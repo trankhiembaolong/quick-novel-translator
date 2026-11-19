@@ -32,6 +32,7 @@ $ExtensionFiles = @(
     'popup.js',
     'shortcut.js',
     'translator.js',
+    'tts-icon-describer.js',
     'tts-player.js',
     'tts-worklet.js',
     'url-validator.js',

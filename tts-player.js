@@ -116,33 +116,77 @@
         };
     }
 
+    function getIconDescriber() {
+        return global.STV_IconDescriber || (typeof globalThis !== 'undefined' ? globalThis.STV_IconDescriber : null) || null;
+    }
+
     function ensureSentenceEnding(text) {
         if (!text) return '';
         return /[.!?…;:"”’)\]]$/u.test(text) ? text : `${text}.`;
     }
 
-    function appendPackedSegment(targetSegments, rawText, domEl, minLockedIndex = 0) {
-        const cleaned = cleanTextForSpeech(rawText);
+    function appendPackedSegment(targetSegments, rawText, domEl, minLockedIndex = 0, iconOptions = null) {
+        const describer = getIconDescriber();
+        const effectiveRaw = (typeof rawText === 'string') ? rawText : '';
+
+        let prep = null;
+        let cleaned = '';
+        if (describer) {
+            prep = describer.prepareTextForTTS(effectiveRaw, iconOptions || { mode: 'local', style: 'tagged' });
+            if (prep.needsAi && effectiveRaw.length > MAX_CHUNK_CHARS) {
+                const rawSentences = effectiveRaw.split(/(?<=[.!?;。！？])\s+/).filter(Boolean);
+                if (rawSentences.length > 1) {
+                    let splitAdded = 0;
+                    for (const s of rawSentences) {
+                        splitAdded += appendPackedSegment(targetSegments, s, domEl, minLockedIndex, iconOptions);
+                    }
+                    return splitAdded;
+                }
+            }
+            cleaned = cleanTextForSpeech(prep.text, { _skipIconDescribe: true });
+        } else {
+            cleaned = cleanTextForSpeech(effectiveRaw);
+        }
         if (!cleaned) return 0;
+
         const parts = splitLongTextForTTS(cleaned);
+        const isSinglePart = parts.length === 1;
+        const needsAi = Boolean(prep && prep.needsAi && isSinglePart);
         let added = 0;
         for (const part of parts) {
-            if (targetSegments.length > minLockedIndex) {
+            if (!needsAi && targetSegments.length > minLockedIndex) {
                 const prev = targetSegments[targetSegments.length - 1];
-                // Chỉ gộp các phần thuộc cùng 1 thẻ DOM để luôn highlight đúng dòng đang đọc
-                if (!domEl || prev.domElement === domEl) {
+                // Chỉ gộp các phần thuộc cùng 1 thẻ DOM và không trộn với đoạn chờ AI giải mã icon
+                if (!prev.needsAiIconResolve && (!domEl || prev.domElement === domEl)) {
                     const prefix = ensureSentenceEnding(prev.text);
                     if (prefix.length + 1 + part.length <= MAX_CHUNK_CHARS) {
                         prev.text = `${prefix} ${part}`;
+                        if (isSinglePart && prev.rawText !== undefined) {
+                            prev.rawText = `${ensureSentenceEnding(prev.rawText)} ${effectiveRaw}`;
+                        } else {
+                            delete prev.rawText;
+                        }
                         continue;
                     }
                 }
             }
-            targetSegments.push({
+            const segObj = {
                 text: part,
                 domElement: domEl || null,
                 domElements: domEl ? [domEl] : []
-            });
+            };
+            if (isSinglePart) {
+                segObj.rawText = (prep && prep.aiText) ? prep.aiText : effectiveRaw;
+            }
+            if (needsAi) {
+                segObj.needsAiIconResolve = true;
+                segObj.aiRawText = (prep && prep.aiText) ? prep.aiText : effectiveRaw;
+                segObj.iconTokens = (prep && prep.aiTokens) || prep.tokens || [];
+                segObj.iconLang = prep.lang || 'vi';
+                segObj.iconResolveState = 'pending';
+                segObj.iconResolvePromise = null;
+            }
+            targetSegments.push(segObj);
             added += 1;
         }
         return added;
@@ -159,9 +203,16 @@
         return { ...SAMPLING_PROFILES[key] };
     }
 
-    function cleanTextForSpeech(raw) {
+    function cleanTextForSpeech(raw, iconOptions = null) {
         if (!raw || typeof raw !== 'string') return '';
-        let text = raw
+        const describer = getIconDescriber();
+        let source = raw;
+        if (describer && !(iconOptions && iconOptions._skipIconDescribe)) {
+            const prep = describer.prepareTextForTTS(raw, iconOptions || { mode: 'local', style: 'tagged' });
+            source = prep.text;
+            if (!source) return '';
+        }
+        let text = source
             .normalize('NFC')
             .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, '')
             .replace(/\u00A0/g, ' ')
@@ -568,27 +619,67 @@
             .filter((line) => line.length > 0);
     }
 
-    function packSegmentsForExport(rawLinesOrTexts, maxLen = EXPORT_MAX_CHUNK_CHARS) {
+    function packSegmentsForExport(rawLinesOrTexts, maxLen = EXPORT_MAX_CHUNK_CHARS, iconOptions = null) {
         const limit = Math.max(64, Math.floor(Number(maxLen) || EXPORT_MAX_CHUNK_CHARS));
+        const describer = getIconDescriber();
         const segments = [];
         const items = Array.isArray(rawLinesOrTexts) ? rawLinesOrTexts : [];
         for (let i = 0; i < items.length; i++) {
             const item = items[i];
-            const raw = typeof item === 'string' ? item : (item && item.text);
-            const cleaned = cleanTextForSpeech(raw);
-            if (!cleaned) continue;
-            const parts = splitLongTextForTTS(cleaned, limit);
-            for (let j = 0; j < parts.length; j++) {
-                const part = parts[j];
-                if (segments.length > 0) {
-                    const prev = segments[segments.length - 1];
-                    const prefix = ensureSentenceEnding(prev.text);
-                    if (prefix.length + 1 + part.length <= limit) {
-                        prev.text = `${prefix} ${part}`;
+            const raw = typeof item === 'string' ? item : (item && (item.rawText || item.text));
+            const effectiveRaw = (typeof raw === 'string') ? raw : '';
+
+            let prep = null;
+            let cleaned = '';
+            if (describer) {
+                prep = describer.prepareTextForTTS(effectiveRaw, iconOptions || { mode: 'local', style: 'tagged' });
+                if (prep.needsAi && effectiveRaw.length > limit) {
+                    const rawSentences = effectiveRaw.split(/(?<=[.!?;。！？])\s+/).filter(Boolean);
+                    if (rawSentences.length > 1) {
+                        const subPacked = packSegmentsForExport(rawSentences, limit, iconOptions);
+                        segments.push(...subPacked);
                         continue;
                     }
                 }
-                segments.push({ text: part, domElement: null, domElements: [] });
+                cleaned = cleanTextForSpeech(prep.text, { _skipIconDescribe: true });
+            } else {
+                cleaned = cleanTextForSpeech(effectiveRaw);
+            }
+            if (!cleaned) continue;
+
+            const parts = splitLongTextForTTS(cleaned, limit);
+            const isSinglePart = parts.length === 1;
+            const needsAi = Boolean(prep && prep.needsAi && isSinglePart);
+            for (let j = 0; j < parts.length; j++) {
+                const part = parts[j];
+                if (!needsAi && segments.length > 0) {
+                    const prev = segments[segments.length - 1];
+                    if (!prev.needsAiIconResolve) {
+                        const prefix = ensureSentenceEnding(prev.text);
+                        if (prefix.length + 1 + part.length <= limit) {
+                            prev.text = `${prefix} ${part}`;
+                            if (isSinglePart && prev.rawText !== undefined) {
+                                prev.rawText = `${ensureSentenceEnding(prev.rawText)} ${effectiveRaw}`;
+                            } else {
+                                delete prev.rawText;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                const segObj = { text: part, domElement: null, domElements: [] };
+                if (isSinglePart) {
+                    segObj.rawText = (prep && prep.aiText) ? prep.aiText : effectiveRaw;
+                }
+                if (needsAi) {
+                    segObj.needsAiIconResolve = true;
+                    segObj.aiRawText = (prep && prep.aiText) ? prep.aiText : effectiveRaw;
+                    segObj.iconTokens = (prep && prep.aiTokens) || prep.tokens || [];
+                    segObj.iconLang = prep.lang || 'vi';
+                    segObj.iconResolveState = 'pending';
+                    segObj.iconResolvePromise = null;
+                }
+                segments.push(segObj);
             }
         }
         return segments;
@@ -876,11 +967,25 @@
             }
         `;
 
+    function getActiveIconOptions() {
+        const loc = (global.STV_I18n && typeof global.STV_I18n.getLocale === 'function')
+            ? global.STV_I18n.getLocale()
+            : 'vi';
+        return {
+            mode: state.iconMode || 'auto',
+            style: state.iconStyle || 'tagged',
+            fallbackLocale: loc === 'en' ? 'en' : 'vi',
+            learnedCache: state.iconLearnedCache || null,
+            customIcons: state.iconCustomMap || null
+        };
+    }
+
     async function collectReadableSegments() {
         const segments = [];
         const consumedEls = new Set();
+        const iconOpts = getActiveIconOptions();
         const pushElementText = (el, rawText) => {
-            appendPackedSegment(segments, rawText, el, 0);
+            appendPackedSegment(segments, rawText, el, 0, iconOpts);
         };
 
         // 1. Ưu tiên đọc theo các dòng đã dịch xong (.stv-line, bỏ qua dòng đang gõ dở .stv-line-partial)
@@ -905,7 +1010,7 @@
         if (contentBox) {
             // Nếu vùng truyện có các thẻ <p> rõ ràng thì highlight từng <p>
             const pNodes = Array.from(contentBox.querySelectorAll('p'))
-                .filter((p) => cleanTextForSpeech(p.innerText || p.textContent).length > 0);
+                .filter((p) => cleanTextForSpeech(p.innerText || p.textContent, iconOpts).length > 0);
             if (pNodes.length >= 2) {
                 pNodes.forEach((p) => pushElementText(p, p.innerText || p.textContent));
                 if (segments.length > 0) return { segments, consumedEls, usedStvLines: false };
@@ -981,6 +1086,12 @@
         autoplayUnblockedAt: 0,
         autoplayResumeBound: false,
         downloadMinutes: DEFAULT_DOWNLOAD_MINUTES,
+        iconMode: 'auto', // 'auto' | 'local' | 'off'
+        iconStyle: 'tagged', // 'tagged' | 'natural'
+        iconLearnedCache: {},
+        iconCustomMap: {},
+        aiIconsUnavailable: false,
+        liveIconDebounceTimer: null,
         debugLog: false
     };
 
@@ -1765,6 +1876,23 @@
                 break;
             }
             const seg = state.segments[i];
+            if (seg && seg.iconResolveState === 'resolving' && seg.iconResolvePromise) {
+                if (!seg._prefetchWaitBound) {
+                    seg._prefetchWaitBound = true;
+                    Promise.race([
+                        seg.iconResolvePromise,
+                        new Promise((resolve) => setTimeout(resolve, 2500))
+                    ]).then(() => {
+                        if (seg.iconResolveState === 'resolving') {
+                            seg.iconResolveState = 'timed_out';
+                        }
+                        if (runId === state.runId && state.isPlaying && !state.isPaused) {
+                            pumpPrefetchQueue(runId);
+                        }
+                    });
+                }
+                return;
+            }
             aheadChars += (seg && seg.text) ? seg.text.length : 0;
 
             const existing = state.prefetchQueue.get(i);
@@ -2439,6 +2567,124 @@
         };
     }
 
+    function scheduleAiIconResolution(segments, runId, { isExport = false, timeoutMs = 6000 } = {}) {
+        if (!Array.isArray(segments) || segments.length === 0) return Promise.resolve();
+        const describer = getIconDescriber();
+        const pendingIndices = [];
+        for (let i = 0; i < segments.length; i++) {
+            const seg = segments[i];
+            if (seg && seg.needsAiIconResolve && seg.iconResolveState === 'pending') {
+                pendingIndices.push(i);
+            }
+        }
+        if (pendingIndices.length === 0) return Promise.resolve();
+
+        if (!describer || state.iconMode !== 'auto' || state.aiIconsUnavailable || !isExtensionAlive() || typeof chrome?.runtime?.sendMessage !== 'function') {
+            for (const idx of pendingIndices) {
+                segments[idx].iconResolveState = 'fallback';
+            }
+            return Promise.resolve();
+        }
+
+        const isRunStillActive = () => (isExport
+            ? (exportState.runId === runId && !exportState.aborted && !exportState.savePartialRequested)
+            : (state.runId === runId));
+
+        const batches = [];
+        for (let offset = 0; offset < pendingIndices.length; offset += 12) {
+            batches.push(pendingIndices.slice(offset, offset + 12));
+        }
+
+        const batchPromises = batches.map((batchIdxList) => {
+            const items = batchIdxList.map((idx) => {
+                const seg = segments[idx];
+                const prevSeg = idx > 0 ? segments[idx - 1] : null;
+                const nextSeg = idx + 1 < segments.length ? segments[idx + 1] : null;
+                return {
+                    id: idx,
+                    prev: prevSeg ? (prevSeg.rawText || prevSeg.text || '') : '',
+                    text: seg.aiRawText || seg.rawText || seg.text || '',
+                    fallbackText: seg.text || '',
+                    next: nextSeg ? (nextSeg.rawText || nextSeg.text || '') : '',
+                    icons: Array.isArray(seg.iconTokens) ? seg.iconTokens.map((t) => t.raw) : []
+                };
+            });
+            const batchLang = segments[batchIdxList[0]]?.iconLang || 'vi';
+
+            const batchPromise = new Promise((resolve) => {
+                let settled = false;
+                const finish = () => {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
+                    for (const idx of batchIdxList) {
+                        const s = segments[idx];
+                        if (s && s.iconResolveState === 'resolving') {
+                            s.iconResolveState = 'fallback';
+                        }
+                    }
+                    resolve();
+                };
+
+                const timer = setTimeout(finish, timeoutMs);
+
+                try {
+                    chrome.runtime.sendMessage({
+                        action: 'resolve_tts_icons',
+                        style: state.iconStyle || 'tagged',
+                        lang: batchLang,
+                        items
+                    }, (resp) => {
+                        if (settled) return;
+                        void chrome?.runtime?.lastError;
+                        if (!isRunStillActive()) {
+                            finish();
+                            return;
+                        }
+                        if (resp && resp.reason === 'no_api_key') {
+                            state.aiIconsUnavailable = true;
+                            finish();
+                            return;
+                        }
+                        if (resp && resp.ok && Array.isArray(resp.results)) {
+                            for (const resItem of resp.results) {
+                                const seg = segments[resItem.id];
+                                if (!seg || !batchIdxList.includes(resItem.id)) continue;
+                                const cleanedSpoken = cleanTextForSpeech(
+                                    describer.sanitizeAiSpokenText(resItem.spoken, seg.aiRawText || seg.rawText || seg.text, seg.text, {
+                                        iconCount: (seg.iconTokens && seg.iconTokens.length) || 1
+                                    }),
+                                    { _skipIconDescribe: true }
+                                );
+                                if (cleanedSpoken) {
+                                    seg.text = cleanedSpoken;
+                                    seg.iconResolveState = 'done';
+                                }
+                            }
+                            if (resp.cacheUpdates && typeof resp.cacheUpdates === 'object') {
+                                state.iconLearnedCache = { ...(state.iconLearnedCache || {}), ...resp.cacheUpdates };
+                            }
+                            if (!isExport && state.playerEl && batchIdxList.includes(state.currentIndex)) {
+                                updatePlayerUI();
+                            }
+                        }
+                        finish();
+                    });
+                } catch {
+                    finish();
+                }
+            });
+
+            for (const idx of batchIdxList) {
+                segments[idx].iconResolveState = 'resolving';
+                segments[idx].iconResolvePromise = batchPromise;
+            }
+            return batchPromise;
+        });
+
+        return Promise.all(batchPromises);
+    }
+
     function playSegment(index, runId, { seamless = false } = {}) {
         if (runId !== state.runId) return;
         if (index < 0 || index >= state.segments.length) {
@@ -2465,6 +2711,24 @@
         state.isPaused = false;
         state.currentSession = null;
 
+        const seg = state.segments[index];
+        if (seg && seg.iconResolveState === 'resolving' && seg.iconResolvePromise) {
+            highlightSegment(index);
+            maybeTriggerNextChapterPreload();
+            updatePlayerUI(tTts('tts_status_resolving_icons', 'Đang phân tích biểu cảm...'));
+            Promise.race([
+                seg.iconResolvePromise,
+                new Promise((resolve) => setTimeout(resolve, 2500))
+            ]).then(() => {
+                if (runId !== state.runId || !state.isPlaying || state.isPaused) return;
+                if (seg.iconResolveState === 'resolving') {
+                    seg.iconResolveState = 'timed_out';
+                }
+                playSegment(index, runId, { seamless });
+            });
+            return;
+        }
+
         highlightSegment(index);
         maybeTriggerNextChapterPreload();
 
@@ -2486,7 +2750,6 @@
         state.streamToken += 1;
         const segmentToken = state.streamToken;
 
-        const seg = state.segments[index];
         const prevSeg = index > 0 ? state.segments[index - 1] : null;
         const isSameLineContinuation = Boolean(
             seamless && prevSeg && seg.domElement && prevSeg.domElement === seg.domElement
@@ -2974,6 +3237,10 @@
                     if (capturedSession.totalRawSamples > 0 || capturedSession.streamDone) {
                         rerenderSessionFromSample(capturedSession, resumeFrom, { resetPreRoll: true });
                     }
+                } else if (!capturedSession && !state.activePort && !state.activeWs && state.currentIndex < state.segments.length) {
+                    playSegment(state.currentIndex, capturedRunId);
+                    maybeTriggerNextChapterPreload({ forceVerify: true });
+                    return;
                 }
                 updatePlayerUI();
                 pumpPrefetchQueue(capturedRunId);
@@ -3013,6 +3280,10 @@
         if (state.nextChapterTimer) {
             clearTimeout(state.nextChapterTimer);
             state.nextChapterTimer = null;
+        }
+        if (state.liveIconDebounceTimer) {
+            clearTimeout(state.liveIconDebounceTimer);
+            state.liveIconDebounceTimer = null;
         }
         stopStreamPlayer(true);
         if (state.audioCtx && state.audioCtx.state === 'suspended' && canStartAudioContext()) {
@@ -3083,14 +3354,33 @@
 
         let added = 0;
         const lockedFloor = Math.max(0, state.currentIndex + 2);
+        const iconOpts = getActiveIconOptions();
         const finalizedLines = document.querySelectorAll('.stv-line:not(.stv-line-partial)');
         finalizedLines.forEach((el) => {
             if (state.consumedLineEls.has(el)) return;
             state.consumedLineEls.add(el);
-            added += appendPackedSegment(state.segments, el.innerText || el.textContent, el, lockedFloor);
+            added += appendPackedSegment(state.segments, el.innerText || el.textContent, el, lockedFloor, iconOpts);
         });
 
         if (added > 0) {
+            const hasPendingIcons = state.segments.some((s) => s.needsAiIconResolve && s.iconResolveState === 'pending');
+            if (hasPendingIcons) {
+                if (state.liveIconDebounceTimer) {
+                    clearTimeout(state.liveIconDebounceTimer);
+                    state.liveIconDebounceTimer = null;
+                }
+                const capturedRun = state.runId;
+                if (state.waitingForMoreSegments || (transState && !transState.active)) {
+                    scheduleAiIconResolution(state.segments, capturedRun);
+                } else {
+                    state.liveIconDebounceTimer = setTimeout(() => {
+                        state.liveIconDebounceTimer = null;
+                        if (state.runId === capturedRun && state.isPlaying) {
+                            scheduleAiIconResolution(state.segments, capturedRun);
+                        }
+                    }, 350);
+                }
+            }
             updatePlayerUI();
             if (state.waitingForMoreSegments && state.isPlaying && !state.isPaused && state.currentIndex < state.segments.length) {
                 state.waitingForMoreSegments = false;
@@ -3165,6 +3455,20 @@
         state.preloadLeadSec = Number.isFinite(parsedLead) ? Math.max(5, Math.min(300, parsedLead)) : 60;
         const parsedDlMins = parseInt(options.downloadMinutes !== undefined ? options.downloadMinutes : config.ttsDownloadMinutes, 10);
         state.downloadMinutes = Number.isFinite(parsedDlMins) ? Math.max(1, Math.min(240, parsedDlMins)) : DEFAULT_DOWNLOAD_MINUTES;
+
+        const modeCand = options.iconMode !== undefined ? options.iconMode : config.ttsIconMode;
+        state.iconMode = ['auto', 'local', 'off'].includes(modeCand) ? modeCand : 'auto';
+        const styleCand = options.iconStyle !== undefined ? options.iconStyle : config.ttsIconStyle;
+        state.iconStyle = styleCand === 'natural' ? 'natural' : 'tagged';
+        state.iconLearnedCache = (config.ttsIconLearnedCache && typeof config.ttsIconLearnedCache === 'object')
+            ? { ...config.ttsIconLearnedCache }
+            : {};
+        const customSrc = options.customIcons !== undefined ? options.customIcons : config.ttsCustomIcons;
+        const describer = getIconDescriber();
+        state.iconCustomMap = (describer && typeof describer.normalizeCustomIconsMap === 'function')
+            ? describer.normalizeCustomIconsMap(customSrc)
+            : ((customSrc && typeof customSrc === 'object' && !Array.isArray(customSrc)) ? { ...customSrc } : {});
+        state.aiIconsUnavailable = false;
 
         return config;
     }
@@ -3741,7 +4045,8 @@
             const startSliceIdx = (!options.startFromBeginning && resumeIdx > 0 && resumeIdx < collected.segments.length)
                 ? resumeIdx
                 : 0;
-            let chapterSegments = packSegmentsForExport(collected.segments.slice(startSliceIdx), EXPORT_MAX_CHUNK_CHARS);
+            const exportIconOpts = getActiveIconOptions();
+            let chapterSegments = packSegmentsForExport(collected.segments.slice(startSliceIdx), EXPORT_MAX_CHUNK_CHARS, exportIconOpts);
             if (chapterSegments.length === 0) {
                 chapterSegments = collected.segments.slice(startSliceIdx);
             }
@@ -3762,6 +4067,11 @@
             try {
                 while (chapterSegments.length > 0 && exportState.chaptersCompleted < MAX_EXPORT_CHAPTERS) {
                     if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) break;
+
+                    if (state.iconMode === 'auto') {
+                        await scheduleAiIconResolution(chapterSegments, myRunId, { isExport: true, timeoutMs: 8000 });
+                        if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) break;
+                    }
 
                     const N = chapterSegments.length;
                     exportState.currentChapter = exportState.chaptersCompleted + 1;
@@ -3889,7 +4199,7 @@
                     const lines = state.wasTranslated
                         ? extractCleanTranslatedLines(nextData.fullText)
                         : (Array.isArray(nextData.origChunks) ? nextData.origChunks : []);
-                    const nextSegs = packSegmentsForExport(lines, EXPORT_MAX_CHUNK_CHARS);
+                    const nextSegs = packSegmentsForExport(lines, EXPORT_MAX_CHUNK_CHARS, exportIconOpts);
                     if (nextSegs.length === 0) {
                         earlyStopReason = 'Chương tiếp theo không có nội dung hợp lệ sau khi trích xuất/dịch.';
                         break;
@@ -4024,6 +4334,9 @@
             : null;
         state.currentIndex = Math.max(0, Math.min(options.startIndex || 0, collected.segments.length - 1));
 
+        // Bắt đầu giải mã các kaomoji phức tạp bằng AI theo ngữ cảnh ở chế độ ngầm (không chặn các câu không có icon)
+        scheduleAiIconResolution(state.segments, state.runId);
+
         await ensureAudioContextReady();
         if (state.autoplayBlocked) {
             state.isPlaying = true;
@@ -4069,6 +4382,8 @@
             nextChapterUrl: state.nextChapterUrl,
             preloadState: state.preloadState,
             downloadMinutes: state.downloadMinutes,
+            iconMode: state.iconMode,
+            iconStyle: state.iconStyle,
             exportActive: exportState.active,
             nextOpenUrl: exportState.nextOpenUrl
         })

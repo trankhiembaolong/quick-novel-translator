@@ -1,12 +1,69 @@
 // background.js - Service Worker xử lý dịch ngầm từ phím tắt & Proxy/Controller cho VieNeu-TTS
 
-importScripts('glossary-utils.js', 'url-validator.js');
+importScripts('glossary-utils.js', 'url-validator.js', 'tts-icon-describer.js');
 
 const VIENEU_NATIVE_HOST = 'com.stv.vieneu_host';
 const DEFAULT_VIENEU_URL = 'http://127.0.0.1:8000';
 const DEFAULT_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
 const DEFAULT_MODEL = 'stepfun/step-3.5-flash';
 const DEFAULT_PROMPT = 'Dịch toàn bộ nội dung sau sang tiếng Việt chuẩn, mượt mà, tự nhiên theo văn phong tiểu thuyết. Giữ nguyên định dạng xuống dòng.';
+const TTS_ICON_CACHE_KEY = 'stv_tts_icon_cache';
+const TTS_CUSTOM_ICONS_KEY = 'stv_tts_custom_icons';
+const TTS_ICON_CACHE_MAX = 500;
+
+function mergeTtsIconCache(existingCache, updates, lang = 'vi') {
+    const describer = globalThis.STV_IconDescriber || null;
+    const normKeyFn = describer?.normalizeCacheKey || ((s) => String(s || '').trim().replace(/\s+/g, ' '));
+    const stripFn = describer?.stripResidualIcons || ((s) => String(s || '').trim());
+    const safeLang = lang === 'en' ? 'en' : 'vi';
+    const nextCache = (existingCache && typeof existingCache === 'object' && !Array.isArray(existingCache))
+        ? { ...existingCache }
+        : {};
+    const flatUpdates = {};
+    let changed = false;
+    const now = Date.now();
+
+    for (const [rawKey, rawGloss] of Object.entries(updates || {})) {
+        const key = normKeyFn(rawKey);
+        const gloss = stripFn(String(rawGloss || '')).trim();
+        if (!key || !gloss || gloss.length > 60) continue;
+        const prev = (nextCache[key] && typeof nextCache[key] === 'object') ? nextCache[key] : {};
+        if (prev[safeLang] !== gloss) {
+            changed = true;
+        }
+        nextCache[key] = { ...prev, [safeLang]: gloss, ts: now };
+        flatUpdates[key] = { ...nextCache[key] };
+    }
+
+    const keys = Object.keys(nextCache);
+    if (keys.length > TTS_ICON_CACHE_MAX) {
+        keys.sort((a, b) => (Number(nextCache[a]?.ts) || 0) - (Number(nextCache[b]?.ts) || 0));
+        const removeCount = keys.length - TTS_ICON_CACHE_MAX;
+        for (let i = 0; i < removeCount; i++) {
+            delete nextCache[keys[i]];
+        }
+        changed = true;
+    }
+
+    return { merged: nextCache, changed, flatUpdates };
+}
+
+function flattenIconCacheForRuntime(rawCache) {
+    if (!rawCache || typeof rawCache !== 'object' || Array.isArray(rawCache)) return {};
+    const out = {};
+    for (const [k, entry] of Object.entries(rawCache)) {
+        if (!k || !entry) continue;
+        if (typeof entry === 'string') {
+            out[k] = { vi: entry };
+        } else if (typeof entry === 'object') {
+            const compact = {};
+            if (typeof entry.vi === 'string' && entry.vi.trim()) compact.vi = entry.vi.trim();
+            if (typeof entry.en === 'string' && entry.en.trim()) compact.en = entry.en.trim();
+            if (compact.vi || compact.en) out[k] = compact;
+        }
+    }
+    return out;
+}
 
 // Enforce secret isolation: Content scripts cannot read chrome.storage.local
 async function initSecretIsolation() {
@@ -1286,7 +1343,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return true;
     }
     if (request.action === 'set_runtime_setting' && request.key) {
-        const allowed = new Set(['ttsAutoNextChapter', 'ttsSpeed', 'stv_locale', 'ttsDownloadMinutes']);
+        const allowed = new Set(['ttsAutoNextChapter', 'ttsSpeed', 'stv_locale', 'ttsDownloadMinutes', 'ttsIconMode', 'ttsIconStyle']);
         if (!allowed.has(request.key)) {
             sendResponse({ ok: false, error: 'Setting không được phép' });
             return false;
@@ -1395,7 +1452,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const locData = await chrome.storage.local.get(['stv_locale']);
             await chrome.scripting.executeScript({
                 target: { tabId },
-                files: ['i18n.js', 'page-ui.js', 'extractor.js', 'tts-player.js']
+                files: ['i18n.js', 'page-ui.js', 'extractor.js', 'tts-icon-describer.js', 'tts-player.js']
             });
             await chrome.scripting.executeScript({
                 target: { tabId },
@@ -1519,13 +1576,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         chrome.storage.local.get([
             'ttsEngine', 'ttsWsEndpoint', 'ttsWsVoice', 'ttsWsFallback', 'ttsWsAutoFallback',
             'ttsEndpoint', 'ttsVoice', 'ttsApiKey', 'ttsSpeed', 'ttsStability', 'ttsStabilityProfile',
-            'ttsAutoNext', 'ttsAutoNextChapter', 'ttsPreloadSec', 'ttsPreloadSeconds', 'ttsDownloadMinutes', 'stv_locale',
-            'stvDebugLog'
+            'ttsAutoNext', 'ttsAutoNextChapter', 'ttsPreloadSec', 'ttsPreloadSeconds', 'ttsDownloadMinutes',
+            'ttsIconMode', 'ttsIconStyle', TTS_ICON_CACHE_KEY, TTS_CUSTOM_ICONS_KEY,
+            'stv_locale', 'stvDebugLog'
         ], (data) => {
             if (data.ttsWsAutoFallback === undefined) data.ttsWsAutoFallback = data.ttsWsFallback;
             if (data.ttsStabilityProfile === undefined) data.ttsStabilityProfile = data.ttsStability;
             if (data.ttsAutoNextChapter === undefined) data.ttsAutoNextChapter = data.ttsAutoNext;
             if (data.ttsPreloadSeconds === undefined) data.ttsPreloadSeconds = data.ttsPreloadSec;
+            if (!data.ttsIconMode) data.ttsIconMode = 'auto';
+            if (!data.ttsIconStyle) data.ttsIconStyle = 'tagged';
+            data.ttsIconLearnedCache = flattenIconCacheForRuntime(data[TTS_ICON_CACHE_KEY]);
+            delete data[TTS_ICON_CACHE_KEY];
+            const describer = globalThis.STV_IconDescriber || null;
+            const rawCustom = data[TTS_CUSTOM_ICONS_KEY];
+            data.ttsCustomIcons = (describer && typeof describer.normalizeCustomIconsMap === 'function')
+                ? describer.normalizeCustomIconsMap(rawCustom)
+                : ((rawCustom && typeof rawCustom === 'object' && !Array.isArray(rawCustom)) ? rawCustom : {});
+            delete data[TTS_CUSTOM_ICONS_KEY];
             sendResponse({ ok: true, data });
         });
         return true;
@@ -1644,6 +1712,141 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         })().catch((err) => {
             const msg = err?.name === 'AbortError'
                 ? 'Timeout khi tải danh sách model từ API'
+                : (err?.message || String(err));
+            sendResponse({ ok: false, error: msg });
+        });
+        return true;
+    }
+
+    if (request.action === 'resolve_tts_icons') {
+        const describer = globalThis.STV_IconDescriber || null;
+        if (!describer) {
+            sendResponse({ ok: false, error: 'Icon describer unavailable' });
+            return false;
+        }
+        const rawItems = Array.isArray(request.items) ? request.items.slice(0, 15) : [];
+        if (rawItems.length === 0) {
+            sendResponse({ ok: true, results: [], cacheUpdates: {} });
+            return false;
+        }
+
+        const style = request.style === 'natural' ? 'natural' : 'tagged';
+        const lang = request.lang === 'en' ? 'en' : 'vi';
+
+        (async () => {
+            const config = await chrome.storage.local.get([
+                'endpoint', 'apikey', 'model', TTS_ICON_CACHE_KEY, TTS_CUSTOM_ICONS_KEY, 'stvDebugLog'
+            ]);
+            const apikey = (config.apikey || '').trim();
+            if (!apikey) {
+                sendResponse({ ok: false, reason: 'no_api_key', error: 'API key not configured' });
+                return;
+            }
+            const endpoint = (config.endpoint || '').trim() || DEFAULT_ENDPOINT;
+            const validator = globalThis.STV_UrlValidator || globalThis;
+            if (typeof validator.isValidUrl === 'function' && !validator.isValidUrl(endpoint)) {
+                sendResponse({ ok: false, error: 'API Endpoint URL không hợp lệ' });
+                return;
+            }
+            const model = (config.model || '').trim() || DEFAULT_MODEL;
+
+            const normalizedItems = rawItems.map((it) => ({
+                id: Number(it?.id),
+                prev: String(it?.prev || '').slice(0, 240),
+                text: String(it?.text || '').slice(0, 500),
+                fallbackText: String(it?.fallbackText || '').slice(0, 500),
+                next: String(it?.next || '').slice(0, 240),
+                icons: Array.isArray(it?.icons) ? it.icons.slice(0, 8).map((s) => String(s || '')) : []
+            })).filter((it) => Number.isFinite(it.id) && it.text.length > 0);
+
+            if (normalizedItems.length === 0) {
+                sendResponse({ ok: true, results: [], cacheUpdates: {} });
+                return;
+            }
+
+            const { systemPrompt, userMessage } = describer.buildAiIconPrompt(normalizedItems, { style, lang });
+            const res = await fetchWithTimeout(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apikey}`,
+                    'HTTP-Referer': 'https://github.com/stv-extension',
+                    'X-Title': 'Quick Novel Translator'
+                },
+                body: JSON.stringify({
+                    model,
+                    temperature: 0.2,
+                    stream: false,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userMessage }
+                    ]
+                })
+            }, 6000);
+
+            if (!res.ok) {
+                sendResponse({ ok: false, status: res.status, error: `HTTP ${res.status}` });
+                return;
+            }
+
+            const json = await res.json();
+            const rawContent = json?.choices?.[0]?.message?.content || '';
+            const parsed = describer.parseAiIconResponse(rawContent);
+            if (!parsed) {
+                sendResponse({ ok: false, error: 'Invalid AI icon response JSON' });
+                return;
+            }
+
+            const itemById = new Map(normalizedItems.map((it) => [it.id, it]));
+            const finalResults = [];
+            const rawCacheUpdates = {};
+
+            for (const entry of parsed) {
+                const orig = itemById.get(entry.id);
+                if (!orig) continue;
+                const safeSpoken = describer.sanitizeAiSpokenText(entry.spoken, orig.text, orig.fallbackText, {
+                    iconCount: orig.icons.length || 1
+                });
+                finalResults.push({ id: orig.id, spoken: safeSpoken });
+
+                if (entry.icon_gloss && typeof entry.icon_gloss === 'object') {
+                    const glossEntries = Object.entries(entry.icon_gloss);
+                    for (const [k, v] of glossEntries) {
+                        rawCacheUpdates[k] = v;
+                    }
+                    if (orig.icons.length === 1 && glossEntries.length === 1) {
+                        rawCacheUpdates[orig.icons[0]] = glossEntries[0][1];
+                    }
+                }
+            }
+
+            const customIcons = (typeof describer.normalizeCustomIconsMap === 'function')
+                ? describer.normalizeCustomIconsMap(config[TTS_CUSTOM_ICONS_KEY])
+                : {};
+            const filteredCacheUpdates = {};
+            for (const [k, v] of Object.entries(rawCacheUpdates)) {
+                if (typeof describer.lookupCustomIcon === 'function' && describer.lookupCustomIcon(customIcons, k, k)) {
+                    continue;
+                }
+                filteredCacheUpdates[k] = v;
+            }
+
+            let cacheUpdates = {};
+            if (Object.keys(filteredCacheUpdates).length > 0) {
+                const mergedRes = mergeTtsIconCache(config[TTS_ICON_CACHE_KEY], filteredCacheUpdates, lang);
+                cacheUpdates = mergedRes.flatUpdates;
+                if (mergedRes.changed) {
+                    await chrome.storage.local.set({ [TTS_ICON_CACHE_KEY]: mergedRes.merged });
+                }
+            }
+
+            if (config.stvDebugLog) {
+                console.log('[STV Background TTS Icons]', { model, style, lang, count: finalResults.length, cacheUpdates });
+            }
+            sendResponse({ ok: true, results: finalResults, cacheUpdates });
+        })().catch((err) => {
+            const msg = err?.name === 'AbortError'
+                ? 'Timeout mô tả icon TTS'
                 : (err?.message || String(err));
             sendResponse({ ok: false, error: msg });
         });
@@ -2377,7 +2580,7 @@ async function handleAutoAdvanceOnTabComplete(tabId, pending) {
                 entry.consumedByPage = true;
                 await chrome.scripting.executeScript({
                     target: { tabId },
-                    files: ['i18n.js', 'page-ui.js', 'glossary-utils.js', 'translator.js', 'tts-player.js']
+                    files: ['i18n.js', 'page-ui.js', 'glossary-utils.js', 'translator.js', 'tts-icon-describer.js', 'tts-player.js']
                 });
 
                 const prepRes = await chrome.scripting.executeScript({
@@ -2429,7 +2632,7 @@ async function handleAutoAdvanceOnTabComplete(tabId, pending) {
         // Chế độ chỉ đọc (truyện tiếng Việt sẵn)
         await chrome.scripting.executeScript({
             target: { tabId },
-            files: ['i18n.js', 'page-ui.js', 'extractor.js', 'tts-player.js']
+            files: ['i18n.js', 'page-ui.js', 'extractor.js', 'tts-icon-describer.js', 'tts-player.js']
         });
         await chrome.scripting.executeScript({
             target: { tabId },

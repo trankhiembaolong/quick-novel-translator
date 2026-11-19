@@ -8,6 +8,7 @@
     const I18n = window.STV_I18n;
     const UrlValidator = window.STV_UrlValidator;
     const GlossaryUtils = window.STV_GlossaryUtils;
+    const IconDescriber = window.STV_IconDescriber;
 
     const DEFAULT_SETTINGS = {
         endpoint: 'https://openrouter.ai/api/v1/chat/completions',
@@ -32,6 +33,8 @@
         ttsAutoNext: true,
         ttsPreloadSec: 60,
         ttsDownloadMinutes: 30,
+        ttsIconMode: 'auto',
+        ttsIconStyle: 'tagged',
         stvDebugLog: false,
         stv_theme: 'dark'
     };
@@ -58,6 +61,13 @@
         selectedOrigs: new Set(),
         searchTimer: null,
         cleanIssues: [],
+        glossarySubtab: 'terms',
+        customIcons: {},
+        learnedIcons: {},
+        iconKindFilter: 'all',
+        iconFilterMode: 'all',
+        iconSearchQuery: '',
+        iconSearchTimer: null,
         vieneuRunning: false,
         fetchedModels: [],
         modelsEndpoint: '',
@@ -159,6 +169,7 @@
         }
         renderSitePermissionUI();
         renderGlossaryList();
+        renderIconLibraryList();
         updateVieNeuBadgeUI(state.vieneuRunning);
         if (state.modelDropdownOpen) {
             renderModelDropdown();
@@ -168,30 +179,36 @@
     // -------------------------------------------------------------------------
     // Tabs
     // -------------------------------------------------------------------------
-    function initTabs() {
+    function switchMainTab(target) {
         const buttons = document.querySelectorAll('.tab-btn');
         const panels = document.querySelectorAll('.tab-panel');
+        buttons.forEach((b) => {
+            const active = b.getAttribute('data-tab') === target;
+            b.classList.toggle('active', active);
+            b.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
+        panels.forEach((p) => {
+            const active = p.id === `panel-${target}`;
+            p.classList.toggle('active', active);
+            p.hidden = !active;
+        });
+        if (target === 'glossary') {
+            renderGlossaryList();
+            void loadIconLibraryData();
+        } else if (target === 'tts') {
+            syncTtsPlaybackUI();
+            if ($('tts-engine-select')?.value === 'vieneu') {
+                checkVieNeuHealth();
+            }
+        }
+    }
+
+    function initTabs() {
+        const buttons = document.querySelectorAll('.tab-btn');
         buttons.forEach((btn) => {
             btn.addEventListener('click', () => {
                 const target = btn.getAttribute('data-tab');
-                buttons.forEach((b) => {
-                    const active = b === btn;
-                    b.classList.toggle('active', active);
-                    b.setAttribute('aria-selected', active ? 'true' : 'false');
-                });
-                panels.forEach((p) => {
-                    const active = p.id === `panel-${target}`;
-                    p.classList.toggle('active', active);
-                    p.hidden = !active;
-                });
-                if (target === 'glossary') {
-                    renderGlossaryList();
-                } else if (target === 'tts') {
-                    syncTtsPlaybackUI();
-                    if ($('tts-engine-select')?.value === 'vieneu') {
-                        checkVieNeuHealth();
-                    }
-                }
+                if (target) switchMainTab(target);
             });
         });
     }
@@ -326,6 +343,8 @@
         $('tts-autoplay').checked = !!cfg.ttsAutoPlay;
         $('tts-autonext').checked = (cfg.ttsAutoNextChapter ?? cfg.ttsAutoNext) !== false;
         $('tts-preload-sec').value = cfg.ttsPreloadSeconds ?? cfg.ttsPreloadSec ?? DEFAULT_SETTINGS.ttsPreloadSec;
+        $('tts-icon-mode').value = ['auto', 'local', 'off'].includes(cfg.ttsIconMode) ? cfg.ttsIconMode : DEFAULT_SETTINGS.ttsIconMode;
+        $('tts-icon-style').value = cfg.ttsIconStyle === 'natural' ? 'natural' : DEFAULT_SETTINGS.ttsIconStyle;
         $('settings-debug-log').checked = !!cfg.stvDebugLog;
 
         toggleVieNeuCard(activeEngine);
@@ -492,6 +511,8 @@
                 ttsPreloadSec: Math.min(300, Math.max(5, Number($('tts-preload-sec').value) || DEFAULT_SETTINGS.ttsPreloadSec)),
                 ttsPreloadSeconds: Math.min(300, Math.max(5, Number($('tts-preload-sec').value) || DEFAULT_SETTINGS.ttsPreloadSec)),
                 ttsDownloadMinutes: Math.min(240, Math.max(1, Number($('tts-download-minutes').value) || DEFAULT_SETTINGS.ttsDownloadMinutes)),
+                ttsIconMode: $('tts-icon-mode').value || DEFAULT_SETTINGS.ttsIconMode,
+                ttsIconStyle: $('tts-icon-style').value || DEFAULT_SETTINGS.ttsIconStyle,
                 stvDebugLog: $('settings-debug-log').checked
             };
 
@@ -1106,7 +1127,7 @@
             'ttsEngine', 'ttsWsEndpoint', 'ttsWsVoice', 'ttsWsFallback', 'ttsWsAutoFallback',
             'ttsEndpoint', 'ttsBackend', 'ttsStability', 'ttsStabilityProfile', 'ttsVoice',
             'ttsSpeed', 'ttsAutoNext', 'ttsAutoNextChapter', 'ttsPreloadSec', 'ttsPreloadSeconds',
-            'ttsDownloadMinutes'
+            'ttsDownloadMinutes', 'ttsIconMode', 'ttsIconStyle'
         ]);
 
         const engine = $('tts-engine-select').value || stored.ttsEngine || 'ws_default';
@@ -1126,6 +1147,8 @@
             autoNextChapter: (stored.ttsAutoNextChapter ?? stored.ttsAutoNext) !== false,
             preloadLeadSec: stored.ttsPreloadSeconds ?? stored.ttsPreloadSec ?? DEFAULT_SETTINGS.ttsPreloadSec,
             downloadMinutes: Number($('tts-download-minutes').value) || stored.ttsDownloadMinutes || DEFAULT_SETTINGS.ttsDownloadMinutes,
+            iconMode: $('tts-icon-mode')?.value || stored.ttsIconMode || DEFAULT_SETTINGS.ttsIconMode,
+            iconStyle: $('tts-icon-style')?.value || stored.ttsIconStyle || DEFAULT_SETTINGS.ttsIconStyle,
             ...extra
         };
     }
@@ -1147,7 +1170,7 @@
 
         await chrome.scripting.executeScript({
             target: { tabId: state.activeTab.id },
-            files: ['i18n.js', 'page-ui.js', 'extractor.js', 'tts-player.js']
+            files: ['i18n.js', 'page-ui.js', 'extractor.js', 'tts-icon-describer.js', 'tts-player.js']
         });
         await chrome.scripting.executeScript({
             target: { tabId: state.activeTab.id },
@@ -1189,7 +1212,7 @@
 
         await chrome.scripting.executeScript({
             target: { tabId: state.activeTab.id },
-            files: ['i18n.js', 'page-ui.js', 'extractor.js', 'tts-player.js']
+            files: ['i18n.js', 'page-ui.js', 'extractor.js', 'tts-icon-describer.js', 'tts-player.js']
         });
         await chrome.scripting.executeScript({
             target: { tabId: state.activeTab.id },
@@ -1703,6 +1726,456 @@
     }
 
     // -------------------------------------------------------------------------
+    // Emoji / Icon Library (Sub-tab inside Glossary)
+    // -------------------------------------------------------------------------
+    function switchGlossarySubtab(target) {
+        const next = target === 'icons' ? 'icons' : 'terms';
+        state.glossarySubtab = next;
+
+        const termsBtn = $('subtab-glossary-terms');
+        const iconsBtn = $('subtab-glossary-icons');
+        const termsPanel = $('glossary-subpanel-terms');
+        const iconsPanel = $('glossary-subpanel-icons');
+
+        if (termsBtn) {
+            termsBtn.classList.toggle('active', next === 'terms');
+            termsBtn.setAttribute('aria-selected', next === 'terms' ? 'true' : 'false');
+        }
+        if (iconsBtn) {
+            iconsBtn.classList.toggle('active', next === 'icons');
+            iconsBtn.setAttribute('aria-selected', next === 'icons' ? 'true' : 'false');
+        }
+        if (termsPanel) termsPanel.hidden = next !== 'terms';
+        if (iconsPanel) iconsPanel.hidden = next !== 'icons';
+
+        if (next === 'icons') {
+            void loadIconLibraryData();
+        }
+    }
+
+    function normalizeCustomIconEntryMap(raw) {
+        if (IconDescriber && typeof IconDescriber.normalizeCustomIconsMap === 'function') {
+            return IconDescriber.normalizeCustomIconsMap(raw);
+        }
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+        const out = {};
+        for (const [k, v] of Object.entries(raw)) {
+            const key = String(k || '').trim();
+            if (!key) continue;
+            if (typeof v === 'string' && v.trim()) {
+                out[key] = { meaning: v.trim(), skip: false, updatedAt: 0 };
+            } else if (v && typeof v === 'object') {
+                const skip = Boolean(v.skip);
+                const meaning = String(v.meaning || v.text || '').trim();
+                if (skip || meaning) {
+                    out[key] = { meaning, skip, updatedAt: Number(v.updatedAt) || 0 };
+                }
+            }
+        }
+        return out;
+    }
+
+    async function loadIconLibraryData() {
+        const data = await chrome.storage.local.get(['stv_tts_custom_icons', 'stv_tts_icon_cache']);
+        state.customIcons = normalizeCustomIconEntryMap(data.stv_tts_custom_icons);
+        state.learnedIcons = (data.stv_tts_icon_cache && typeof data.stv_tts_icon_cache === 'object' && !Array.isArray(data.stv_tts_icon_cache))
+            ? { ...data.stv_tts_icon_cache }
+            : {};
+        renderIconLibraryList();
+    }
+
+    async function persistCustomIcons() {
+        await chrome.storage.local.set({ stv_tts_custom_icons: state.customIcons });
+    }
+
+    async function persistLearnedIcons() {
+        await chrome.storage.local.set({ stv_tts_icon_cache: state.learnedIcons });
+    }
+
+    function hasKeyVariantInMap(map, key) {
+        if (!map || !key) return false;
+        if (Object.prototype.hasOwnProperty.call(map, key)) return true;
+        const noVs = key.replace(/\uFE0F/g, '');
+        if (noVs && Object.prototype.hasOwnProperty.call(map, noVs)) return true;
+        if (noVs && Object.prototype.hasOwnProperty.call(map, `${noVs}\uFE0F`)) return true;
+        const lower = key.toLowerCase();
+        if (Object.prototype.hasOwnProperty.call(map, lower)) return true;
+        return false;
+    }
+
+    function classifyIconKind(key, def) {
+        if (def && (def.category === 'emoji' || def.category === 'kaomoji')) {
+            return def.category;
+        }
+        if (IconDescriber && typeof IconDescriber.classifyIconCategory === 'function') {
+            return IconDescriber.classifyIconCategory(key);
+        }
+        return 'kaomoji';
+    }
+
+    function setIconKindFilter(kind) {
+        const next = kind === 'emoji' || kind === 'kaomoji' ? kind : 'all';
+        state.iconKindFilter = next;
+        document.querySelectorAll('[data-icon-kind]').forEach((btn) => {
+            const active = btn.getAttribute('data-icon-kind') === next;
+            btn.classList.toggle('active', active);
+            btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+        });
+    }
+
+    function getMergedIconLibraryEntries() {
+        const lang = I18n && I18n.getLocale() === 'en' ? 'en' : 'vi';
+        const defaultEntries = (IconDescriber && typeof IconDescriber.getDefaultIconEntries === 'function')
+            ? IconDescriber.getDefaultIconEntries(lang)
+            : [];
+        const defaultMap = new Map();
+        for (const item of defaultEntries) {
+            defaultMap.set(item.key, item);
+        }
+
+        const findDefaultForKey = (k) => {
+            return defaultMap.get(k)
+                || defaultMap.get(k.replace(/\uFE0F/g, ''))
+                || defaultMap.get(`${k.replace(/\uFE0F/g, '')}\uFE0F`)
+                || defaultMap.get(k.toLowerCase())
+                || null;
+        };
+
+        const merged = [];
+
+        const customList = Object.entries(state.customIcons || {}).map(([key, info]) => {
+            const def = findDefaultForKey(key);
+            return {
+                key,
+                meaning: info.meaning || '',
+                skip: Boolean(info.skip),
+                source: 'custom',
+                category: classifyIconKind(key, def),
+                hasDefault: Boolean(def),
+                defaultMeaning: def ? def.meaning : '',
+                updatedAt: Number(info.updatedAt) || 0
+            };
+        });
+        customList.sort((a, b) => (b.updatedAt - a.updatedAt) || a.key.localeCompare(b.key));
+        merged.push(...customList);
+
+        const learnedList = [];
+        for (const [key, info] of Object.entries(state.learnedIcons || {})) {
+            if (!key || !info || hasKeyVariantInMap(state.customIcons, key)) continue;
+            const meaning = typeof info === 'string'
+                ? info.trim()
+                : String(info[lang] || info.vi || info.en || '').trim();
+            if (!meaning) continue;
+            const def = findDefaultForKey(key);
+            learnedList.push({
+                key,
+                meaning,
+                skip: false,
+                source: 'learned',
+                category: classifyIconKind(key, def),
+                hasDefault: Boolean(def),
+                defaultMeaning: def ? def.meaning : '',
+                ts: (typeof info === 'object' && Number(info.ts)) || 0
+            });
+        }
+        learnedList.sort((a, b) => (b.ts - a.ts) || a.key.localeCompare(b.key));
+        merged.push(...learnedList);
+
+        for (const def of defaultEntries) {
+            if (hasKeyVariantInMap(state.customIcons, def.key) || hasKeyVariantInMap(state.learnedIcons, def.key)) {
+                continue;
+            }
+            merged.push({
+                key: def.key,
+                meaning: def.meaning,
+                skip: false,
+                source: 'default',
+                category: def.category || classifyIconKind(def.key, def),
+                hasDefault: true,
+                defaultMeaning: def.meaning
+            });
+        }
+
+        return merged;
+    }
+
+    function buildIconLibraryRow(entry) {
+        const row = document.createElement('div');
+        row.className = 'glossary-item icon-lib-item' + (entry.skip ? ' skipped' : '');
+
+        const textWrap = document.createElement('div');
+        textWrap.className = 'glossary-item-text';
+
+        const head = document.createElement('div');
+        head.className = 'icon-lib-head';
+
+        const symSpan = document.createElement('span');
+        symSpan.className = 'icon-lib-symbol';
+        symSpan.textContent = entry.key;
+
+        const kindKey = entry.category === 'emoji' ? 'emoji' : 'kaomoji';
+        const kindBadge = document.createElement('span');
+        kindBadge.className = `icon-kind-badge ${kindKey}`;
+        kindBadge.textContent = t(`icon_kind_badge_${kindKey}`);
+
+        const badge = document.createElement('span');
+        const badgeKind = entry.skip ? 'skipped' : entry.source;
+        badge.className = `icon-source-badge ${badgeKind}`;
+        badge.textContent = t(`icon_badge_${badgeKind}`);
+
+        head.appendChild(symSpan);
+        head.appendChild(kindBadge);
+        head.appendChild(badge);
+
+        const descSpan = document.createElement('span');
+        descSpan.className = 'glossary-item-viet';
+        descSpan.textContent = entry.skip ? t('icon_skipped_desc') : entry.meaning;
+
+        textWrap.appendChild(head);
+        textWrap.appendChild(descSpan);
+
+        const skipBtn = document.createElement('button');
+        skipBtn.type = 'button';
+        skipBtn.className = 'icon-btn-sm' + (entry.skip ? ' muted-active' : '');
+        skipBtn.textContent = entry.skip ? '🔇' : '🔊';
+        skipBtn.title = entry.skip ? t('icon_btn_unskip_title') : t('icon_btn_skip_title');
+        skipBtn.addEventListener('click', async () => {
+            if (entry.skip) {
+                if (entry.hasDefault && (!entry.meaning || entry.meaning === entry.defaultMeaning)) {
+                    delete state.customIcons[entry.key];
+                } else if (entry.meaning) {
+                    state.customIcons[entry.key] = { meaning: entry.meaning, skip: false, updatedAt: Date.now() };
+                } else {
+                    delete state.customIcons[entry.key];
+                }
+            } else {
+                state.customIcons[entry.key] = {
+                    meaning: entry.meaning || entry.defaultMeaning || '',
+                    skip: true,
+                    updatedAt: Date.now()
+                };
+            }
+            await persistCustomIcons();
+            renderIconLibraryList();
+        });
+
+        const editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'icon-btn-sm';
+        editBtn.textContent = '✏️';
+        editBtn.title = t('icon_btn_edit_title');
+        editBtn.addEventListener('click', async () => {
+            const nextMeaning = await showPrompt(entry.key, t('icon_lib_meaning_ph'), entry.meaning || entry.defaultMeaning || '');
+            if (nextMeaning !== null && nextMeaning.trim()) {
+                state.customIcons[entry.key] = {
+                    meaning: nextMeaning.trim().slice(0, 80),
+                    skip: false,
+                    updatedAt: Date.now()
+                };
+                await persistCustomIcons();
+                renderIconLibraryList();
+            }
+        });
+
+        row.appendChild(textWrap);
+        row.appendChild(skipBtn);
+        row.appendChild(editBtn);
+
+        if (entry.source === 'custom' || entry.source === 'learned') {
+            const delBtn = document.createElement('button');
+            delBtn.type = 'button';
+            delBtn.className = 'icon-btn-sm';
+            const isReset = entry.source === 'custom' && entry.hasDefault;
+            delBtn.textContent = isReset ? '↺' : '🗑️';
+            delBtn.title = isReset ? t('icon_btn_reset_title') : t('icon_btn_delete_title');
+            delBtn.addEventListener('click', async () => {
+                const msgKey = isReset ? 'icon_lib_reset_msg' : 'icon_lib_delete_msg';
+                const ok = await showConfirm(t('icon_lib_delete_title'), t(msgKey, { symbol: entry.key }));
+                if (!ok) return;
+                if (entry.source === 'custom') {
+                    delete state.customIcons[entry.key];
+                    await persistCustomIcons();
+                } else {
+                    delete state.learnedIcons[entry.key];
+                    await persistLearnedIcons();
+                }
+                renderIconLibraryList();
+            });
+            row.appendChild(delBtn);
+        }
+
+        return row;
+    }
+
+    function renderIconLibraryList() {
+        const listEl = $('icon-lib-list');
+        if (!listEl) return;
+
+        const allEntries = getMergedIconLibraryEntries();
+        const learnedCount = allEntries.filter((e) => e.source === 'learned').length;
+        const learnedBar = $('icon-learned-bar');
+        const learnedCountEl = $('icon-learned-count');
+        if (learnedBar) learnedBar.hidden = learnedCount === 0;
+        if (learnedCountEl) learnedCountEl.textContent = t('icon_lib_learned_summary', { count: learnedCount });
+
+        const q = state.iconSearchQuery.trim().toLowerCase();
+        const baseFiltered = allEntries.filter((entry) => {
+            if (state.iconFilterMode === 'custom' && entry.source !== 'custom') return false;
+            if (state.iconFilterMode === 'skipped' && !entry.skip) return false;
+            if (state.iconFilterMode === 'learned' && entry.source !== 'learned') return false;
+            if (state.iconFilterMode === 'default' && entry.source !== 'default') return false;
+            if (q) {
+                return entry.key.toLowerCase().includes(q) || entry.meaning.toLowerCase().includes(q);
+            }
+            return true;
+        });
+
+        const emojiCount = baseFiltered.filter((e) => e.category === 'emoji').length;
+        const kaomojiCount = baseFiltered.length - emojiCount;
+        const countAllEl = $('icon-kind-count-all');
+        const countEmojiEl = $('icon-kind-count-emoji');
+        const countKaomojiEl = $('icon-kind-count-kaomoji');
+        if (countAllEl) countAllEl.textContent = String(baseFiltered.length);
+        if (countEmojiEl) countEmojiEl.textContent = String(emojiCount);
+        if (countKaomojiEl) countKaomojiEl.textContent = String(kaomojiCount);
+
+        const filtered = state.iconKindFilter === 'all'
+            ? baseFiltered
+            : baseFiltered.filter((e) => e.category === state.iconKindFilter);
+
+        const countEl = $('icon-lib-count');
+        if (countEl) countEl.textContent = String(filtered.length);
+
+        listEl.textContent = '';
+        if (filtered.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'glossary-empty';
+            empty.textContent = q
+                ? t('icon_lib_no_match', { query: state.iconSearchQuery.trim() })
+                : t('icon_lib_empty');
+            listEl.appendChild(empty);
+            return;
+        }
+
+        const frag = document.createDocumentFragment();
+        const appendSectionHeader = (kindKey, count) => {
+            const hdr = document.createElement('div');
+            hdr.className = `icon-section-header ${kindKey}`;
+            hdr.textContent = t(`icon_section_${kindKey}`, { count });
+            frag.appendChild(hdr);
+        };
+
+        if (state.iconKindFilter === 'all') {
+            const emojiItems = filtered.filter((e) => e.category === 'emoji');
+            const kaomojiItems = filtered.filter((e) => e.category !== 'emoji');
+            if (emojiItems.length > 0 && kaomojiItems.length > 0) {
+                appendSectionHeader('emoji', emojiItems.length);
+                emojiItems.forEach((entry) => frag.appendChild(buildIconLibraryRow(entry)));
+                appendSectionHeader('kaomoji', kaomojiItems.length);
+                kaomojiItems.forEach((entry) => frag.appendChild(buildIconLibraryRow(entry)));
+                listEl.appendChild(frag);
+                return;
+            }
+        }
+
+        filtered.forEach((entry) => {
+            frag.appendChild(buildIconLibraryRow(entry));
+        });
+
+        listEl.appendChild(frag);
+    }
+
+    async function handleAddIconEntry() {
+        const symInput = $('add-icon-symbol');
+        const meanInput = $('add-icon-meaning');
+        const skipCb = $('add-icon-skip');
+
+        const rawSym = symInput.value.trim();
+        const key = (IconDescriber && typeof IconDescriber.normalizeCacheKey === 'function')
+            ? IconDescriber.normalizeCacheKey(rawSym)
+            : rawSym;
+        if (!key) {
+            symInput.focus();
+            return;
+        }
+        const skip = Boolean(skipCb && skipCb.checked);
+        const meaning = meanInput.value.trim().slice(0, 80);
+        if (!skip && !meaning) {
+            meanInput.focus();
+            return;
+        }
+
+        state.customIcons[key] = {
+            meaning: skip ? '' : meaning,
+            skip,
+            updatedAt: Date.now()
+        };
+
+        symInput.value = '';
+        meanInput.value = '';
+        if (skipCb) skipCb.checked = false;
+        meanInput.disabled = false;
+
+        const addedCat = classifyIconKind(key, null);
+        if (state.iconKindFilter !== 'all' && state.iconKindFilter !== addedCat) {
+            setIconKindFilter(addedCat);
+        }
+
+        await persistCustomIcons();
+        renderIconLibraryList();
+    }
+
+    function handleExportIconLibrary() {
+        const payload = JSON.stringify({
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            customIcons: state.customIcons,
+            learnedIcons: state.learnedIcons
+        }, null, 2);
+        const blob = new Blob([payload], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'stv-emoji-library.json';
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    async function handleImportIconLibraryFile(file) {
+        if (!file) return;
+        try {
+            const text = await file.text();
+            const parsed = JSON.parse(text);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                await showAlert(t('glossary_subtab_icons'), t('icon_lib_import_invalid'));
+                return;
+            }
+            const rawCustom = parsed.customIcons !== undefined
+                ? parsed.customIcons
+                : (parsed.icons !== undefined ? parsed.icons : parsed);
+            const normalized = normalizeCustomIconEntryMap(rawCustom);
+            const entries = Object.entries(normalized);
+            if (entries.length === 0) {
+                await showAlert(t('glossary_subtab_icons'), t('icon_lib_import_invalid'));
+                return;
+            }
+            const now = Date.now();
+            entries.forEach(([k, info]) => {
+                state.customIcons[k] = {
+                    meaning: info.meaning,
+                    skip: Boolean(info.skip),
+                    updatedAt: info.updatedAt || now
+                };
+            });
+            await persistCustomIcons();
+            renderIconLibraryList();
+            await showAlert(t('glossary_subtab_icons'), t('icon_lib_imported', { added: entries.length }));
+        } catch (_) {
+            await showAlert(t('glossary_subtab_icons'), t('icon_lib_import_invalid'));
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Cleanup & Move Modals
     // -------------------------------------------------------------------------
     function openCleanupModal() {
@@ -2075,6 +2548,72 @@
             e.target.value = '';
         });
 
+        // Glossary / Emoji sub-tabs
+        $('subtab-glossary-terms').addEventListener('click', () => switchGlossarySubtab('terms'));
+        $('subtab-glossary-icons').addEventListener('click', () => switchGlossarySubtab('icons'));
+        $('add-icon-skip').addEventListener('change', (e) => {
+            $('add-icon-meaning').disabled = Boolean(e.target.checked);
+        });
+        $('btn-add-icon').addEventListener('click', handleAddIconEntry);
+        $('add-icon-symbol').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); void handleAddIconEntry(); }
+        });
+        $('add-icon-meaning').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); void handleAddIconEntry(); }
+        });
+        $('icon-search-input').addEventListener('input', (e) => {
+            const val = e.target.value;
+            $('btn-clear-icon-search').hidden = !val;
+            clearTimeout(state.iconSearchTimer);
+            state.iconSearchTimer = setTimeout(() => {
+                state.iconSearchQuery = val;
+                renderIconLibraryList();
+            }, 150);
+        });
+        $('btn-clear-icon-search').addEventListener('click', () => {
+            $('icon-search-input').value = '';
+            $('btn-clear-icon-search').hidden = true;
+            state.iconSearchQuery = '';
+            renderIconLibraryList();
+        });
+        document.querySelectorAll('.pill-btn[data-icon-filter]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.pill-btn[data-icon-filter]').forEach((b) => b.classList.remove('active'));
+                btn.classList.add('active');
+                state.iconFilterMode = btn.getAttribute('data-icon-filter') || 'all';
+                renderIconLibraryList();
+            });
+        });
+        document.querySelectorAll('[data-icon-kind]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                setIconKindFilter(btn.getAttribute('data-icon-kind'));
+                renderIconLibraryList();
+            });
+        });
+        $('btn-clear-learned-icons').addEventListener('click', async () => {
+            const count = Object.keys(state.learnedIcons || {}).length;
+            if (!count) return;
+            const ok = await showConfirm(
+                t('icon_lib_clear_learned'),
+                t('icon_lib_clear_learned_confirm', { count })
+            );
+            if (!ok) return;
+            state.learnedIcons = {};
+            await persistLearnedIcons();
+            renderIconLibraryList();
+        });
+        $('btn-export-icons').addEventListener('click', handleExportIconLibrary);
+        $('btn-import-icons').addEventListener('click', () => $('icon-import-file').click());
+        $('icon-import-file').addEventListener('change', async (e) => {
+            const file = e.target.files && e.target.files[0];
+            await handleImportIconLibraryFile(file);
+            e.target.value = '';
+        });
+        $('btn-open-icon-lib').addEventListener('click', () => {
+            switchMainTab('glossary');
+            switchGlossarySubtab('icons');
+        });
+
         // Cleanup modal
         $('btn-scan-cleanup').addEventListener('click', openCleanupModal);
         $('btn-clean-cancel').addEventListener('click', () => { $('clean-glossary-overlay').hidden = true; });
@@ -2144,9 +2683,9 @@
             }
         });
         $('btn-save').addEventListener('click', () => { void saveAllSettings(); });
-        ['tts-ws-fallback', 'tts-autoplay', 'tts-autonext', 'settings-debug-log'].forEach((id) => {
-            const checkbox = $(id);
-            if (checkbox) checkbox.addEventListener('change', () => { void saveAllSettings(); });
+        ['tts-ws-fallback', 'tts-autoplay', 'tts-autonext', 'tts-icon-mode', 'tts-icon-style', 'settings-debug-log'].forEach((id) => {
+            const ctrl = $(id);
+            if (ctrl) ctrl.addEventListener('change', () => { void saveAllSettings(); });
         });
     }
 
@@ -2159,7 +2698,8 @@
         await Promise.all([
             loadSettingsIntoUI(),
             refreshActiveTabInfo(),
-            loadGlossaryData()
+            loadGlossaryData(),
+            loadIconLibraryData()
         ]);
         refreshLocalizedUI();
     }

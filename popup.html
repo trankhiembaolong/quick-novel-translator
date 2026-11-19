@@ -146,53 +146,120 @@
 
         <!-- TAB 3: GLOSSARY -->
         <section id="panel-glossary" class="tab-panel" role="tabpanel">
-            <div class="card">
-                <div class="input-with-btn">
-                    <select id="glossary-profile-select"></select>
-                    <button id="btn-new-profile" class="btn btn-primary btn-sm" type="button" data-i18n="btn_new_profile">Tạo mới</button>
-                    <button id="btn-delete-profile" class="btn btn-danger btn-sm" type="button" data-i18n="btn_delete_profile">Xóa</button>
+            <div class="subtab-bar" role="tablist">
+                <button id="subtab-glossary-terms" class="subtab-btn active" data-glossary-subtab="terms" role="tab" aria-selected="true" type="button" data-i18n="glossary_subtab_terms">Thuật ngữ</button>
+                <button id="subtab-glossary-icons" class="subtab-btn" data-glossary-subtab="icons" role="tab" aria-selected="false" type="button" data-i18n="glossary_subtab_icons">Emoji / Icon</button>
+            </div>
+
+            <div id="glossary-subpanel-terms">
+                <div class="card">
+                    <div class="input-with-btn">
+                        <select id="glossary-profile-select"></select>
+                        <button id="btn-new-profile" class="btn btn-primary btn-sm" type="button" data-i18n="btn_new_profile">Tạo mới</button>
+                        <button id="btn-delete-profile" class="btn btn-danger btn-sm" type="button" data-i18n="btn_delete_profile">Xóa</button>
+                    </div>
+                    <div class="input-with-btn">
+                        <input type="text" id="add-orig" data-i18n-attr="placeholder:glossary_orig_ph" placeholder="Từ gốc (Trung)">
+                        <input type="text" id="add-hanviet" data-i18n-attr="placeholder:glossary_viet_ph" placeholder="Nghĩa dịch (Việt)">
+                        <button id="btn-add-term" class="btn btn-primary btn-sm" type="button" data-i18n="btn_add">Thêm</button>
+                    </div>
                 </div>
-                <div class="input-with-btn">
-                    <input type="text" id="add-orig" data-i18n-attr="placeholder:glossary_orig_ph" placeholder="Từ gốc (Trung)">
-                    <input type="text" id="add-hanviet" data-i18n-attr="placeholder:glossary_viet_ph" placeholder="Nghĩa dịch (Việt)">
-                    <button id="btn-add-term" class="btn btn-primary btn-sm" type="button" data-i18n="btn_add">Thêm</button>
+
+                <div class="card">
+                    <div class="site-row">
+                        <strong style="font-size: 12.5px;"><span id="glossary-list-heading">Danh sách</span> (<span id="glossary-count">0</span>)</strong>
+                        <div style="display: flex; gap: 4px;">
+                            <button id="btn-export-glossary" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_export_json">Xuất JSON</button>
+                            <button id="btn-import-glossary" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_import_json">Nhập JSON</button>
+                            <input type="file" id="glossary-import-file" accept=".json,application/json" style="display: none;">
+                        </div>
+                    </div>
+
+                    <div class="input-with-btn">
+                        <input type="text" id="glossary-search-input" data-i18n-attr="placeholder:glossary_search_ph" placeholder="Tìm từ gốc hoặc nghĩa dịch...">
+                        <button id="btn-clear-search" class="btn btn-secondary btn-sm" type="button" hidden>✕</button>
+                    </div>
+
+                    <div class="filter-pills">
+                        <button class="pill-btn active" data-filter="all" type="button" data-i18n="glossary_filter_all">Tất cả</button>
+                        <button class="pill-btn" data-filter="locked" type="button" data-i18n="glossary_filter_locked">Đã khóa</button>
+                        <button class="pill-btn" data-filter="unlocked" type="button" data-i18n="glossary_filter_unlocked">Chưa khóa</button>
+                    </div>
+
+                    <div id="glossary-batch-actions" class="glossary-tools">
+                        <label class="checkbox-row" style="font-size: 11.5px;">
+                            <input type="checkbox" id="select-all-terms">
+                            <span data-i18n="glossary_select_all">Chọn tất cả</span>
+                        </label>
+                        <div style="display: flex; gap: 4px; flex-wrap: wrap;">
+                            <button id="btn-scan-cleanup" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_scan_clean">Quét rác</button>
+                            <button id="btn-move-used" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_move_used">Chuyển đã dùng</button>
+                            <button id="btn-delete-selected" class="btn btn-danger btn-sm" type="button" hidden>Xóa</button>
+                        </div>
+                    </div>
+
+                    <div id="glossary-list" class="glossary-list"></div>
                 </div>
             </div>
 
-            <div class="card">
-                <div class="site-row">
-                    <strong style="font-size: 12.5px;"><span id="glossary-list-heading">Danh sách</span> (<span id="glossary-count">0</span>)</strong>
-                    <div style="display: flex; gap: 4px;">
-                        <button id="btn-export-glossary" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_export_json">Xuất JSON</button>
-                        <button id="btn-import-glossary" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_import_json">Nhập JSON</button>
-                        <input type="file" id="glossary-import-file" accept=".json,application/json" style="display: none;">
+            <div id="glossary-subpanel-icons" hidden>
+                <div class="card">
+                    <div class="input-with-btn">
+                        <input type="text" id="add-icon-symbol" style="flex: 0 0 96px;" data-i18n-attr="placeholder:icon_lib_symbol_ph" placeholder="Icon / Kaomoji">
+                        <input type="text" id="add-icon-meaning" data-i18n-attr="placeholder:icon_lib_meaning_ph" placeholder="Câu mô tả TTS...">
+                        <button id="btn-add-icon" class="btn btn-primary btn-sm" type="button" data-i18n="btn_add">Thêm</button>
                     </div>
-                </div>
-
-                <div class="input-with-btn">
-                    <input type="text" id="glossary-search-input" data-i18n-attr="placeholder:glossary_search_ph" placeholder="Tìm từ gốc hoặc nghĩa dịch...">
-                    <button id="btn-clear-search" class="btn btn-secondary btn-sm" type="button" hidden>✕</button>
-                </div>
-
-                <div class="filter-pills">
-                    <button class="pill-btn active" data-filter="all" type="button" data-i18n="glossary_filter_all">Tất cả</button>
-                    <button class="pill-btn" data-filter="locked" type="button" data-i18n="glossary_filter_locked">Đã khóa</button>
-                    <button class="pill-btn" data-filter="unlocked" type="button" data-i18n="glossary_filter_unlocked">Chưa khóa</button>
-                </div>
-
-                <div id="glossary-batch-actions" class="glossary-tools">
                     <label class="checkbox-row" style="font-size: 11.5px;">
-                        <input type="checkbox" id="select-all-terms">
-                        <span data-i18n="glossary_select_all">Chọn tất cả</span>
+                        <input type="checkbox" id="add-icon-skip">
+                        <span data-i18n="icon_lib_skip_label">Bỏ qua (không đọc icon này khi TTS)</span>
                     </label>
-                    <div style="display: flex; gap: 4px; flex-wrap: wrap;">
-                        <button id="btn-scan-cleanup" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_scan_clean">Quét rác</button>
-                        <button id="btn-move-used" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_move_used">Chuyển đã dùng</button>
-                        <button id="btn-delete-selected" class="btn btn-danger btn-sm" type="button" hidden>Xóa</button>
-                    </div>
                 </div>
 
-                <div id="glossary-list" class="glossary-list"></div>
+                <div class="card">
+                    <div class="site-row">
+                        <strong style="font-size: 12.5px;"><span id="icon-lib-heading" data-i18n="icon_lib_list_title">Thư viện Icon</span> (<span id="icon-lib-count">0</span>)</strong>
+                        <div style="display: flex; gap: 4px;">
+                            <button id="btn-export-icons" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_export_json">Xuất JSON</button>
+                            <button id="btn-import-icons" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_import_json">Nhập JSON</button>
+                            <input type="file" id="icon-import-file" accept=".json,application/json" style="display: none;">
+                        </div>
+                    </div>
+
+                    <div class="input-with-btn">
+                        <input type="text" id="icon-search-input" data-i18n-attr="placeholder:icon_lib_search_ph" placeholder="Tìm icon hoặc câu đọc...">
+                        <button id="btn-clear-icon-search" class="btn btn-secondary btn-sm" type="button" hidden>✕</button>
+                    </div>
+
+                    <div class="icon-kind-bar" role="group" aria-label="Icon category">
+                        <button id="icon-kind-all" class="icon-kind-btn active" data-icon-kind="all" type="button" aria-pressed="true">
+                            <span data-i18n="icon_kind_all">Tất cả</span>
+                            <span id="icon-kind-count-all" class="icon-kind-count">0</span>
+                        </button>
+                        <button id="icon-kind-emoji" class="icon-kind-btn" data-icon-kind="emoji" type="button" aria-pressed="false">
+                            <span data-i18n="icon_kind_emoji">Icon / Emoji</span>
+                            <span id="icon-kind-count-emoji" class="icon-kind-count">0</span>
+                        </button>
+                        <button id="icon-kind-kaomoji" class="icon-kind-btn" data-icon-kind="kaomoji" type="button" aria-pressed="false">
+                            <span data-i18n="icon_kind_kaomoji">Kaomoji</span>
+                            <span id="icon-kind-count-kaomoji" class="icon-kind-count">0</span>
+                        </button>
+                    </div>
+
+                    <div class="filter-pills icon-filter-pills">
+                        <button class="pill-btn active" data-icon-filter="all" type="button" data-i18n="icon_filter_all">Tất cả</button>
+                        <button class="pill-btn" data-icon-filter="custom" type="button" data-i18n="icon_filter_custom">Tùy chỉnh</button>
+                        <button class="pill-btn" data-icon-filter="skipped" type="button" data-i18n="icon_filter_skipped">Bỏ qua</button>
+                        <button class="pill-btn" data-icon-filter="learned" type="button" data-i18n="icon_filter_learned">AI học</button>
+                        <button class="pill-btn" data-icon-filter="default" type="button" data-i18n="icon_filter_default">Mặc định</button>
+                    </div>
+
+                    <div id="icon-learned-bar" class="glossary-tools" hidden>
+                        <span id="icon-learned-count" class="muted" style="font-size: 11px;"></span>
+                        <button id="btn-clear-learned-icons" class="btn btn-secondary btn-sm" type="button" data-i18n="icon_lib_clear_learned">Xóa cache AI</button>
+                    </div>
+
+                    <div id="icon-lib-list" class="glossary-list"></div>
+                </div>
             </div>
         </section>
 
@@ -322,6 +389,24 @@
                         <label class="field-label" for="tts-preload-sec" data-i18n="settings_tts_preload_sec">Thời gian tải trước (giây)</label>
                         <input type="number" id="tts-preload-sec" min="5" max="300" placeholder="60">
                     </div>
+                    <div class="btn-row">
+                        <div class="field" style="flex: 1;">
+                            <label class="field-label" for="tts-icon-mode" data-i18n="settings_tts_icon_mode_label">Mô tả icon / kaomoji</label>
+                            <select id="tts-icon-mode">
+                                <option value="auto" data-i18n="tts_icon_mode_auto">Tự động (Từ điển + AI)</option>
+                                <option value="local" data-i18n="tts_icon_mode_local">Chỉ cục bộ (Offline)</option>
+                                <option value="off" data-i18n="tts_icon_mode_off">Tắt (chỉ lọc ký tự rác)</option>
+                            </select>
+                        </div>
+                        <div class="field" style="flex: 1;">
+                            <label class="field-label" for="tts-icon-style" data-i18n="settings_tts_icon_style_label">Phong cách đọc icon</label>
+                            <select id="tts-icon-style">
+                                <option value="tagged" data-i18n="tts_icon_style_tagged" selected>Tách bạch (Biểu cảm...)</option>
+                                <option value="natural" data-i18n="tts_icon_style_natural">Tự nhiên theo truyện</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button id="btn-open-icon-lib" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_open_icon_lib">Quản lý thư viện Emoji / Icon →</button>
                     <label class="checkbox-row">
                         <input type="checkbox" id="settings-debug-log">
                         <span data-i18n="settings_debug_log">Bật log debug chi tiết</span>
@@ -388,6 +473,7 @@
     <script src="i18n.js"></script>
     <script src="url-validator.js"></script>
     <script src="glossary-utils.js"></script>
+    <script src="tts-icon-describer.js"></script>
     <script src="popup.js"></script>
 </body>
 

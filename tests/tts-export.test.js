@@ -184,3 +184,53 @@ test('tts-player Shadow DOM enforces [hidden] over flex download bars and backgr
         'background preload must fall back to hidden iframe when raw HTML only has a pending placeholder nextUrl'
     );
 });
+
+test('packSegmentsForExport avoids multi-part rawText duplication and double icon wrapping', () => {
+    const describerCode = fs.readFileSync(path.resolve(__dirname, '..', 'tts-icon-describer.js'), 'utf8');
+    const playerCode = fs.readFileSync(path.resolve(__dirname, '..', 'tts-player.js'), 'utf8');
+    const sandbox = {
+        window: undefined,
+        globalThis: {},
+        atob: (b64) => Buffer.from(b64, 'base64').toString('binary'),
+        Blob,
+        Float32Array,
+        Int16Array,
+        Uint8Array,
+        ArrayBuffer,
+        DataView,
+        Math,
+        Number,
+        String,
+        Array
+    };
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(describerCode, sandbox);
+    vm.runInNewContext(playerCode, sandbox);
+    const helpers = sandbox.STV_TTSHelpers;
+
+    const longParagraph = [
+        'Đoạn mở đầu rất dài nói về hành trình tu luyện gian khổ trong núi sâu qua nhiều năm tháng trường kỳ.',
+        'Đoạn tiếp theo kể về việc hắn tìm thấy bí kíp cổ xưa dưới đáy vực thẳm lạnh lẽo đầy sương mù.',
+        'Đoạn cuối cùng miêu tả cảnh hắn đột phá cảnh giới giữa cơn giông bão mịt mù trời đất.'
+    ].join(' ');
+
+    const segments = [];
+    helpers.appendPackedSegment(segments, longParagraph, null, 0, { mode: 'auto', style: 'tagged' });
+    assert.ok(segments.length >= 2, 'Long paragraph must split across multiple playback segments');
+
+    const exported = helpers.packSegmentsForExport(segments, 210, { mode: 'auto', style: 'tagged' });
+    const joined = exported.map((s) => s.text).join(' ');
+    const firstSentenceCount = joined.split('Đoạn mở đầu rất dài').length - 1;
+    assert.equal(firstSentenceCount, 1, 'Multi-part paragraph must not be duplicated when repacked for export');
+
+    const kaomojiSegments = [];
+    const iconOpts = { mode: 'auto', style: 'tagged' };
+    helpers.appendPackedSegment(kaomojiSegments, 'Sở Oánh: "Con gái, sao thế?"', null, 0, iconOpts);
+    helpers.appendPackedSegment(kaomojiSegments, 'Cô con gái: ૮ε˚۵ ⋋ʌ⋋۵ 3˚ა', null, 0, iconOpts);
+    helpers.appendPackedSegment(kaomojiSegments, 'Cô lao bổ vào Sở Oánh.', null, 0, iconOpts);
+
+    const packedKaomoji = helpers.packSegmentsForExport(kaomojiSegments, 210, iconOpts);
+    assert.equal(packedKaomoji.length, 3, 'Kaomoji segment must not merge into adjacent prose segments');
+    assert.equal(packedKaomoji[1].needsAiIconResolve, true);
+    assert.ok(!/biểu cảm\s+biểu cảm/i.test(packedKaomoji[1].text), `Must not double-wrap tag: ${packedKaomoji[1].text}`);
+});

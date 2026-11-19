@@ -188,4 +188,195 @@ describe('Feature 4: Dual-Engine TTS Subsystem & Automatic Fallback', () => {
         const trimmed = trimmer.push(silence);
         assert.strictEqual(trimmed, null, 'Initial silence accumulates until threshold');
     });
+
+    it('T1.25: pure-icon lines are not dropped and default to tagged description style', async () => {
+        const span = document.createElement('span');
+        span.className = 'stv-line';
+        span.textContent = '😭😭😭';
+        document.body.appendChild(span);
+
+        const res = await STV_TTSController.start({ engine: 'webspeech' });
+        assert.strictEqual(res.ok, true);
+        assert.strictEqual(STV_TTSController.getState().iconMode, 'auto');
+        assert.strictEqual(STV_TTSController.getState().iconStyle, 'tagged');
+        assert.strictEqual(speechSynthesis.queue.length, 1);
+        assert.ok(speechSynthesis.queue[0].text.includes('Biểu cảm khóc nức nở dữ dội'));
+        assert.strictEqual(span.textContent, '😭😭😭', 'Original DOM line must never be mutated');
+        STV_TTSController.stop();
+    });
+
+    it('T1.26: resolves complex kaomoji via background AI with context, updates preview, and reuses learned cache', async () => {
+        await chrome.storage.local.set({
+            endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+            apikey: 'sk-test-valid-key',
+            model: 'google/gemini-2.5-flash'
+        });
+
+        let aiCalls = 0;
+        let capturedPayload = null;
+        sandbox.network.addRoute('/chat/completions', async (url, options) => {
+            aiCalls += 1;
+            const body = JSON.parse(options.body);
+            capturedPayload = JSON.parse(body.messages[1].content);
+            assert.strictEqual(body.model, 'google/gemini-2.5-flash');
+            assert.strictEqual(options.headers.Authorization, 'Bearer sk-test-valid-key');
+            return new Response(JSON.stringify({
+                choices: [{
+                    message: {
+                        content: JSON.stringify({
+                            results: [{
+                                id: capturedPayload.items[0].id,
+                                spoken: 'Cô con gái, biểu cảm mếu máo khóc nấc vì ấm ức.',
+                                icon_gloss: { '૮ε˚۵ ⋋ʌ⋋۵ 3˚ა': 'mếu máo khóc nấc vì ấm ức' }
+                            }]
+                        })
+                    }
+                }]
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        });
+
+        const l1 = document.createElement('span');
+        l1.className = 'stv-line';
+        l1.textContent = 'Sở Oánh: "Con gái, sao thế?"';
+        const l2 = document.createElement('span');
+        l2.className = 'stv-line';
+        l2.textContent = 'Cô con gái: ૮ε˚۵ ⋋ʌ⋋۵ 3˚ა';
+        const l3 = document.createElement('span');
+        l3.className = 'stv-line';
+        l3.textContent = 'Cô lao bổ vào Sở Oánh: "A... tại mẹ hết..."';
+        document.body.appendChild(l1);
+        document.body.appendChild(l2);
+        document.body.appendChild(l3);
+
+        await STV_TTSController.start({ engine: 'webspeech' });
+        assert.strictEqual(speechSynthesis.queue.length, 1, 'First non-icon line must start immediately');
+        assert.ok(speechSynthesis.queue[0].text.includes('Sở Oánh'));
+
+        // Wait for background AI batch to finish
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        assert.strictEqual(aiCalls, 1);
+        assert.ok(capturedPayload.items[0].prev.includes('Sở Oánh'));
+        assert.ok(capturedPayload.items[0].next.includes('lao bổ'));
+
+        // Advance to segment 2 (MockSpeechSynthesis.cancel clears queue before pushing next utterance)
+        speechSynthesis.queue[0].onend();
+        assert.strictEqual(speechSynthesis.queue.length, 1);
+        assert.strictEqual(speechSynthesis.queue[0].text, 'Cô con gái, biểu cảm mếu máo khóc nấc vì ấm ức.');
+        assert.strictEqual(l2.textContent, 'Cô con gái: ૮ε˚۵ ⋋ʌ⋋۵ 3˚ა', 'Original DOM must stay untouched');
+
+        const previewEl = document.getElementById('stv-tts-root')?.shadowRoot?.querySelector('.stv-tts-preview');
+        assert.strictEqual(previewEl?.textContent, 'Cô con gái, biểu cảm mếu máo khóc nấc vì ấm ức.');
+
+        const stored = await chrome.storage.local.get(['stv_tts_icon_cache']);
+        assert.strictEqual(stored.stv_tts_icon_cache['૮ε˚۵ ⋋ʌ⋋۵ 3˚ა'].vi, 'mếu máo khóc nấc vì ấm ức');
+
+        STV_TTSController.stop();
+
+        // Second playback on same kaomoji must hit cache with 0 additional AI calls
+        await STV_TTSController.start({ engine: 'webspeech', startIndex: 1 });
+        assert.strictEqual(aiCalls, 1, 'Learned cache hit must avoid duplicate AI call');
+        assert.strictEqual(speechSynthesis.queue.length, 1);
+        assert.strictEqual(speechSynthesis.queue[0].text, 'Cô con gái, biểu cảm mếu máo khóc nấc vì ấm ức');
+        STV_TTSController.stop();
+    });
+
+    it('T1.27: falls back gracefully when API key is missing or AI errors, and honors iconMode=off', async () => {
+        const span = document.createElement('span');
+        span.className = 'stv-line';
+        span.textContent = 'Cô con gái: ૮ε˚۵ ⋋ʌ⋋۵ 3˚ა';
+        document.body.appendChild(span);
+
+        // No apikey configured -> falls back cleanly to Tier 3 structural heuristic
+        await STV_TTSController.start({ engine: 'webspeech' });
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        assert.strictEqual(speechSynthesis.queue.length, 1);
+        assert.ok(speechSynthesis.queue[0].text.startsWith('Cô con gái, biểu cảm '));
+        assert.ok(!/[\u0A80-\u0AFF\u10A0-\u10FF\u0250-\u02FF\u06F5]/.test(speechSynthesis.queue[0].text));
+        STV_TTSController.stop();
+
+        // Configured apikey but AI endpoint fails -> waits briefly and falls back cleanly without error
+        await chrome.storage.local.set({ apikey: 'sk-test-valid-key' });
+        sandbox.network.addRoute('/chat/completions', async () => new Response('Server error', { status: 500 }));
+        await STV_TTSController.start({ engine: 'webspeech' });
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        assert.strictEqual(speechSynthesis.queue.length, 1);
+        assert.ok(speechSynthesis.queue[0].text.startsWith('Cô con gái, biểu cảm '));
+        STV_TTSController.stop();
+
+        // iconMode = 'off' strips kaomoji cleanly
+        await STV_TTSController.start({ engine: 'webspeech', iconMode: 'off' });
+        assert.strictEqual(speechSynthesis.queue.length, 1);
+        assert.strictEqual(speechSynthesis.queue[0].text, 'Cô con gái');
+        STV_TTSController.stop();
+    });
+
+    it('T1.28: honors stv_tts_custom_icons overrides, per-icon skip, and prevents AI cache overwrite', async () => {
+        await chrome.storage.local.set({
+            apikey: 'sk-test-valid-key',
+            stv_tts_custom_icons: {
+                '✨': { meaning: 'lấp lánh', skip: true, updatedAt: 100 },
+                '😂': { meaning: 'cười vỡ bụng', skip: false, updatedAt: 200 },
+                '૮ε˚۵ ⋋ʌ⋋۵ 3˚ა': { meaning: 'khóc nức nở vì tủi thân', skip: false, updatedAt: 300 }
+            }
+        });
+
+        let aiCalls = 0;
+        sandbox.network.addRoute('/chat/completions', async () => {
+            aiCalls += 1;
+            return new Response(JSON.stringify({
+                choices: [{
+                    message: {
+                        content: JSON.stringify({
+                            results: [{
+                                id: 0,
+                                spoken: 'AI overridden',
+                                icon_gloss: { '😂': 'should not overwrite custom' }
+                            }]
+                        })
+                    }
+                }]
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        });
+
+        const l1 = document.createElement('span');
+        l1.className = 'stv-line';
+        l1.textContent = '✨'; // completely muted -> must be skipped!
+        const l2 = document.createElement('span');
+        l2.className = 'stv-line';
+        l2.textContent = 'Hắn cười 😂 rồi nhìn ✨ cô bé';
+        const l3 = document.createElement('span');
+        l3.className = 'stv-line';
+        l3.textContent = 'Cô con gái: ૮ε˚۵ ⋋ʌ⋋۵ 3˚ა';
+        document.body.appendChild(l1);
+        document.body.appendChild(l2);
+        document.body.appendChild(l3);
+
+        const res = await STV_TTSController.start({ engine: 'webspeech' });
+        assert.strictEqual(res.ok, true);
+        assert.strictEqual(res.totalSegments, 2, 'Muted icon-only line must be skipped completely');
+        assert.strictEqual(aiCalls, 0, 'Custom-overridden kaomoji must not trigger AI call');
+
+        assert.strictEqual(speechSynthesis.queue[0].text, 'Hắn cười, biểu cảm cười vỡ bụng, rồi nhìn cô bé');
+        speechSynthesis.queue[0].onend();
+        assert.strictEqual(speechSynthesis.queue[0].text, 'Cô con gái, biểu cảm khóc nức nở vì tủi thân');
+        STV_TTSController.stop();
+
+        // Also verify background resolve_tts_icons protects custom icons from cache write
+        const bgRes = await chrome.runtime.sendMessage({
+            action: 'resolve_tts_icons',
+            style: 'tagged',
+            lang: 'vi',
+            items: [{
+                id: 0,
+                prev: '',
+                text: 'Test 😂',
+                fallbackText: 'Test',
+                next: '',
+                icons: ['😂']
+            }]
+        });
+        assert.strictEqual(bgRes.ok, true);
+        const storedAfter = await chrome.storage.local.get(['stv_tts_icon_cache']);
+        assert.strictEqual(storedAfter.stv_tts_icon_cache?.['😂'], undefined, 'Custom icon must never be written into AI cache');
+    });
 });

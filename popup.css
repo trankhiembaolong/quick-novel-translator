@@ -596,6 +596,211 @@ textarea {
     color: var(--text-muted);
 }
 
+/* Glossary / Emoji Sub-tabs */
+.subtab-bar {
+    display: flex;
+    gap: 6px;
+    padding: 3px;
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+}
+
+.subtab-btn {
+    flex: 1;
+    padding: 6px 8px;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+
+.subtab-btn.active {
+    background: var(--primary);
+    color: #fff;
+}
+
+#glossary-subpanel-terms,
+#glossary-subpanel-icons {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+#glossary-subpanel-terms[hidden],
+#glossary-subpanel-icons[hidden] {
+    display: none;
+}
+
+.icon-kind-bar {
+    display: flex;
+    gap: 4px;
+    padding: 3px;
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+}
+
+.icon-kind-btn {
+    flex: 1;
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 5px 6px;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 11.5px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s, color 0.15s;
+}
+
+.icon-kind-btn:hover {
+    color: var(--text);
+}
+
+.icon-kind-btn.active {
+    background: var(--primary);
+    color: #fff;
+}
+
+.icon-kind-count {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: rgba(100, 116, 139, 0.18);
+    color: inherit;
+    line-height: 1.5;
+}
+
+.icon-kind-btn.active .icon-kind-count {
+    background: rgba(255, 255, 255, 0.22);
+    color: #fff;
+}
+
+.icon-filter-pills {
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.icon-filter-pills .pill-btn {
+    flex: 1 1 auto;
+    padding: 4px 7px;
+    font-size: 11px;
+}
+
+.icon-section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-muted);
+    padding: 4px 4px 2px;
+    border-bottom: 1px solid var(--border);
+    margin-top: 4px;
+}
+
+.icon-section-header:first-child {
+    margin-top: 0;
+}
+
+.icon-section-header.emoji {
+    color: var(--accent);
+}
+
+.icon-section-header.kaomoji {
+    color: #7c3aed;
+}
+
+:root[data-theme="dark"] .icon-section-header.kaomoji,
+[data-theme="dark"] .icon-section-header.kaomoji {
+    color: #c4b5fd;
+}
+
+.icon-lib-item.skipped {
+    opacity: 0.72;
+    border-style: dashed;
+}
+
+.icon-lib-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.icon-lib-symbol {
+    font-weight: 700;
+    font-size: 13px;
+    overflow-wrap: anywhere;
+}
+
+.icon-kind-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 999px;
+    white-space: nowrap;
+}
+
+.icon-kind-badge.emoji {
+    background: rgba(13, 148, 136, 0.14);
+    color: var(--accent);
+}
+
+.icon-kind-badge.kaomoji {
+    background: rgba(139, 92, 246, 0.15);
+    color: #7c3aed;
+}
+
+:root[data-theme="dark"] .icon-kind-badge.kaomoji,
+[data-theme="dark"] .icon-kind-badge.kaomoji {
+    background: rgba(167, 139, 250, 0.18);
+    color: #c4b5fd;
+}
+
+.icon-source-badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+.icon-source-badge.custom {
+    background: var(--primary-soft);
+    color: var(--primary);
+}
+
+.icon-source-badge.skipped {
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+
+.icon-source-badge.learned {
+    background: var(--warning-bg);
+    color: var(--warning);
+}
+
+.icon-btn-sm.muted-active {
+    border-color: var(--danger);
+    background: var(--danger-bg);
+    color: var(--danger);
+}
+
 .badge.online {
     background: var(--success-bg);
     color: var(--success-text);

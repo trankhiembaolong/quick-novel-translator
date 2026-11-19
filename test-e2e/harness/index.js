@@ -139,6 +139,7 @@ export function setupSandbox(options = {}) {
         'i18n.js',
         'page-ui.js',
         'extractor.js',
+        'tts-icon-describer.js',
         'tts-player.js',
         'translator.js'
     ];
@@ -171,6 +172,7 @@ export function setupSandbox(options = {}) {
     const readerUI = globalThis.STV_Reader || windowMock.STV_Reader || pageUI?.Reader;
     const modalUI = globalThis.UIModal || globalThis.STV_Modal || windowMock.UIModal || windowMock.STV_Modal || pageUI?.UIModal;
     const ttsHelpers = globalThis.STV_TTSHelpers || windowMock.STV_TTSHelpers;
+    const iconDescriber = globalThis.STV_IconDescriber || windowMock.STV_IconDescriber;
     const ttsController = globalThis.STV_TTSController || windowMock.STV_TTSController;
     const extractorConvert = windowMock.STV_convertHtmlToTextChunks || globalThis.STV_convertHtmlToTextChunks;
     const extractorFindBox = windowMock.STV_findContentBoxInDocument || globalThis.STV_findContentBoxInDocument;
@@ -186,6 +188,7 @@ export function setupSandbox(options = {}) {
     setGlobal('UIModal', modalUI);
     setGlobal('STV_Modal', modalUI);
     setGlobal('STV_TTSHelpers', ttsHelpers);
+    setGlobal('STV_IconDescriber', iconDescriber);
     setGlobal('STV_TTSController', ttsController);
     setGlobal('STV_convertHtmlToTextChunks', extractorConvert);
     setGlobal('STV_findContentBoxInDocument', extractorFindBox);
@@ -232,7 +235,7 @@ export function teardownSandbox() {
     const extraKeys = [
         'importScripts', 'STV_UrlValidator', 'isValidUrl', 'isPrivateIP', 'extractSiteDomain', 'isSafePreloadTarget',
         'STV_GlossaryUtils', 'STV_I18n', 'STV_PageUI', 'STV_Reader', 'UIModal', 'STV_Modal',
-        'STV_TTSHelpers', 'STV_TTSController', 'STV_startTTS', 'STV_stopTTS', 'STV_getTTSState',
+        'STV_TTSHelpers', 'STV_IconDescriber', 'STV_TTSController', 'STV_startTTS', 'STV_stopTTS', 'STV_getTTSState',
         'splitLongTextForTTS', 'WSOLAProcessor', 'ContinuousResampler', 'createAnchorTrimmer', 'cleanTextForSpeech',
         'STV_convertHtmlToTextChunks', 'STV_COMMON_CONTENT_SELECTORS', 'STV_findContentBoxInDocument', 'STV_findNextChapterUrl',
         'STV_extractChapterTextChunks', 'STV_activeContentBox', 'STV_createStreamRenderer',
@@ -342,6 +345,15 @@ export const createAnchorTrimmer = (...args) =>
 
 export const cleanTextForSpeech = (...args) =>
     (globalThis.STV_TTSHelpers?.cleanTextForSpeech || globalThis.cleanTextForSpeech)(...args);
+
+export const STV_IconDescriber = new Proxy({}, {
+    get(_, prop) {
+        const target = globalThis.STV_IconDescriber || {};
+        const val = target[prop];
+        if (typeof val === 'function') return val.bind(target);
+        return val;
+    }
+});
 
 export const STV_TTSController = new Proxy({}, {
     get(_, prop) {
