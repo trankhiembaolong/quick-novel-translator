@@ -145,12 +145,13 @@ test('packSegmentsForExport merges short lines up to 210 chars across segments',
     assert.ok(joined.includes('đám người kia.'));
 });
 
-test('AMD GPU DirectML backend option is wired across popup.html, i18n.js, tts-player.js, and native host', () => {
+test('AMD GPU DirectML backend option is wired across popup.html, i18n.js, tts-player.js, background.js, and native host', () => {
     const root = path.resolve(__dirname, '..');
     const html = fs.readFileSync(path.join(root, 'popup.html'), 'utf8');
     const hostPy = fs.readFileSync(path.join(root, 'native-host', 'vieneu_host.py'), 'utf8');
     const runnerPy = fs.readFileSync(path.join(root, 'native-host', 'vieneu_server_runner.py'), 'utf8');
     const playerJs = fs.readFileSync(path.join(root, 'tts-player.js'), 'utf8');
+    const backgroundJs = fs.readFileSync(path.join(root, 'background.js'), 'utf8');
     const i18n = require(path.join(root, 'i18n.js'));
 
     assert.ok(html.includes('value="amd_gpu"'), 'popup.html must offer amd_gpu option');
@@ -160,14 +161,86 @@ test('AMD GPU DirectML backend option is wired across popup.html, i18n.js, tts-p
 
     assert.ok(hostPy.includes('backend == "amd_gpu"'), 'vieneu_host.py must handle amd_gpu backend');
     assert.ok(hostPy.includes('env["VIENEU_PRECISION"] = "amd_gpu"'));
-    assert.ok(hostPy.includes('env["VIENEU_MAX_STREAMS"] = "3"'), 'vieneu_host.py must allocate 3 streams (2 GPU + 1 CPU)');
+    assert.ok(hostPy.includes('env["VIENEU_MAX_STREAMS"] = "1"'), 'vieneu_host.py must start web listening with 1 worker');
+    assert.ok(hostPy.includes('env["VIENEU_EXPORT_MAX_STREAMS"] = "3"'), 'vieneu_host.py must allow 3-worker export scaling');
+    assert.ok(hostPy.includes('env["OPENBLAS_NUM_THREADS"] = "1"'), 'vieneu_host.py must constrain BLAS threads to 1');
+    assert.ok(!hostPy.includes('ABOVE_NORMAL_PRIORITY_CLASS'), 'vieneu_host.py must not starve Chrome/UI with ABOVE_NORMAL priority');
+
     assert.ok(runnerPy.includes('detect_amd_dml_device_id'), 'vieneu_server_runner.py must detect discrete DirectML adapter');
     assert.ok(runnerPy.includes('SubprocessDmlWorker'), 'vieneu_server_runner.py must support isolated second GPU process');
     assert.ok(runnerPy.includes('DmlExecutionProvider'));
+    assert.ok(runnerPy.includes('ResizableGate'), 'vieneu_server_runner.py must use ResizableGate for live 1 <-> 3 scaling');
+    assert.ok(runnerPy.includes('/v1/workers/mode'), 'vieneu_server_runner.py must expose /v1/workers/mode endpoint');
+    assert.ok(runnerPy.includes('allow_spinning'), 'vieneu_server_runner.py must disable ORT busy spinning');
+    assert.ok(runnerPy.includes('OPENBLAS_NUM_THREADS'), 'vieneu_server_runner.py must enforce OPENBLAS_NUM_THREADS=1');
     assert.ok(runnerPy.includes('eng._ac_pos_steps[ch]'), 'acoustic frame step must index _ac_pos_steps[ch] cleanly');
     assert.ok(!runnerPy.includes('eng._ac_pos_steps[ch - 1]'), 'must not shift acoustic RoPE position_ids by -1');
     assert.ok(!/sess_codec_dec[\s\S]{0,120}providers=dml_prov/.test(runnerPy), 'MOSS codec decoder must stay on CPU to avoid DirectML ConvTranspose hum');
+
     assert.ok(playerJs.includes('const EXPORT_CONCURRENCY = 3;'), 'tts-player.js must permit 3 concurrent WAV export streams');
+    assert.ok(playerJs.includes('vieneu_set_worker_mode'), 'tts-player.js must scale VieNeu workers around WAV export');
+    assert.ok(backgroundJs.includes("request.action === 'vieneu_set_worker_mode'"), 'background.js must proxy vieneu_set_worker_mode');
+});
+
+test('optimized decodePcm16Base64ToFloat32, createAnchorTrimmer, and WSOLAProcessor preserve accuracy', () => {
+    const helpers = loadTtsHelpers();
+
+    // 1. decodePcm16Base64ToFloat32 exact conversion
+    const pcm = new Int16Array([0, 16384, -32768, 32767]);
+    const b64 = Buffer.from(pcm.buffer).toString('base64');
+    const f32 = helpers.decodePcm16Base64ToFloat32(b64);
+    assert.equal(f32.length, 4);
+    assert.equal(f32[0], 0);
+    assert.ok(Math.abs(f32[1] - 0.5) < 1e-6);
+    assert.equal(f32[2], -1);
+    assert.ok(Math.abs(f32[3] - (32767 / 32768)) < 1e-6);
+
+    // 2. incremental createAnchorTrimmer detects anchor + valley across uneven chunk boundaries
+    const sr = 16000; // hop = 160 samples (10ms)
+    const trimmer = helpers.createAnchorTrimmer(sr);
+    const hop = 160;
+    const totalFrames = 30; // 10 active anchor, 10 silence valley, 10 speech
+    const full = new Float32Array(totalFrames * hop);
+    for (let f = 0; f < 10; f++) {
+        for (let k = 0; k < hop; k++) full[f * hop + k] = 0.2;
+    }
+    // frames 10..19 stay 0.0 (valley >= 7 frames)
+    for (let f = 20; f < 30; f++) {
+        for (let k = 0; k < hop; k++) full[f * hop + k] = 0.25;
+    }
+    // Push in awkward non-hop-aligned slices (e.g. 250 samples)
+    const emitted = [];
+    for (let off = 0; off < full.length; off += 250) {
+        const piece = full.subarray(off, Math.min(full.length, off + 250));
+        const res = trimmer.push(piece);
+        if (res && res.length > 0) emitted.push(res);
+    }
+    const rest = trimmer.flush();
+    if (rest && rest.length > 0) emitted.push(rest);
+    const totalEmitted = emitted.reduce((sum, c) => sum + c.length, 0);
+    assert.ok(totalEmitted > 0, 'Anchor trimmer must emit trimmed speech audio');
+    assert.ok(totalEmitted <= (totalFrames - 12) * hop, `Anchor prefix must be trimmed (got ${totalEmitted})`);
+    assert.ok(totalEmitted >= 10 * hop, `Speech body must be preserved (got ${totalEmitted})`);
+
+    // 3. hierarchical WSOLAProcessor at 1.5x and 0.8x produces finite output at expected duration ratio
+    for (const speed of [1.5, 0.8]) {
+        const wsola = new helpers.WSOLAProcessor(48000, speed);
+        const src = new Float32Array(48000); // 1 second 440Hz sine
+        for (let i = 0; i < src.length; i++) {
+            src[i] = Math.sin((2 * Math.PI * 440 * i) / 48000) * 0.5;
+        }
+        const out1 = wsola.process(src.subarray(0, 24000));
+        const out2 = wsola.process(src.subarray(24000));
+        const out3 = wsola.flush();
+        const totalOut = out1.length + out2.length + out3.length;
+        const expected = 48000 / speed;
+        assert.ok(Math.abs(totalOut - expected) < 6000, `Expected ~${expected} samples at ${speed}x, got ${totalOut}`);
+        for (const chunk of [out1, out2, out3]) {
+            for (let i = 0; i < chunk.length; i++) {
+                assert.ok(Number.isFinite(chunk[i]), 'WSOLA output samples must be finite');
+            }
+        }
+    }
 });
 
 test('tts-player Shadow DOM enforces [hidden] over flex download bars and background falls back on pending nextUrl', () => {

@@ -1426,6 +1426,50 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return true;
     }
 
+    if (request.action === 'vieneu_set_worker_mode') {
+        const serverUrl = normalizeServerUrl(request.serverUrl);
+        const mode = request.mode === 'export' ? 'export' : 'listen';
+        const timeoutMs = mode === 'export' ? 25000 : 5000;
+        const body = { mode };
+        if (request.leaseId) body.lease_id = String(request.leaseId);
+        if (mode === 'export' && Number.isFinite(Number(request.workers))) {
+            body.workers = Math.max(1, Math.min(4, Math.floor(Number(request.workers))));
+        }
+        if (Number.isFinite(Number(request.ttlSec))) {
+            body.ttl_sec = Math.max(10, Math.min(600, Number(request.ttlSec)));
+        }
+        (async () => {
+            const ttsCfg = await chrome.storage.local.get(['ttsApiKey']);
+            const resolvedApiKey = (request.apiKey !== undefined && request.apiKey !== '')
+                ? request.apiKey
+                : (ttsCfg.ttsApiKey || '');
+            const headers = buildAuthHeaders(resolvedApiKey, { 'Content-Type': 'application/json' });
+            const res = await fetchWithTimeout(`${serverUrl}/v1/workers/mode`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body)
+            }, timeoutMs);
+            if (!res.ok) {
+                const txt = await res.text().catch(() => '');
+                sendResponse({
+                    ok: false,
+                    unsupported: res.status === 404 || res.status === 405,
+                    status: res.status,
+                    error: `HTTP ${res.status}${txt ? ': ' + txt : ''}`
+                });
+                return;
+            }
+            const data = await res.json().catch(() => ({}));
+            sendResponse({ ok: true, data });
+        })().catch((err) => {
+            sendResponse({
+                ok: false,
+                error: err?.name === 'AbortError' ? 'Timeout chuyển chế độ worker VieNeu' : (err?.message || String(err))
+            });
+        });
+        return true;
+    }
+
     if (request.action === 'vieneu_get_voices') {
         const serverUrl = normalizeServerUrl(request.serverUrl);
         const headers = buildAuthHeaders(request.apiKey);

@@ -13,9 +13,9 @@
     const FIRST_CHUNK_PREROLL_SEC = 0.04;
     const CONTINUATION_PREROLL_SEC = 0.015;
     const WSOLA_LEAD_PAD_SEC = 0.025;
-    const PREFETCH_AHEAD_COUNT = 3;
-    const MIN_PREFETCH_CHARS = 360;
-    const MAX_PREFETCH_SEGMENTS = 5;
+    const PREFETCH_AHEAD_COUNT = 2;
+    const MIN_PREFETCH_CHARS = 220;
+    const MAX_PREFETCH_SEGMENTS = 3;
     const ANCHOR_PREFIX = 'Một. ';
 
     function formatTtsInputText(text) {
@@ -35,83 +35,132 @@
         let chunks = [];
         let totalSamples = 0;
         let done = false;
+        let anchorStart = -1;
+        let valleyStart = -1;
+        let scannedFrames = 0;
+        const rem = new Float32Array(hop);
+        let remLen = 0;
 
-        const concatPending = () => {
-            if (chunks.length === 0) return new Float32Array(0);
-            if (chunks.length === 1) return chunks[0];
-            const merged = new Float32Array(totalSamples);
-            let offset = 0;
-            for (const c of chunks) {
-                merged.set(c, offset);
-                offset += c.length;
+        const sliceFromSample = (startSample) => {
+            const safeStart = Math.max(0, Math.min(totalSamples, startSample));
+            let result;
+            if (chunks.length === 0 || safeStart >= totalSamples) {
+                result = new Float32Array(0);
+            } else if (chunks.length === 1) {
+                result = safeStart === 0 ? chunks[0] : chunks[0].subarray(safeStart);
+            } else {
+                const outLen = totalSamples - safeStart;
+                const merged = new Float32Array(outLen);
+                let srcOffset = 0;
+                let dstOffset = 0;
+                for (let i = 0; i < chunks.length; i++) {
+                    const c = chunks[i];
+                    const end = srcOffset + c.length;
+                    if (end > safeStart) {
+                        const from = Math.max(0, safeStart - srcOffset);
+                        const slice = from === 0 ? c : c.subarray(from);
+                        merged.set(slice, dstOffset);
+                        dstOffset += slice.length;
+                    }
+                    srcOffset = end;
+                }
+                result = merged;
             }
-            chunks = [merged];
-            return merged;
+            chunks = [];
+            totalSamples = 0;
+            remLen = 0;
+            return result;
         };
 
-        const analyze = (merged, isFinal) => {
-            const totalFrames = Math.floor(merged.length / hop);
-            let anchorStart = -1;
-            let valleyStart = -1;
-
-            for (let f = 0; f < totalFrames; f++) {
-                let sum = 0;
-                const base = f * hop;
-                for (let k = 0; k < hop; k++) {
-                    const v = merged[base + k];
-                    sum += v * v;
-                }
-                const rms = Math.sqrt(sum / hop);
-
-                if (anchorStart === -1) {
-                    if (f < 55 && rms > 0.02) {
-                        anchorStart = f;
-                    }
-                    continue;
-                }
-
-                if (f < anchorStart + 8) continue;
-
-                if (rms < 0.012) {
-                    if (valleyStart === -1) valleyStart = f;
-                } else {
-                    if (valleyStart !== -1 && (f - valleyStart) >= 7) {
-                        const cutFrame = Math.max(valleyStart + 2, f - 3);
-                        done = true;
-                        chunks = [];
-                        totalSamples = 0;
-                        return merged.subarray(cutFrame * hop);
-                    }
-                    valleyStart = -1;
-                }
+        const evalFrameRms = (buf, base) => {
+            let sum = 0;
+            for (let k = 0; k < hop; k++) {
+                const v = buf[base + k];
+                sum += v * v;
             }
+            const rms = Math.sqrt(sum / hop);
+            const f = scannedFrames;
+            scannedFrames += 1;
 
-            if (totalFrames >= maxScanFrames || isFinal) {
-                done = true;
-                chunks = [];
-                totalSamples = 0;
-                if (valleyStart !== -1 && (totalFrames - valleyStart) >= 7) {
-                    const cutFrame = valleyStart + 2;
-                    return merged.subarray(cutFrame * hop);
+            if (anchorStart === -1) {
+                if (f < 55 && rms > 0.02) {
+                    anchorStart = f;
                 }
-                return merged;
+                return -1;
             }
-            return null;
+            if (f < anchorStart + 8) return -1;
+            if (rms < 0.012) {
+                if (valleyStart === -1) valleyStart = f;
+                return -1;
+            }
+            if (valleyStart !== -1 && (f - valleyStart) >= 7) {
+                return Math.max(valleyStart + 2, f - 3);
+            }
+            valleyStart = -1;
+            return -1;
         };
 
         return {
             push(rawChunk) {
                 if (!rawChunk || rawChunk.length === 0) return null;
                 if (done) return rawChunk;
+
                 chunks.push(rawChunk);
                 totalSamples += rawChunk.length;
-                const merged = concatPending();
-                return analyze(merged, false);
+
+                let pos = 0;
+                if (remLen > 0) {
+                    const take = Math.min(hop - remLen, rawChunk.length);
+                    rem.set(rawChunk.subarray(0, take), remLen);
+                    remLen += take;
+                    pos += take;
+                    if (remLen === hop) {
+                        remLen = 0;
+                        const cutFrame = evalFrameRms(rem, 0);
+                        if (cutFrame !== -1) {
+                            done = true;
+                            return sliceFromSample(cutFrame * hop);
+                        }
+                        if (scannedFrames >= maxScanFrames) {
+                            done = true;
+                            const cut = (valleyStart !== -1 && (scannedFrames - valleyStart) >= 7)
+                                ? (valleyStart + 2) * hop
+                                : 0;
+                            return sliceFromSample(cut);
+                        }
+                    }
+                }
+
+                while (pos + hop <= rawChunk.length) {
+                    const cutFrame = evalFrameRms(rawChunk, pos);
+                    pos += hop;
+                    if (cutFrame !== -1) {
+                        done = true;
+                        return sliceFromSample(cutFrame * hop);
+                    }
+                    if (scannedFrames >= maxScanFrames) {
+                        done = true;
+                        const cut = (valleyStart !== -1 && (scannedFrames - valleyStart) >= 7)
+                            ? (valleyStart + 2) * hop
+                            : 0;
+                        return sliceFromSample(cut);
+                    }
+                }
+
+                if (pos < rawChunk.length) {
+                    const left = rawChunk.length - pos;
+                    rem.set(rawChunk.subarray(pos), 0);
+                    remLen = left;
+                }
+                return null;
             },
             flush() {
                 if (done || totalSamples === 0) return null;
-                const merged = concatPending();
-                return analyze(merged, true);
+                done = true;
+                if (valleyStart !== -1 && (scannedFrames - valleyStart) >= 7) {
+                    return sliceFromSample((valleyStart + 2) * hop);
+                }
+                return sliceFromSample(0);
             }
         };
     }
@@ -285,6 +334,9 @@
         return chunks;
     }
 
+    const IS_LITTLE_ENDIAN = new Uint8Array(new Int16Array([1]).buffer)[0] === 1;
+    const INV_INT16_SCALE = 1 / 32768;
+
     function decodePcm16Base64ToFloat32(base64Str) {
         const binary = atob(base64Str);
         const evenLen = binary.length - (binary.length % 2);
@@ -294,9 +346,16 @@
         for (let i = 0; i < evenLen; i++) {
             bytes[i] = binary.charCodeAt(i);
         }
-        const view = new DataView(bytes.buffer);
-        for (let i = 0; i < sampleCount; i++) {
-            float32[i] = view.getInt16(i * 2, true) / 32768;
+        if (IS_LITTLE_ENDIAN) {
+            const int16 = new Int16Array(bytes.buffer, 0, sampleCount);
+            for (let i = 0; i < sampleCount; i++) {
+                float32[i] = int16[i] * INV_INT16_SCALE;
+            }
+        } else {
+            const view = new DataView(bytes.buffer);
+            for (let i = 0; i < sampleCount; i++) {
+                float32[i] = view.getInt16(i * 2, true) * INV_INT16_SCALE;
+            }
         }
         return float32;
     }
@@ -332,7 +391,7 @@
             if (!chunk || chunk.length === 0) return;
             const needed = this.inputLen + chunk.length;
             if (needed > this.inputBuf.length) {
-                let nextCap = Math.max(this.inputBuf.length * 2, needed);
+                const nextCap = Math.max(this.inputBuf.length * 2, needed);
                 const grown = new Float32Array(nextCap);
                 if (this.inputLen > 0) {
                     grown.set(this.inputBuf.subarray(0, this.inputLen), 0);
@@ -356,15 +415,11 @@
             const ref = this.refSlice;
             const buf = this.inputBuf;
 
-            const centerClamped = Math.max(minStart, Math.min(maxStart, center));
-            let bestPos = centerClamped;
-            let bestScore = -Infinity;
-
-            // Tìm vị trí lệch tối ưu có độ tương đồng pha cao nhất với tail của frame trước
-            const scoreAt = (pos) => {
+            // Tìm vị trí lệch tối ưu có độ tương đồng pha cao nhất qua 3 mức coarse -> medium -> fine
+            const scoreAt = (pos, stride) => {
                 let cross = 0;
                 let energy = 1e-9;
-                for (let i = 0; i < len; i += 2) {
+                for (let i = 0; i < len; i += stride) {
                     const s = buf[pos + i];
                     cross += s * ref[i];
                     energy += s * s;
@@ -372,20 +427,41 @@
                 return cross / Math.sqrt(energy);
             };
 
-            bestScore = scoreAt(centerClamped) * 1.02;
+            const centerClamped = Math.max(minStart, Math.min(maxStart, center));
+            const coarseStep = this.searchRadius >= 64 ? 8 : 2;
+            const coarseStride = len >= 256 ? 4 : 2;
 
-            for (let pos = minStart; pos <= maxStart; pos += 2) {
-                const score = scoreAt(pos);
+            let bestPos = centerClamped;
+            let bestScore = scoreAt(centerClamped, coarseStride) * 1.02;
+
+            for (let pos = minStart; pos <= maxStart; pos += coarseStep) {
+                const score = scoreAt(pos, coarseStride);
                 if (score > bestScore) {
                     bestScore = score;
                     bestPos = pos;
                 }
             }
 
+            if (coarseStep > 2) {
+                const medMin = Math.max(minStart, bestPos - coarseStep);
+                const medMax = Math.min(maxStart, bestPos + coarseStep);
+                for (let pos = medMin; pos <= medMax; pos += 2) {
+                    const score = scoreAt(pos, coarseStride);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestPos = pos;
+                    }
+                }
+            }
+
             const fineMin = Math.max(minStart, bestPos - 1);
             const fineMax = Math.min(maxStart, bestPos + 1);
+            bestScore = scoreAt(bestPos, 2);
+            if (bestPos === centerClamped) bestScore *= 1.02;
             for (let pos = fineMin; pos <= fineMax; pos++) {
-                const score = scoreAt(pos);
+                if (pos === bestPos) continue;
+                let score = scoreAt(pos, 2);
+                if (pos === centerClamped) score *= 1.02;
                 if (score > bestScore) {
                     bestScore = score;
                     bestPos = pos;
@@ -395,41 +471,33 @@
             return bestPos;
         }
 
-        _synthStep() {
+        _synthStepInto(out, outOffset) {
             const bestPos = this._findBestMatch(this.inPos);
-            const frameOut = new Float32Array(this.synHop);
+            const hop = this.synHop;
+            const buf = this.inputBuf;
+            const win = this.win;
+            const tail = this.tailOverlap;
+            const ref = this.refSlice;
 
             if (!this.hasStarted) {
-                for (let i = 0; i < this.synHop; i++) {
-                    frameOut[i] = this.inputBuf[bestPos + i];
+                for (let i = 0; i < hop; i++) {
+                    out[outOffset + i] = buf[bestPos + i];
                 }
                 this.hasStarted = true;
             } else {
-                for (let i = 0; i < this.synHop; i++) {
-                    frameOut[i] = this.tailOverlap[i] + this.inputBuf[bestPos + i] * this.win[i];
+                for (let i = 0; i < hop; i++) {
+                    out[outOffset + i] = tail[i] + buf[bestPos + i] * win[i];
                 }
             }
 
-            for (let i = 0; i < this.synHop; i++) {
-                const sample = this.inputBuf[bestPos + this.synHop + i];
-                this.tailOverlap[i] = sample * this.win[this.synHop + i];
-                this.refSlice[i] = sample;
+            for (let i = 0; i < hop; i++) {
+                const sample = buf[bestPos + hop + i];
+                tail[i] = sample * win[hop + i];
+                ref[i] = sample;
             }
 
-            this.inPos += this.synHop * this.speed;
-            return frameOut;
-        }
-
-        _concatChunks(parts, totalLen) {
-            if (totalLen === 0) return new Float32Array(0);
-            if (parts.length === 1) return parts[0];
-            const out = new Float32Array(totalLen);
-            let offset = 0;
-            for (let i = 0; i < parts.length; i++) {
-                out.set(parts[i], offset);
-                offset += parts[i].length;
-            }
-            return out;
+            this.inPos += hop * this.speed;
+            return hop;
         }
 
         process(chunk) {
@@ -446,13 +514,17 @@
             }
 
             this._appendInput(chunk);
-            const parts = [];
-            let totalLen = 0;
+            const estFrames = Math.max(1, Math.ceil((this.inputLen - this.inPos) / (this.synHop * this.speed)) + 2);
+            let out = new Float32Array(estFrames * this.synHop);
+            let outLen = 0;
 
             while (this.inputLen >= Math.round(this.inPos) + this.winLen + this.searchRadius) {
-                const frame = this._synthStep();
-                parts.push(frame);
-                totalLen += frame.length;
+                if (outLen + this.synHop > out.length) {
+                    const grown = new Float32Array(out.length * 2);
+                    grown.set(out.subarray(0, outLen), 0);
+                    out = grown;
+                }
+                outLen += this._synthStepInto(out, outLen);
             }
 
             const safeKeep = this.searchRadius + 16;
@@ -466,15 +538,16 @@
                 this.inPos -= discard;
             }
 
-            return this._concatChunks(parts, totalLen);
+            return outLen === 0 ? new Float32Array(0) : out.subarray(0, outLen);
         }
 
         flush() {
             if (Math.abs(this.speed - 1.0) < 0.001) return new Float32Array(0);
 
             const realEnd = this.inputLen;
-            const parts = [];
-            let totalLen = 0;
+            const estFrames = Math.max(1, Math.ceil(Math.max(0, realEnd - this.inPos) / (this.synHop * this.speed)) + 3);
+            let out = new Float32Array(estFrames * this.synHop);
+            let outLen = 0;
 
             if (realEnd > 0 && Math.round(this.inPos) < realEnd) {
                 const padNeed = Math.max(0, Math.round(this.inPos) + this.winLen + this.searchRadius - realEnd);
@@ -482,20 +555,28 @@
                     this._appendInput(new Float32Array(padNeed));
                 }
                 while (Math.round(this.inPos) < realEnd && this.inputLen >= Math.round(this.inPos) + this.winLen) {
-                    const frame = this._synthStep();
-                    parts.push(frame);
-                    totalLen += frame.length;
+                    if (outLen + this.synHop > out.length) {
+                        const grown = new Float32Array(out.length * 2);
+                        grown.set(out.subarray(0, outLen), 0);
+                        out = grown;
+                    }
+                    outLen += this._synthStepInto(out, outLen);
                 }
             }
 
             if (this.hasStarted) {
-                parts.push(this.tailOverlap.slice());
-                totalLen += this.tailOverlap.length;
+                if (outLen + this.tailOverlap.length > out.length) {
+                    const grown = new Float32Array(outLen + this.tailOverlap.length);
+                    grown.set(out.subarray(0, outLen), 0);
+                    out = grown;
+                }
+                out.set(this.tailOverlap, outLen);
+                outLen += this.tailOverlap.length;
             }
 
             this.inputLen = 0;
             this.inPos = 0;
-            return this._concatChunks(parts, totalLen);
+            return outLen === 0 ? new Float32Array(0) : out.subarray(0, outLen);
         }
     }
 
@@ -1098,6 +1179,7 @@
     const exportState = {
         active: false,
         runId: 0,
+        leaseId: null,
         aborted: false,
         savePartialRequested: false,
         targetMinutes: DEFAULT_DOWNLOAD_MINUTES,
@@ -1149,7 +1231,18 @@
             el.classList.add('stv-tts-speaking');
         }
         state.highlightedEls = valid;
-        valid[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        const firstEl = valid[0];
+        let shouldScroll = true;
+        if (typeof firstEl.getBoundingClientRect === 'function' && typeof global.innerHeight === 'number' && global.innerHeight > 0) {
+            const rect = firstEl.getBoundingClientRect();
+            const vh = global.innerHeight;
+            if (rect.top >= vh * 0.15 && rect.bottom <= vh * 0.85) {
+                shouldScroll = false;
+            }
+        }
+        if (shouldScroll && typeof firstEl.scrollIntoView === 'function') {
+            firstEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
     }
 
     function createContinuousStreamPlayer(audioCtx) {
@@ -1923,6 +2016,11 @@
         const entry = {
             index: targetIndex,
             chunks: [],
+            trimmedChunks: [],
+            sampleRate: DEFAULT_SAMPLE_RATE,
+            anchorTrimmer: null,
+            anchorRate: null,
+            firstFadeApplied: false,
             done: false,
             aborted: false,
             error: null,
@@ -1935,6 +2033,16 @@
         state.prefetchIndex = targetIndex;
         syncPrefetchCacheAlias();
 
+        const pushTrimmedPrefetchAudio = (trimmed, sr) => {
+            if (!trimmed || trimmed.length === 0) return;
+            if (!entry.firstFadeApplied) {
+                entry.firstFadeApplied = true;
+                const fadeLen = Math.min(trimmed.length, Math.round(sr * 0.005));
+                for (let i = 0; i < fadeLen; i++) trimmed[i] *= i / fadeLen;
+            }
+            entry.trimmedChunks.push(trimmed);
+        };
+
         port.onMessage.addListener((msg) => {
             if (runId !== state.runId || entry.aborted) {
                 try { port.disconnect(); } catch {}
@@ -1945,8 +2053,23 @@
                 return;
             }
             if (msg.type === 'chunk') {
-                entry.chunks.push({ audio: msg.audio, sampleRate: msg.sampleRate || DEFAULT_SAMPLE_RATE });
+                const sr = msg.sampleRate || entry.sampleRate || DEFAULT_SAMPLE_RATE;
+                entry.sampleRate = sr;
+                if (!entry.anchorTrimmer || entry.anchorRate !== sr) {
+                    entry.anchorRate = sr;
+                    entry.anchorTrimmer = createAnchorTrimmer(sr);
+                }
+                const rawChunk = decodePcm16Base64ToFloat32(msg.audio);
+                if (rawChunk.length > 0) {
+                    const trimmed = entry.anchorTrimmer.push(rawChunk);
+                    pushTrimmedPrefetchAudio(trimmed, sr);
+                }
             } else if (msg.type === 'done') {
+                if (entry.anchorTrimmer) {
+                    const rest = entry.anchorTrimmer.flush();
+                    pushTrimmedPrefetchAudio(rest, entry.sampleRate);
+                    entry.anchorTrimmer = null;
+                }
                 entry.done = true;
                 entry.port = null;
                 if (state.prefetchPort === port) {
@@ -1954,13 +2077,15 @@
                     state.prefetchIndex = -1;
                 }
                 try { port.disconnect(); } catch {}
-                ttsLog(`Prefetch #${targetIndex + 1} ready (${entry.chunks.length} chunks)`);
+                ttsLog(`Prefetch #${targetIndex + 1} ready (${entry.trimmedChunks.length} chunks)`);
                 pumpPrefetchQueue(runId);
             } else if (msg.type === 'error') {
                 entry.error = msg.error;
                 entry.done = true;
                 entry.retries += 1;
                 entry.chunks = [];
+                entry.trimmedChunks = [];
+                entry.anchorTrimmer = null;
                 entry.port = null;
                 syncPrefetchCacheAlias();
                 if (state.prefetchPort === port) {
@@ -1990,6 +2115,8 @@
             } else {
                 entry.retries += 1;
                 entry.chunks = [];
+                entry.trimmedChunks = [];
+                entry.anchorTrimmer = null;
                 syncPrefetchCacheAlias();
                 if (!state.isPaused) {
                     pumpPrefetchQueue(runId);
@@ -2758,8 +2885,8 @@
             ? CONTINUATION_PREROLL_SEC
             : (seamless ? 0.025 : FIRST_CHUNK_PREROLL_SEC);
         const targetPrebufferSec = state.speed <= 1.05
-            ? 0.16
-            : Math.min(0.95, 0.20 + (state.speed - 1.0) * 0.90);
+            ? 0.22
+            : Math.min(1.10, 0.25 + (state.speed - 1.0) * 1.0);
 
         const session = {
             index,
@@ -2787,6 +2914,15 @@
             streamDone: false,
             interruptedWhilePaused: false,
             finishedHandled: false,
+            feedGen: 0,
+            feedTimer: null,
+            cancelAsyncFeed() {
+                this.feedGen += 1;
+                if (this.feedTimer) {
+                    clearTimeout(this.feedTimer);
+                    this.feedTimer = null;
+                }
+            },
             ensureAnchorTrimmer(sr) {
                 const effectiveSr = sr || this.sampleRate || DEFAULT_SAMPLE_RATE;
                 if (!this.anchorTrimmer || this.anchorRate !== effectiveSr) {
@@ -2811,6 +2947,7 @@
             advanceToNext() {
                 if (this.finishedHandled || this.runId !== state.runId || state.currentSession !== this) return;
                 this.finishedHandled = true;
+                this.cancelAsyncFeed();
                 state.currentSession = null;
                 playSegment(this.index + 1, this.runId, { seamless: true });
             },
@@ -2914,13 +3051,101 @@
         }
         if (cached && !cached.error) {
             if (cached.done) {
-                ttsLog(`Seg #${index + 1} cache HIT (${cached.chunks.length} chunks)`);
-                for (const c of cached.chunks) {
-                    session.pushPcmBase64(c.audio, c.sampleRate);
+                const cachedChunks = cached.trimmedChunks || [];
+                const sr = cached.sampleRate || DEFAULT_SAMPLE_RATE;
+                ttsLog(`Seg #${index + 1} cache HIT (${cachedChunks.length} chunks)`);
+                session.sampleRate = sr;
+                session.streamDone = true;
+                for (let i = 0; i < cachedChunks.length; i++) {
+                    const c = cachedChunks[i];
+                    if (c && c.length > 0) {
+                        session.rawChunks.push(c);
+                        session.totalRawSamples += c.length;
+                    }
                 }
                 updatePlayerUI();
-                session.finishStream();
                 pumpPrefetchQueue(runId);
+
+                if (state.isPaused) return;
+                if (session.totalRawSamples === 0) {
+                    session.advanceToNext();
+                    return;
+                }
+
+                const wsola = session.ensureWsola(sr);
+                const syncThresholdSamples = Math.round(sr * 1.5);
+                if (!wsola || session.totalRawSamples <= syncThresholdSamples) {
+                    for (let i = 0; i < session.rawChunks.length; i++) {
+                        const raw = session.rawChunks[i];
+                        const processed = wsola ? wsola.process(raw) : raw;
+                        session.scheduleProcessed(processed);
+                    }
+                    if (wsola) {
+                        session.scheduleProcessed(wsola.flush());
+                    }
+                    session.flushPrebuffer();
+                    if (!session.preRollScheduled) {
+                        session.advanceToNext();
+                        return;
+                    }
+                    session.streamPlayer.flush(session.streamToken);
+                    return;
+                }
+
+                // Phát dần từng lát ~1.5s cho đoạn dài có WSOLA để không gây giật luồng UI
+                const myFeedGen = ++session.feedGen;
+                const initialSyncSamples = Math.round(sr * 0.8);
+                const sliceSamples = Math.round(sr * 1.5);
+                let chunkIdx = 0;
+
+                const feedChunksUpTo = (limitSamples) => {
+                    let processedSamples = 0;
+                    while (chunkIdx < session.rawChunks.length && processedSamples < limitSamples) {
+                        const raw = session.rawChunks[chunkIdx++];
+                        processedSamples += raw.length;
+                        const processed = wsola.process(raw);
+                        if (processed && processed.length > 0) {
+                            session._pushToStreamPlayer(processed);
+                        }
+                    }
+                };
+
+                session.prebufferFlushed = true;
+                feedChunksUpTo(initialSyncSamples);
+
+                const finishAsyncFeed = () => {
+                    if (session.feedGen !== myFeedGen || session.runId !== state.runId || state.currentSession !== session || state.isPaused) {
+                        return;
+                    }
+                    const flushed = wsola.flush();
+                    if (flushed && flushed.length > 0) {
+                        session._pushToStreamPlayer(flushed);
+                    }
+                    if (!session.preRollScheduled) {
+                        session.advanceToNext();
+                        return;
+                    }
+                    session.streamPlayer.flush(session.streamToken);
+                };
+
+                if (chunkIdx >= session.rawChunks.length) {
+                    finishAsyncFeed();
+                    return;
+                }
+
+                const pumpNextSlice = () => {
+                    session.feedTimer = null;
+                    if (session.feedGen !== myFeedGen || session.runId !== state.runId || state.currentSession !== session || state.isPaused) {
+                        return;
+                    }
+                    feedChunksUpTo(sliceSamples);
+                    if (chunkIdx >= session.rawChunks.length) {
+                        finishAsyncFeed();
+                    } else {
+                        session.feedTimer = setTimeout(pumpNextSlice, 0);
+                    }
+                };
+                session.feedTimer = setTimeout(pumpNextSlice, 0);
                 return;
             }
 
@@ -2932,9 +3157,17 @@
                     state.prefetchIndex = -1;
                 }
                 state.activePort = promotedPort;
-                ttsLog(`Seg #${index + 1} promoted live prefetch (${cached.chunks.length} chunks buffered)`);
-                for (const c of cached.chunks) {
-                    session.pushPcmBase64(c.audio, c.sampleRate);
+                const cachedChunks = cached.trimmedChunks || [];
+                const cachedSr = cached.sampleRate || DEFAULT_SAMPLE_RATE;
+                ttsLog(`Seg #${index + 1} promoted live prefetch (${cachedChunks.length} chunks buffered)`);
+                for (const c of cachedChunks) {
+                    session._acceptTrimmedRaw(c, cachedSr);
+                }
+                if (cached.anchorTrimmer) {
+                    session.sampleRate = cachedSr;
+                    session.anchorTrimmer = cached.anchorTrimmer;
+                    session.anchorRate = cached.anchorRate || cachedSr;
+                    cached.anchorTrimmer = null;
                 }
                 updatePlayerUI();
 
@@ -3042,6 +3275,9 @@
         state.waitingForMoreSegments = false;
         state.isPlaying = false;
         state.isPaused = false;
+        if (state.currentSession && typeof state.currentSession.cancelAsyncFeed === 'function') {
+            state.currentSession.cancelAsyncFeed();
+        }
         state.currentSession = null;
         abortPorts();
         stopStreamPlayer(true);
@@ -3060,6 +3296,9 @@
     }
 
     function rerenderSessionFromSample(session, startRawSample, { resetPreRoll = false } = {}) {
+        if (typeof session.cancelAsyncFeed === 'function') {
+            session.cancelAsyncFeed();
+        }
         const sr = session.sampleRate || DEFAULT_SAMPLE_RATE;
         const clampedStart = Math.max(0, Math.min(session.totalRawSamples, startRawSample));
 
@@ -3251,6 +3490,9 @@
             clearPreloadTimer();
             const session = state.currentSession;
             if (session && session.runId === state.runId) {
+                if (typeof session.cancelAsyncFeed === 'function') {
+                    session.cancelAsyncFeed();
+                }
                 const hwLatency = Math.min(0.35, Math.max(0, (ctx.baseLatency || 0) + (ctx.outputLatency || 0)));
                 const rewindOutSec = Math.min(0.60, hwLatency + 0.30);
                 if (!Number.isFinite(session.pausedRawSample)) {
@@ -3274,6 +3516,9 @@
         clearAutoplayResumeGesture();
         state.autoplayBlocked = false;
         state.autoplayUnblockedAt = 0;
+        if (state.currentSession && typeof state.currentSession.cancelAsyncFeed === 'function') {
+            state.currentSession.cancelAsyncFeed();
+        }
         state.currentSession = null;
         abortPorts();
         cancelPreload();
@@ -3312,6 +3557,9 @@
         const clamped = Math.max(0, Math.min(targetIdx, state.segments.length - 1));
         state.runId += 1;
         state.waitingForMoreSegments = false;
+        if (state.currentSession && typeof state.currentSession.cancelAsyncFeed === 'function') {
+            state.currentSession.cancelAsyncFeed();
+        }
         state.currentSession = null;
         clearPreloadTimer();
         if (state.autoplayBlocked && canStartAudioContext()) {
@@ -3555,10 +3803,32 @@
         return chars / (14 * Math.max(0.5, Number(speed) || 1.0));
     }
 
-    async function ensureMultiStreamVieNeuReady() {
+    async function ensureMultiStreamVieNeuReady(leaseId) {
         if (state.engine !== 'vieneu' || !isExtensionAlive()) {
             return EXPORT_CONCURRENCY;
         }
+        updatePlayerUI(tTts('tts_dl_scaling_workers', 'Đang bật 3 worker VieNeu để tải nhanh hơn...'));
+        const scaled = await new Promise((resolve) => {
+            chrome.runtime.sendMessage({
+                action: 'vieneu_set_worker_mode',
+                serverUrl: state.serverUrl,
+                apiKey: state.apiKey,
+                mode: 'export',
+                leaseId,
+                workers: EXPORT_CONCURRENCY
+            }, (resp) => {
+                if (chrome.runtime.lastError || !resp || !resp.ok) {
+                    resolve(null);
+                    return;
+                }
+                resolve(resp.data || {});
+            });
+        });
+        if (scaled) {
+            const streams = Number(scaled.max_streams || scaled.active_workers || 1);
+            return Math.max(1, Math.min(EXPORT_CONCURRENCY, streams));
+        }
+
         const health = await new Promise((resolve) => {
             chrome.runtime.sendMessage({
                 action: 'vieneu_check_health',
@@ -3574,6 +3844,24 @@
         if (!health) return 1;
         const curStreams = Number(health.max_streams || 1);
         return Math.max(1, Math.min(EXPORT_CONCURRENCY, curStreams));
+    }
+
+    function releaseExportWorkers(leaseId) {
+        if (!leaseId || state.engine !== 'vieneu' || !isExtensionAlive()) return;
+        if (exportState.leaseId === leaseId) {
+            exportState.leaseId = null;
+        }
+        try {
+            chrome.runtime.sendMessage({
+                action: 'vieneu_set_worker_mode',
+                serverUrl: state.serverUrl,
+                apiKey: state.apiKey,
+                mode: 'listen',
+                leaseId
+            }, () => { void chrome?.runtime?.lastError; });
+        } catch {
+            // ignore
+        }
     }
 
     function waitForActiveTranslation(exportRunId) {
@@ -3976,7 +4264,9 @@
 
         exportState.runId += 1;
         const myRunId = exportState.runId;
+        const exportLeaseId = `exp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         exportState.active = true;
+        exportState.leaseId = exportLeaseId;
         exportState.aborted = false;
         exportState.savePartialRequested = false;
         exportState.accumulatedSec = 0;
@@ -4051,7 +4341,7 @@
                 chapterSegments = collected.segments.slice(startSliceIdx);
             }
 
-            const effectiveConcurrency = await ensureMultiStreamVieNeuReady();
+            const effectiveConcurrency = await ensureMultiStreamVieNeuReady(exportLeaseId);
             if (exportState.runId !== myRunId || exportState.aborted) {
                 throw new Error('EXPORT_ABORTED');
             }
@@ -4262,8 +4552,10 @@
             notifyTtsToast(errMsg, 'error');
             return { ok: false, error: errMsg };
         } finally {
+            releaseExportWorkers(exportLeaseId);
             if (exportState.runId === myRunId) {
                 exportState.active = false;
+                exportState.leaseId = null;
                 exportState.waitingTranslation = false;
                 exportState.fetchingNext = false;
                 exportState.abortRejects.clear();
@@ -4352,6 +4644,9 @@
 
     if (typeof global.addEventListener === 'function') {
         global.addEventListener('pagehide', () => {
+            if (exportState.active && exportState.leaseId) {
+                releaseExportWorkers(exportState.leaseId);
+            }
             abortPorts();
             disconnectPreloadWatchPort();
         });

@@ -13,8 +13,8 @@ class STVPcmStreamProcessor extends AudioWorkletProcessor {
         this.fadeInLeft = 0;
         this.buffering = true;
         const sr = (typeof sampleRate === 'number' && sampleRate > 0) ? sampleRate : 48000;
-        this.initialBufferSamples = Math.round(sr * 0.05);
-        this.recoveryBufferSamples = Math.round(sr * 0.04);
+        this.initialBufferSamples = Math.round(sr * 0.04);
+        this.recoveryBufferSamples = Math.round(sr * 0.10);
         this.minBufferSamples = this.initialBufferSamples;
 
         this.port.onmessage = (e) => {

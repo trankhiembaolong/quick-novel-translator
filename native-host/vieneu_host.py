@@ -164,26 +164,36 @@ def start_server(port: int, backend: str = "auto") -> dict:
     env["PYTHONIOENCODING"] = "utf-8"
     env["HOST"] = "127.0.0.1"
     env["PORT"] = str(port)
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["VECLIB_MAXIMUM_THREADS"] = "1"
+    env["NUMEXPR_NUM_THREADS"] = "1"
     if backend == "onnx_int8":
         env["VIENEU_BACKEND"] = "onnx"
         env["VIENEU_PRECISION"] = "int8"
-        env["VIENEU_MAX_STREAMS"] = "2"
+        env["VIENEU_MAX_STREAMS"] = "1"
+        env["VIENEU_EXPORT_MAX_STREAMS"] = "2"
     elif backend == "amd_gpu":
         env["VIENEU_BACKEND"] = "onnx"
         env["VIENEU_PRECISION"] = "amd_gpu"
-        env["VIENEU_MAX_STREAMS"] = "3"
+        env["VIENEU_MAX_STREAMS"] = "1"
+        env["VIENEU_EXPORT_MAX_STREAMS"] = "3"
     elif backend in ("cpu_fp32", "onnx"):
         env["VIENEU_BACKEND"] = "onnx"
         env["VIENEU_PRECISION"] = "fp32"
         env["VIENEU_MAX_STREAMS"] = "1"
+        env["VIENEU_EXPORT_MAX_STREAMS"] = "1"
     elif backend == "pytorch":
         env["VIENEU_BACKEND"] = "pytorch"
         env["VIENEU_PRECISION"] = "fp32"
         env["VIENEU_MAX_STREAMS"] = "1"
+        env["VIENEU_EXPORT_MAX_STREAMS"] = "1"
     else:
         env["VIENEU_BACKEND"] = "auto"
         env["VIENEU_PRECISION"] = "auto"
-        env["VIENEU_MAX_STREAMS"] = "3"
+        env["VIENEU_MAX_STREAMS"] = "1"
+        env["VIENEU_EXPORT_MAX_STREAMS"] = "3"
     env["VIENEU_WATERMARK"] = "0"
     env["VIENEU_QUEUE"] = "16"
     env["VIENEU_QUEUE_TIMEOUT"] = "60"
@@ -197,7 +207,6 @@ def start_server(port: int, backend: str = "auto") -> dict:
     creation_flags = (
         subprocess.CREATE_NO_WINDOW
         | subprocess.CREATE_NEW_PROCESS_GROUP
-        | getattr(subprocess, "ABOVE_NORMAL_PRIORITY_CLASS", 0x00008000)
     )
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
