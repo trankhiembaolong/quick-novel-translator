@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="color-scheme" content="dark light">
+    <title>Quick Novel Translator</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+    <header class="app-header">
+        <div class="brand">
+            <img src="icons/icon48.png" alt="Logo" class="brand-icon">
+            <h1 class="brand-title" data-i18n="app_title">Quick Novel Translator</h1>
+        </div>
+        <div class="header-actions">
+            <button id="btn-lang-toggle" class="icon-btn" type="button" title="Language">VI</button>
+            <button id="btn-theme-toggle" class="icon-btn" type="button" title="Theme">◐</button>
+        </div>
+    </header>
+
+    <nav class="tab-bar" role="tablist">
+        <button class="tab-btn active" data-tab="translate" role="tab" aria-selected="true" data-i18n="nav_translate">Dịch</button>
+        <button class="tab-btn" data-tab="tts" role="tab" aria-selected="false" data-i18n="nav_tts">Nghe</button>
+        <button class="tab-btn" data-tab="glossary" role="tab" aria-selected="false" data-i18n="nav_glossary">Từ điển</button>
+        <button class="tab-btn" data-tab="settings" role="tab" aria-selected="false" data-i18n="nav_settings">Cài đặt</button>
+    </nav>
+
+    <main class="tab-content">
+        <!-- TAB 1: TRANSLATE -->
+        <section id="panel-translate" class="tab-panel active" role="tabpanel">
+            <!-- Onboarding Card (shown when API Key is missing) -->
+            <div id="onboarding-card" class="card card-warning" hidden>
+                <h3 class="card-title" data-i18n="onboarding_title">Chào mừng! Thiết lập nhanh 2 bước</h3>
+                <p class="muted" data-i18n="onboarding_desc">Nhập API Key (OpenRouter / OpenAI) để bắt đầu dịch truyện ngay trên trình duyệt.</p>
+                <div class="input-with-btn">
+                    <input type="password" id="onboarding-api-key" data-i18n-attr="placeholder:onboarding_key_placeholder" placeholder="Dán API Key...">
+                    <button id="btn-onboarding-save" class="btn btn-primary btn-sm" type="button" data-i18n="onboarding_save_btn">Lưu &amp; Bắt đầu</button>
+                </div>
+            </div>
+
+            <!-- Site Permission & Selector Status -->
+            <div class="card">
+                <div class="site-row">
+                    <span id="site-perm-badge" class="badge">
+                        <span class="dot"></span>
+                        <span id="site-perm-text" data-i18n="site_access_granted">Đã cấp quyền cho trang này</span>
+                    </span>
+                    <button id="btn-grant-site" class="btn btn-secondary btn-sm" type="button" hidden data-i18n="btn_grant_site">Cấp quyền trang này</button>
+                </div>
+                <div class="site-row">
+                    <span id="site-selector-text" class="muted" data-i18n="site_selector_none">Tự động nhận diện vùng truyện</span>
+                    <button id="btn-clear-selector" class="btn btn-secondary btn-sm" type="button" hidden data-i18n="btn_clear_selector">Xóa vùng đã lưu</button>
+                </div>
+            </div>
+
+            <!-- Quick Model & Actions -->
+            <div class="card">
+                <div class="field model-picker-field">
+                    <label class="field-label" for="main-model" data-i18n="label_model">Model AI</label>
+                    <div class="model-picker-row">
+                        <input type="text" id="main-model" autocomplete="off" data-i18n-attr="placeholder:model_placeholder" placeholder="stepfun/step-3.5-flash">
+                        <button id="btn-fetch-models" class="btn btn-secondary btn-sm model-action-btn" type="button" data-i18n-attr="title:btn_fetch_models_title,aria-label:btn_fetch_models_title" title="Tải danh sách model từ API">↻</button>
+                        <button id="btn-model-dropdown" class="btn btn-secondary btn-sm model-action-btn" type="button" popovertarget="model-dropdown-panel" aria-expanded="false" aria-controls="model-dropdown-panel" data-i18n-attr="title:btn_model_dropdown_title,aria-label:btn_model_dropdown_title" title="Chọn model từ danh sách">▾</button>
+                    </div>
+                    <div id="model-dropdown-panel" class="model-dropdown-panel" popover="auto">
+                        <div class="model-dropdown-header">
+                            <input type="text" id="model-search-input" autocomplete="off" data-i18n-attr="placeholder:model_search_ph" placeholder="Tìm tên model hoặc provider...">
+                        </div>
+                        <div id="model-provider-filters" class="model-provider-filters"></div>
+                        <div id="model-dropdown-meta" class="model-dropdown-meta muted"></div>
+                        <div id="model-dropdown-list" class="model-dropdown-list"></div>
+                    </div>
+                </div>
+                <button id="btn-translate" class="btn btn-primary" type="button" data-i18n="btn_translate">Dịch chương này</button>
+                <button id="btn-pick" class="btn btn-secondary" type="button" data-i18n="btn_pick_area">Chọn vùng dịch thủ công</button>
+            </div>
+
+            <div id="status-text" class="status-banner" data-i18n="status_ready">Sẵn sàng dịch</div>
+        </section>
+
+        <!-- TAB 2: TTS / LISTEN -->
+        <section id="panel-tts" class="tab-panel" role="tabpanel">
+            <div class="card">
+                <div class="field">
+                    <label class="field-label" for="tts-engine-select" data-i18n="tts_engine_label">Engine đọc giọng</label>
+                    <select id="tts-engine-select">
+                        <option value="ws_default" data-i18n="tts_engine_ws">WebSocket TTS (Mặc định + Tự fallback)</option>
+                        <option value="webspeech" data-i18n="tts_engine_webspeech">Web Speech API (Trình duyệt offline)</option>
+                        <option value="vieneu" data-i18n="tts_engine_vieneu">VieNeu Local Server (Nâng cao)</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label class="field-label" for="tts-voice-quick" data-i18n="tts_voice_label">Giọng đọc</label>
+                    <select id="tts-voice-quick"></select>
+                </div>
+
+                <div class="field">
+                    <div class="site-row">
+                        <label class="field-label" for="tts-speed-range" data-i18n="tts_speed_label">Tốc độ đọc</label>
+                        <span id="tts-speed-label-val" class="muted" style="font-weight: 700;">1.0x</span>
+                    </div>
+                    <input type="range" id="tts-speed-range" min="0.8" max="2.0" step="0.1" value="1.0">
+                </div>
+
+                <div class="btn-row">
+                    <button id="btn-tts-play" class="btn btn-accent" type="button" data-i18n="btn_tts_play">Nghe chương này</button>
+                    <button id="btn-tts-stop" class="btn btn-danger" type="button" hidden data-i18n="btn_tts_stop">Dừng đọc</button>
+                </div>
+            </div>
+
+            <!-- Offline Audio Export Card -->
+            <div class="card">
+                <h3 class="card-title" data-i18n="tts_download_title">Tải Audio nghe offline (WAV)</h3>
+                <div class="field">
+                    <label class="field-label" for="tts-download-minutes" data-i18n="tts_download_minutes_label">Thời lượng tối thiểu (phút)</label>
+                    <div class="input-with-btn">
+                        <input type="number" id="tts-download-minutes" name="ttsDownloadMinutes" min="5" max="240" step="5" value="30" inputmode="numeric" aria-describedby="tts-download-hint" style="flex: 0 0 90px;">
+                        <button id="btn-tts-download" class="btn btn-secondary" type="button" data-i18n="btn_tts_download" style="flex: 1;">⬇ Tải Audio (WAV)</button>
+                    </div>
+                </div>
+                <p id="tts-download-hint" class="muted" data-i18n="tts_download_hint">Tự động nối tiếp và đọc trọn các chương sau cho đến khi đủ số phút.</p>
+            </div>
+
+            <!-- Advanced VieNeu Setup Card (collapsible / shown when VieNeu selected or user expands) -->
+            <div id="vieneu-advanced-card" class="card" hidden>
+                <div class="site-row">
+                    <h3 class="card-title" data-i18n="tts_vieneu_guide_title">Cài đặt VieNeu-TTS Local</h3>
+                    <span id="tts-server-badge" class="badge">
+                        <span class="dot" id="tts-server-dot"></span>
+                        <span id="tts-server-label" data-i18n="tts_vieneu_off">VieNeu: Đang tắt</span>
+                    </span>
+                </div>
+                <p class="muted" data-i18n="tts_vieneu_guide_desc">Dùng giọng AI tiếng Việt chất lượng cao chạy trên máy cá nhân qua Native Host.</p>
+                <div class="btn-row">
+                    <button id="btn-tts-server-toggle" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_vieneu_start">Bật Server</button>
+                    <button id="btn-vieneu-install-guide" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_vieneu_setup">Hướng dẫn &amp; Cài đặt VieNeu</button>
+                </div>
+                <div id="tts-host-hint" class="muted" hidden style="word-break: break-word;"></div>
+            </div>
+
+            <div id="tts-status-text" class="status-banner" data-i18n="tts_status_idle">Chọn chương và bấm Nghe để bắt đầu.</div>
+        </section>
+
+        <!-- TAB 3: GLOSSARY -->
+        <section id="panel-glossary" class="tab-panel" role="tabpanel">
+            <div class="card">
+                <div class="input-with-btn">
+                    <select id="glossary-profile-select"></select>
+                    <button id="btn-new-profile" class="btn btn-primary btn-sm" type="button" data-i18n="btn_new_profile">Tạo mới</button>
+                    <button id="btn-delete-profile" class="btn btn-danger btn-sm" type="button" data-i18n="btn_delete_profile">Xóa</button>
+                </div>
+                <div class="input-with-btn">
+                    <input type="text" id="add-orig" data-i18n-attr="placeholder:glossary_orig_ph" placeholder="Từ gốc (Trung)">
+                    <input type="text" id="add-hanviet" data-i18n-attr="placeholder:glossary_viet_ph" placeholder="Nghĩa dịch (Việt)">
+                    <button id="btn-add-term" class="btn btn-primary btn-sm" type="button" data-i18n="btn_add">Thêm</button>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="site-row">
+                    <strong style="font-size: 12.5px;"><span id="glossary-list-heading">Danh sách</span> (<span id="glossary-count">0</span>)</strong>
+                    <div style="display: flex; gap: 4px;">
+                        <button id="btn-export-glossary" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_export_json">Xuất JSON</button>
+                        <button id="btn-import-glossary" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_import_json">Nhập JSON</button>
+                        <input type="file" id="glossary-import-file" accept=".json,application/json" style="display: none;">
+                    </div>
+                </div>
+
+                <div class="input-with-btn">
+                    <input type="text" id="glossary-search-input" data-i18n-attr="placeholder:glossary_search_ph" placeholder="Tìm từ gốc hoặc nghĩa dịch...">
+                    <button id="btn-clear-search" class="btn btn-secondary btn-sm" type="button" hidden>✕</button>
+                </div>
+
+                <div class="filter-pills">
+                    <button class="pill-btn active" data-filter="all" type="button" data-i18n="glossary_filter_all">Tất cả</button>
+                    <button class="pill-btn" data-filter="locked" type="button" data-i18n="glossary_filter_locked">Đã khóa</button>
+                    <button class="pill-btn" data-filter="unlocked" type="button" data-i18n="glossary_filter_unlocked">Chưa khóa</button>
+                </div>
+
+                <div id="glossary-batch-actions" class="glossary-tools">
+                    <label class="checkbox-row" style="font-size: 11.5px;">
+                        <input type="checkbox" id="select-all-terms">
+                        <span data-i18n="glossary_select_all">Chọn tất cả</span>
+                    </label>
+                    <div style="display: flex; gap: 4px; flex-wrap: wrap;">
+                        <button id="btn-scan-cleanup" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_scan_clean">Quét rác</button>
+                        <button id="btn-move-used" class="btn btn-secondary btn-sm" type="button" data-i18n="btn_move_used">Chuyển đã dùng</button>
+                        <button id="btn-delete-selected" class="btn btn-danger btn-sm" type="button" hidden>Xóa</button>
+                    </div>
+                </div>
+
+                <div id="glossary-list" class="glossary-list"></div>
+            </div>
+        </section>
+
+        <!-- TAB 4: SETTINGS -->
+        <section id="panel-settings" class="tab-panel" role="tabpanel">
+            <div class="card">
+                <div class="field">
+                    <label class="field-label" for="settings-locale" data-i18n="settings_lang_label">Ngôn ngữ giao diện</label>
+                    <select id="settings-locale">
+                        <option value="vi">Tiếng Việt</option>
+                        <option value="en">English</option>
+                    </select>
+                </div>
+            </div>
+
+            <details class="settings-group" open>
+                <summary data-i18n="settings_ai_section">Kết nối AI &amp; Phím tắt</summary>
+                <div class="settings-body">
+                    <div class="field">
+                        <label class="field-label" for="api-endpoint" data-i18n="settings_endpoint_label">API Endpoint URL</label>
+                        <input type="text" id="api-endpoint" placeholder="https://openrouter.ai/api/v1/chat/completions">
+                    </div>
+                    <div class="field">
+                        <label class="field-label" for="api-key" data-i18n="settings_apikey_label">API Key</label>
+                        <div class="input-with-btn">
+                            <input type="password" id="api-key" placeholder="sk-or-...">
+                            <button id="btn-toggle-apikey" class="btn btn-secondary btn-sm" type="button">👁</button>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label class="field-label" for="api-model" data-i18n="label_model">Model AI</label>
+                        <input type="text" id="api-model" placeholder="stepfun/step-3.5-flash">
+                    </div>
+                    <div class="field">
+                        <label class="field-label" for="api-shortcut" data-i18n="settings_shortcut_label">Phím tắt</label>
+                        <input type="text" id="api-shortcut" readonly placeholder="Alt+T">
+                    </div>
+                    <div class="field">
+                        <label class="field-label" for="api-prompt" data-i18n="settings_prompt_label">System Prompt</label>
+                        <textarea id="api-prompt"></textarea>
+                    </div>
+                </div>
+            </details>
+
+            <details class="settings-group">
+                <summary data-i18n="settings_reader_section">Giao diện đọc truyện</summary>
+                <div class="settings-body">
+                    <div class="field">
+                        <label class="field-label" for="api-fontfamily" data-i18n="settings_fontfamily_label">Font chữ</label>
+                        <select id="api-fontfamily">
+                            <option value="Be Vietnam Pro">Be Vietnam Pro</option>
+                            <option value="Noto Sans Vietnamese">Noto Sans Vietnamese</option>
+                            <option value="Roboto">Roboto</option>
+                            <option value="Inter">Inter</option>
+                            <option value="Merriweather">Merriweather (Serif)</option>
+                            <option value="Source Serif Pro">Source Serif Pro (Serif)</option>
+                            <option value="Tahoma">Tahoma</option>
+                            <option value="Segoe UI">Segoe UI</option>
+                        </select>
+                    </div>
+                    <div class="btn-row">
+                        <div class="field" style="flex: 1;">
+                            <label class="field-label" for="api-fontsize" data-i18n="settings_fontsize_label">Cỡ chữ (px)</label>
+                            <input type="text" id="api-fontsize" placeholder="22">
+                        </div>
+                        <div class="field" style="flex: 1;">
+                            <label class="field-label" for="api-lineheight" data-i18n="settings_lineheight_label">Giãn dòng</label>
+                            <input type="text" id="api-lineheight" placeholder="1.8">
+                        </div>
+                    </div>
+                </div>
+            </details>
+
+            <details class="settings-group">
+                <summary data-i18n="settings_tts_section">Cấu hình TTS &amp; Tự động chuyển chương</summary>
+                <div class="settings-body">
+                    <div class="field">
+                        <label class="field-label" for="tts-ws-endpoint" data-i18n="settings_ws_url_label">WebSocket TTS Endpoint URL</label>
+                        <input type="text" id="tts-ws-endpoint" placeholder="wss://tts.stv-novel.local/v1/tts">
+                    </div>
+                    <div class="field">
+                        <label class="field-label" for="tts-ws-voice" data-i18n="settings_ws_voice_label">Tham số giọng WebSocket</label>
+                        <input type="text" id="tts-ws-voice" placeholder="vi-VN-HoaiMyNeural">
+                    </div>
+                    <label class="checkbox-row">
+                        <input type="checkbox" id="tts-ws-fallback" checked>
+                        <span data-i18n="settings_ws_fallback_label">Tự động fallback sang Web Speech API khi lỗi mạng</span>
+                    </label>
+                    <hr style="border: 0; border-top: 1px solid var(--border); width: 100%; margin: 2px 0;">
+                    <div class="field">
+                        <label class="field-label" for="tts-endpoint" data-i18n="settings_vieneu_url_label">VieNeu Server URL</label>
+                        <input type="text" id="tts-endpoint" placeholder="http://127.0.0.1:8000">
+                    </div>
+                    <div class="btn-row">
+                        <div class="field" style="flex: 1;">
+                            <label class="field-label" for="tts-backend" data-i18n="settings_vieneu_backend_label">Chế độ VieNeu</label>
+                            <select id="tts-backend">
+                                <option value="auto">Auto (GPU/CPU)</option>
+                                <option value="amd_gpu" data-i18n="optBackendAmdGpu">AMD GPU (DirectML - Tăng tốc Card rời, Chuẩn gốc)</option>
+                                <option value="cpu_fp32" data-i18n="optBackendCpuFp32">CPU (ONNX FP32 - Chuẩn)</option>
+                                <option value="onnx_int8">CPU (ONNX INT8 - Nhanh ~2x)</option>
+                                <option value="pytorch">GPU (PyTorch)</option>
+                            </select>
+                        </div>
+                        <div class="field" style="flex: 1;">
+                            <label class="field-label" for="tts-stability">Sampling</label>
+                            <select id="tts-stability">
+                                <option value="balanced">Balanced (0.4)</option>
+                                <option value="strict">Strict (0.25)</option>
+                                <option value="natural">Natural (0.8)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="field">
+                        <label class="field-label" for="tts-apikey" data-i18n="settings_vieneu_key_label">VieNeu API Key</label>
+                        <input type="password" id="tts-apikey">
+                    </div>
+                    <label class="checkbox-row">
+                        <input type="checkbox" id="tts-autoplay">
+                        <span data-i18n="settings_tts_autoplay">Tự động đọc sau khi dịch xong chương</span>
+                    </label>
+                    <label class="checkbox-row">
+                        <input type="checkbox" id="tts-autonext" checked>
+                        <span data-i18n="settings_tts_autonext">Tự động tải trước &amp; chuyển chương tiếp theo</span>
+                    </label>
+                    <div class="field">
+                        <label class="field-label" for="tts-preload-sec" data-i18n="settings_tts_preload_sec">Thời gian tải trước (giây)</label>
+                        <input type="number" id="tts-preload-sec" min="5" max="300" placeholder="60">
+                    </div>
+                    <label class="checkbox-row">
+                        <input type="checkbox" id="settings-debug-log">
+                        <span data-i18n="settings_debug_log">Bật log debug chi tiết</span>
+                    </label>
+                </div>
+            </details>
+
+            <button id="btn-save" class="btn btn-primary" type="button" data-i18n="btn_save_settings">Lưu cấu hình</button>
+            <div id="save-status" class="status-banner success" hidden data-i18n="settings_saved">Đã lưu cấu hình!</div>
+        </section>
+    </main>
+
+    <!-- ACCESSIBLE DIALOG MODAL (replaces alert/confirm/prompt) -->
+    <div id="app-dialog-overlay" class="modal-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="app-dialog-title">
+        <div class="modal-box">
+            <h4 id="app-dialog-title"></h4>
+            <p id="app-dialog-message" class="muted"></p>
+            <input type="text" id="app-dialog-input" hidden>
+            <div class="modal-actions">
+                <button id="app-dialog-cancel" class="btn btn-secondary btn-sm" type="button" data-i18n="modal_cancel">Hủy</button>
+                <button id="app-dialog-confirm" class="btn btn-primary btn-sm" type="button" data-i18n="modal_confirm">Xác nhận</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MOVE GLOSSARY MODAL -->
+    <div id="move-glossary-overlay" class="modal-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="move-modal-title">
+        <div class="modal-box">
+            <h4 id="move-modal-title" data-i18n="modal_move_title">Chuyển thuật ngữ đã dùng</h4>
+            <p class="muted" data-i18n="modal_move_desc">Các thuật ngữ xuất hiện trong chương hiện tại sẽ được chuyển sang thư viện đích.</p>
+            <div class="field">
+                <label class="field-label" for="move-target-profile" data-i18n="modal_move_target">Thư viện đích</label>
+                <select id="move-target-profile"></select>
+            </div>
+            <div id="move-modal-status" class="muted"></div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary btn-sm" id="btn-move-cancel" type="button" data-i18n="modal_cancel">Hủy</button>
+                <button class="btn btn-primary btn-sm" id="btn-move-confirm" type="button" data-i18n="modal_move_btn">Chuyển</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- CLEAN GLOSSARY MODAL -->
+    <div id="clean-glossary-overlay" class="modal-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="clean-modal-title">
+        <div class="modal-box" style="max-width: 370px;">
+            <h4 id="clean-modal-title" data-i18n="modal_clean_title">Quét &amp; Dọn rác Glossary</h4>
+            <p id="clean-summary" class="muted"></p>
+            <div id="clean-toolbar" class="site-row" hidden>
+                <label class="checkbox-row" style="font-size: 12px;">
+                    <input type="checkbox" id="clean-select-all">
+                    <span data-i18n="glossary_select_all">Chọn tất cả</span>
+                </label>
+                <span id="clean-selected-count" class="muted">0</span>
+            </div>
+            <div id="clean-issue-list" class="clean-issue-list"></div>
+            <div id="clean-modal-status" class="muted"></div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary btn-sm" id="btn-clean-cancel" type="button" data-i18n="modal_close">Đóng</button>
+                <button class="btn btn-primary btn-sm" id="btn-clean-apply" type="button">Apply</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="i18n.js"></script>
+    <script src="url-validator.js"></script>
+    <script src="glossary-utils.js"></script>
+    <script src="popup.js"></script>
+</body>
+
+</html>

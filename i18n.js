@@ -1,0 +1,751 @@
+/**
+ * Quick Novel Translator (STV) - Bilingual Localization (vi / en)
+ * Universal Module: Works in Popup, Content Scripts, Service Worker, and Node.js tests.
+ */
+(function (global, factory) {
+    if (typeof exports === 'object' && typeof module !== 'undefined') {
+        module.exports = factory();
+    } else {
+        global.STV_I18n = factory();
+    }
+})(typeof globalThis !== 'undefined' ? globalThis : typeof window !== 'undefined' ? window : this, function () {
+    'use strict';
+
+    const DICTIONARY = {
+        vi: {
+            app_title: 'Quick Novel Translator',
+            nav_translate: 'Dịch',
+            nav_tts: 'Nghe',
+            nav_glossary: 'Từ điển',
+            nav_settings: 'Cài đặt',
+
+            // Onboarding & Permissions
+            onboarding_title: 'Chào mừng! Thiết lập nhanh 2 bước',
+            onboarding_desc: 'Nhập API Key (OpenRouter / OpenAI) để bắt đầu dịch truyện ngay trên trình duyệt.',
+            onboarding_key_placeholder: 'Dán API Key của bạn (sk-or-...)',
+            onboarding_save_btn: 'Lưu & Bắt đầu',
+            site_access_granted: 'Đã cấp quyền cho trang này',
+            site_access_needed: 'Chưa cấp quyền đọc trang này',
+            site_access_restricted: 'Trang hệ thống trình duyệt (không hỗ trợ)',
+            btn_grant_site: 'Cấp quyền trang này',
+            site_selector_saved: 'Đã lưu vùng chọn cho {host}',
+            site_selector_none: 'Tự động nhận diện vùng truyện',
+            btn_clear_selector: 'Xóa vùng đã lưu',
+
+            // Translate Tab
+            label_model: 'Model AI',
+            model_placeholder: 'stepfun/step-3.5-flash',
+            btn_fetch_models_title: 'Tải danh sách model từ API',
+            btn_model_dropdown_title: 'Chọn model từ danh sách',
+            model_search_ph: 'Tìm tên model hoặc provider...',
+            model_provider_all: 'Tất cả',
+            model_fetching: 'Đang tải danh sách model...',
+            model_fetched_count: 'Đã tải {count} model ({providers} provider)',
+            model_fetched_count_opaque: 'Đã tải {count} model ({providers} provider · API trả về mã ID)',
+            model_fetch_empty: 'API không trả về model nào.',
+            model_fetch_error: 'Lỗi tải model: {error}',
+            model_list_default_hint: 'Đang hiện gợi ý mặc định · Bấm ↻ để tải từ API',
+            model_no_match: 'Không tìm thấy model khớp "{query}"',
+            btn_translate: 'Dịch chương này',
+            btn_translating: 'Đang dịch...',
+            btn_retranslate: 'Dịch lại',
+            btn_pick_area: 'Chọn vùng dịch thủ công',
+            status_ready: 'Sẵn sàng dịch',
+            status_scanning: 'Đang quét nội dung chương...',
+            status_need_key: 'Vui lòng nhập API Key trong Cài đặt để dịch.',
+            status_picking: 'Hãy click vào vùng chứa nội dung truyện trên trang...',
+            status_translating: 'Đang dịch trực tiếp trên trang...',
+            status_selector_cleared: 'Đã xóa vùng chọn đã lưu cho {host}.',
+
+            // TTS Tab & Player
+            tts_engine_label: 'Engine đọc giọng',
+            tts_engine_ws: 'WebSocket TTS (Mặc định + Tự fallback)',
+            tts_engine_webspeech: 'Web Speech API (Trình duyệt offline)',
+            tts_engine_vieneu: 'VieNeu Local Server (Nâng cao)',
+            tts_voice_label: 'Giọng đọc',
+            tts_speed_label: 'Tốc độ đọc',
+            btn_tts_play: 'Nghe chương này',
+            btn_tts_resume: 'Đọc tiếp ({current}/{total})',
+            btn_tts_stop: 'Dừng đọc',
+            tts_status_idle: 'Chọn chương và bấm Nghe để bắt đầu.',
+            tts_status_playing: 'Đang đọc {total} đoạn...',
+            tts_status_stopped: 'Đã dừng phát âm thanh.',
+            tts_no_content: 'Không tìm thấy nội dung truyện. Hãy Dịch hoặc Chọn vùng trước.',
+            tts_fallback_notice: 'Kết nối WebSocket TTS gián đoạn — đã tự chuyển sang giọng đọc trình duyệt (Web Speech API).',
+            tts_webspeech_unavailable: 'Trình duyệt không hỗ trợ Web Speech API.',
+            tts_vieneu_guide_title: 'Cài đặt VieNeu-TTS Local (Nâng cao)',
+            tts_vieneu_guide_desc: 'Dùng giọng AI tiếng Việt chất lượng cao chạy trên máy cá nhân qua Native Host.',
+            btn_vieneu_setup: 'Hướng dẫn & Cài đặt VieNeu',
+            btn_vieneu_start: 'Bật Server',
+            btn_vieneu_stop: 'Tắt Server',
+            tts_vieneu_ready: 'VieNeu: Sẵn sàng ({backend})',
+            tts_vieneu_starting: 'VieNeu: Đang khởi động...',
+            tts_vieneu_off: 'VieNeu: Đang tắt',
+            tts_vieneu_host_missing: 'Chưa cài Native Host. Chạy file native-host/install_host.bat với Extension ID: {id}',
+            tts_vieneu_host_missing_guide: 'Chưa cài Native Host để bật/tắt 1-click. Bạn có thể tự chạy VieNeu trong Terminal (không cần Native Host) hoặc bấm "Hướng dẫn & Cài đặt VieNeu" bên trên để xem hướng dẫn chi tiết.',
+            tts_vieneu_first_run_hint: 'Đang khởi động / tải model AI lần đầu (có thể mất 1–5 phút), vui lòng đợi...',
+            tts_vieneu_timeout_with_log: 'Server khởi chạy quá {sec}s chưa sẵn sàng. Nếu đây là lần đầu chạy, model có thể vẫn đang tải ngầm. Kiểm tra log: {log}',
+            tts_vieneu_timeout_no_log: 'Server khởi chạy quá {sec}s chưa sẵn sàng. Hãy mở "Hướng dẫn & Cài đặt VieNeu" để kiểm tra.',
+            tts_download_title: 'Tải Audio nghe offline (WAV)',
+            tts_download_minutes_label: 'Thời lượng tối thiểu (phút)',
+            tts_download_hint: 'Tự động nối tiếp và đọc trọn các chương sau cho đến khi đủ số phút.',
+            btn_tts_download: '⬇ Tải Audio (WAV)',
+            tts_dl_starting: 'Đang chuẩn bị tạo audio ({minutes} phút)...',
+            tts_dl_waiting_translation: 'Đang đợi chương hiện tại dịch xong để tải audio...',
+            tts_dl_progress: 'Đang tạo: {current}/{target} phút · Chương {chap} ({seg}/{totalSeg})',
+            tts_dl_fetching_next: 'Đã tạo {current}/{target}p · Đang tải & dịch chương {chap}...',
+            tts_dl_done: 'Đã tải xong {minutes} phút ({chapters} chương)!',
+            tts_dl_webspeech_unsupported: 'Web Speech API không hỗ trợ xuất file WAV. Hãy chọn WebSocket TTS hoặc VieNeu.',
+            tts_dl_save_now: '💾 Lưu ngay',
+            tts_dl_cancel: '✖ Hủy tải',
+            tts_dl_cancelled: 'Đã hủy tải audio.',
+            tts_dl_no_audio: 'Chưa có dữ liệu âm thanh để lưu.',
+            tts_dl_open_next: '↪ Mở chương kế tiếp',
+
+            // Floating Reader Menu (Shadow DOM)
+            reader_menu_title: 'Trình đọc STV',
+            reader_toggle_orig: 'Xem bản gốc',
+            reader_toggle_trans: 'Xem bản dịch',
+            reader_font_dec: 'Giảm cỡ chữ',
+            reader_font_inc: 'Tăng cỡ chữ',
+            reader_retranslate: 'Dịch lại chương',
+            reader_tts_listen: 'Nghe TTS',
+            reader_tts_pause: 'Tạm dừng',
+            reader_next_chap: 'Chương tiếp',
+            reader_picker_hint: 'Di chuột chọn vùng văn bản · Click trái để lưu · Bấm ESC để hủy',
+            reader_picker_saved: 'Đã lưu vùng chọn! Bạn có thể bấm Dịch ngay.',
+            reader_picker_cancelled: 'Đã hủy chọn vùng.',
+            reader_retranslating_line: '[Đang dịch lại...]',
+
+            // Glossary Tab
+            glossary_profile_label: 'Thư viện',
+            btn_new_profile: 'Tạo mới',
+            btn_delete_profile: 'Xóa',
+            glossary_add_title: 'Thêm thuật ngữ',
+            glossary_orig_ph: 'Từ gốc (Trung)',
+            glossary_viet_ph: 'Nghĩa dịch (Việt)',
+            btn_add: 'Thêm',
+            glossary_list_title: 'Danh sách ({count})',
+            glossary_search_ph: 'Tìm từ gốc hoặc nghĩa dịch...',
+            glossary_filter_all: 'Tất cả',
+            glossary_filter_locked: 'Đã khóa',
+            glossary_filter_unlocked: 'Chưa khóa',
+            glossary_select_all: 'Chọn tất cả',
+            btn_scan_clean: 'Quét rác',
+            btn_move_used: 'Chuyển đã dùng',
+            btn_export_json: 'Xuất JSON',
+            btn_import_json: 'Nhập JSON',
+            btn_delete_selected: 'Xóa ({count})',
+            glossary_empty: 'Chưa có thuật ngữ nào trong thư viện này.',
+            glossary_no_match: 'Không tìm thấy thuật ngữ khớp với "{query}".',
+            glossary_imported: 'Đã nhập {added} từ mới (giữ nguyên {skipped} từ đã khóa).',
+            glossary_import_invalid: 'File JSON từ điển không hợp lệ.',
+
+            // Modals
+            modal_cancel: 'Hủy',
+            modal_confirm: 'Xác nhận',
+            modal_close: 'Đóng',
+            modal_new_profile_title: 'Tạo thư viện từ điển mới',
+            modal_new_profile_ph: 'Nhập tên truyện hoặc thư viện...',
+            modal_profile_exists: 'Tên thư viện này đã tồn tại.',
+            modal_delete_profile_title: 'Xóa thư viện từ điển',
+            modal_delete_profile_msg: 'Bạn có chắc muốn xóa thư viện "{name}"? Toàn bộ thuật ngữ bên trong sẽ bị xóa.',
+            modal_delete_default_err: 'Không thể xóa thư viện mặc định "Default".',
+            modal_delete_terms_title: 'Xóa thuật ngữ',
+            modal_delete_terms_msg: 'Xóa {count} thuật ngữ đã chọn?',
+            modal_delete_term_msg: 'Xóa thuật ngữ "{orig}"?',
+            modal_move_title: 'Chuyển thuật ngữ đã dùng',
+            modal_move_desc: 'Các thuật ngữ xuất hiện trong chương hiện tại sẽ được chuyển sang thư viện đích.',
+            modal_move_target: 'Thư viện đích',
+            modal_move_btn: 'Chuyển',
+            modal_clean_title: 'Quét & Dọn rác Glossary',
+
+            // Settings Tab
+            settings_lang_label: 'Ngôn ngữ giao diện',
+            settings_ai_section: 'Kết nối AI & Phím tắt',
+            settings_endpoint_label: 'API Endpoint URL',
+            settings_apikey_label: 'API Key',
+            settings_shortcut_label: 'Phím tắt (nhấn phím để gán)',
+            settings_prompt_label: 'System Prompt',
+            settings_reader_section: 'Giao diện đọc truyện',
+            settings_fontsize_label: 'Cỡ chữ (px)',
+            settings_fontfamily_label: 'Font chữ',
+            settings_lineheight_label: 'Giãn dòng',
+            settings_tts_section: 'Cấu hình TTS & Tự động chuyển chương',
+            settings_ws_url_label: 'WebSocket TTS Endpoint URL',
+            settings_ws_voice_label: 'Tham số giọng WebSocket',
+            settings_ws_fallback_label: 'Tự động fallback sang Web Speech API khi lỗi mạng',
+            settings_vieneu_url_label: 'VieNeu Server URL',
+            settings_vieneu_backend_label: 'Chế độ chạy VieNeu',
+            optBackendAmdGpu: 'AMD GPU (DirectML - Tăng tốc Card rời, Chuẩn gốc)',
+            optBackendCpuFp32: 'CPU (ONNX FP32 - Chuẩn)',
+            settings_vieneu_key_label: 'VieNeu API Key (nếu có)',
+            settings_tts_autoplay: 'Tự động đọc sau khi dịch xong chương',
+            settings_tts_autonext: 'Tự động tải trước & chuyển chương tiếp theo',
+            settings_tts_preload_sec: 'Thời gian tải trước chương sau (giây)',
+            settings_debug_log: 'Bật log debug chi tiết trong Console',
+            btn_save_settings: 'Lưu cấu hình',
+            settings_saved: 'Đã lưu cấu hình!',
+            settings_invalid_url: 'URL không hợp lệ (chỉ hỗ trợ http://, https://, ws://, wss://).',
+
+            // Legacy / Contract Aliases
+            app_name: 'Dịch Tiểu Thuyết STV',
+            tabTranslate: 'Dịch',
+            tabListen: 'Nghe',
+            tabSettings: 'Cài đặt',
+            tabGlossary: 'Từ điển',
+            btnTranslateThisChapter: 'Dịch chương này',
+            btnSave: 'Lưu',
+            btnCancel: 'Hủy',
+            btnConfirm: 'Xác nhận',
+            foundLines: 'Tìm thấy {count} dòng',
+            progress_status: 'Dòng {current} / {total}',
+            menuOriginal: 'Xem bản gốc',
+            menuTranslated: 'Bản dịch',
+            menuFontSize: 'Cỡ chữ',
+            menuNextChapter: 'Chương sau',
+            menuRepick: 'Chọn lại vùng dịch',
+            toastFallbackWebSpeech: 'Chuyển sang giọng đọc Web Speech API',
+            toastInvalidApiKey: 'API Key không hợp lệ',
+            toastOutOfCredit: 'Hết hạn mức tín dụng API',
+            toastRateLimited: 'Quá giới hạn tần suất yêu cầu',
+            onboardingTitle: 'Chào mừng bạn đến với STV!',
+            onboardingDesc: 'Vui lòng nhập API Key để bắt đầu sử dụng tiện ích dịch truyện.',
+            vieneuGuideTitle: 'Hướng dẫn cài VieNeu-TTS',
+            vieneuGuideDesc: 'Tải và cài đặt máy chủ VieNeu TTS cục bộ trên máy tính của bạn.',
+
+            // VieNeu Interactive Setup Page
+            setup_page_title: 'Hướng dẫn cài đặt VieNeu-TTS Local | Quick Novel Translator',
+            setup_skip_link: 'Chuyển đến nội dung hướng dẫn',
+            setup_header_title: 'Cài đặt VieNeu-TTS Local',
+            setup_header_subtitle: 'Giọng đọc AI tiếng Việt 48kHz miễn phí chạy trên máy tính của bạn — tương thích ngay với bản Chrome Web Store.',
+            setup_toggle_lang_label: 'Chuyển ngôn ngữ giao diện',
+            setup_toggle_theme_label: 'Chuyển giao diện sáng hoặc tối',
+
+            setup_diag_title: '1. Kiểm tra kết nối nhanh',
+            setup_diag_server_label: 'VieNeu Server',
+            setup_diag_host_label: 'Native Host (tùy chọn)',
+            setup_diag_checking: 'Đang kiểm tra...',
+            setup_diag_server_online: 'Đang chạy ({voices} giọng)',
+            setup_diag_server_online_default: 'Đang chạy (sẵn sàng)',
+            setup_diag_server_offline: 'Chưa bật / chưa kết nối',
+            setup_diag_host_ready: 'Đã cài (server đang bật)',
+            setup_diag_host_ready_stopped: 'Đã cài (sẵn sàng bật 1-click)',
+            setup_diag_host_missing_venv: 'Đã cài Host nhưng chưa thấy .venv tại {dir}',
+            setup_diag_host_not_installed: 'Chưa cài (không bắt buộc)',
+            setup_diag_host_perm_needed: 'Chưa cấp quyền nativeMessaging',
+            setup_diag_host_non_windows: 'Chỉ hỗ trợ Windows (dùng Cách 1)',
+            setup_server_url_label: 'Địa chỉ VieNeu Server',
+            setup_btn_check_conn: 'Kiểm tra kết nối',
+            setup_btn_activate: 'Dùng VieNeu ngay',
+            setup_msg_invalid_url: 'URL không hợp lệ. Chỉ hỗ trợ http:// hoặc https://.',
+            setup_msg_server_ok: 'Kết nối thành công tới {url}! Đã phát hiện {voices} giọng đọc. Bạn có thể bấm "Dùng VieNeu ngay".',
+            setup_msg_server_ok_default: 'Kết nối thành công tới {url}! Server đã sẵn sàng. Bạn có thể bấm "Dùng VieNeu ngay".',
+            setup_msg_server_fail: 'Chưa thấy VieNeu server tại {url}. Nếu là lần đầu chạy, hãy đợi terminal tải xong model (~1–2 GB) rồi bấm Kiểm tra lại.',
+            setup_msg_activated: 'Đã chọn VieNeu làm engine đọc giọng ({backend})! Hãy quay lại tab truyện và bấm "Nghe chương này".',
+            setup_no_install_tip: 'Không muốn cài đặt trên máy? Trong tab Nghe của Extension, bạn luôn có thể dùng "WebSocket TTS" hoặc "Web Speech API" miễn phí mà không cần cài thêm gì.',
+
+            setup_prereq_title: 'Yêu cầu hệ thống & Tổng quan',
+            setup_prereq_os: 'Hệ điều hành: Windows 10/11 (64-bit), macOS hoặc Linux. RAM tối thiểu 8 GB.',
+            setup_prereq_disk: 'Dung lượng trống: ~4–5 GB. Lần chạy đầu tiên cần Internet để tự tải model AI (~1–2 GB), sau đó có thể chạy offline.',
+            setup_prereq_cws: 'Tương thích Chrome Web Store: Extension giao tiếp qua cổng nội bộ 127.0.0.1:8000 nên dùng được ngay sau Cách 1 mà không cần Native Host.',
+
+            setup_method1_badge: 'KHUYÊN DÙNG · ĐƠN GIẢN NHẤT',
+            setup_method1_title: '2. Cài & chạy VieNeu trong 3 bước',
+            setup_method1_desc: 'Chọn tab đúng với máy của bạn rồi sao chép lần lượt 3 bước vào PowerShell (Windows) hoặc Terminal (macOS/Linux).',
+            setup_hw_tablist_label: 'Chọn hệ điều hành và phần cứng',
+            setup_tab_win_cpu: 'Windows · CPU (Khuyên dùng)',
+            setup_tab_win_nvidia: 'Windows · GPU NVIDIA',
+            setup_tab_win_amd: 'Windows · GPU AMD',
+            setup_tab_unix: 'macOS / Linux',
+            setup_win_cpu_note: 'Chạy nhẹ trên mọi CPU hiện đại qua ONNX Runtime (không cần card rời, không cần PyTorch).',
+            setup_win_nvidia_note: 'Tăng tốc CUDA cho card đồ họa NVIDIA (khuyên dùng VRAM ≥ 4 GB và driver NVIDIA mới).',
+            setup_win_amd_note: 'Tăng tốc DirectML cho card rời AMD Radeon trên Windows. Kết hợp tốt nhất với runner ở mục 3.',
+            setup_unix_note: 'Hỗ trợ macOS (Apple Silicon / Intel) và Linux (Ubuntu / Debian). Chạy trực tiếp trong Terminal.',
+            setup_step1_heading: 'Bước 1: Cài công cụ nền (chỉ làm 1 lần)',
+            setup_step1_win_desc: 'Cài Git, uv (tự quản lý Python) và eSpeak NG (bắt buộc để phiên âm tiếng Việt). Nếu ngại cài bằng lệnh, bạn có thể bấm link bên dưới để tải trực tiếp eSpeak NG (.msi):',
+            setup_step1_unix_desc: 'Cài Git, uv và eSpeak NG trên macOS (Homebrew) hoặc Ubuntu/Debian:',
+            setup_link_espeak: 'Tải eSpeak NG (.msi)',
+            setup_link_git: 'Trang tải Git',
+            setup_link_repo: 'Mã nguồn VieNeu-TTS (GitHub)',
+            setup_reopen_shell_tip: 'Quan trọng: Sau khi cài xong Bước 1, hãy ĐÓNG cửa sổ PowerShell cũ và mở cửa sổ PowerShell MỚI để máy nhận lệnh git và uv.',
+            setup_step2_heading: 'Bước 2: Tải VieNeu-TTS và cài thư viện',
+            setup_step2_desc: 'Tải mã nguồn vào thư mục cá nhân và đồng bộ môi trường ảo (.venv):',
+            setup_step3_heading: 'Bước 3: Khởi động VieNeu Server',
+            setup_step3_desc: 'Mỗi lần muốn dùng giọng VieNeu (nếu không cài mục 3), chạy lệnh sau để bật server tại cổng 8000:',
+            setup_first_run_callout: 'Lần chạy đầu tiên: Server sẽ tự tải model AI (~1–2 GB) từ Hugging Face nên có thể mất 1–5 phút. Hãy giữ nguyên cửa sổ Terminal đến khi thấy thông báo đang lắng nghe ở http://127.0.0.1:8000 (hoặc Uvicorn running), rồi bấm "Kiểm tra kết nối" ở đầu trang!',
+
+            setup_copy_btn_tip_ok: 'Đã sao chép',
+            setup_copy_btn_tip_fail: 'Không sao chép được',
+            setup_aria_copy_win_cpu_1: 'Sao chép lệnh Bước 1 cho Windows CPU',
+            setup_aria_copy_win_cpu_2: 'Sao chép lệnh Bước 2 cho Windows CPU',
+            setup_aria_copy_win_cpu_3: 'Sao chép lệnh Bước 3 cho Windows CPU',
+            setup_aria_copy_win_nv_1: 'Sao chép lệnh Bước 1 cho Windows GPU NVIDIA',
+            setup_aria_copy_win_nv_2: 'Sao chép lệnh Bước 2 cho Windows GPU NVIDIA',
+            setup_aria_copy_win_nv_3: 'Sao chép lệnh Bước 3 cho Windows GPU NVIDIA',
+            setup_aria_copy_win_amd_1: 'Sao chép lệnh Bước 1 cho Windows GPU AMD',
+            setup_aria_copy_win_amd_2: 'Sao chép lệnh Bước 2 cho Windows GPU AMD',
+            setup_aria_copy_win_amd_3: 'Sao chép lệnh Bước 3 cho Windows GPU AMD',
+            setup_aria_copy_unix_1: 'Sao chép lệnh Bước 1 cho macOS hoặc Linux',
+            setup_aria_copy_unix_2: 'Sao chép lệnh Bước 2 cho macOS hoặc Linux',
+            setup_aria_copy_unix_3: 'Sao chép lệnh Bước 3 cho macOS hoặc Linux',
+            setup_aria_copy_ext_id: 'Sao chép Extension ID hiện tại',
+            setup_aria_copy_setup_all: 'Sao chép lệnh cài trọn gói setup_vieneu.bat',
+            setup_aria_copy_install_host: 'Sao chép lệnh đăng ký Native Host install_host.bat',
+
+            setup_method2_badge: 'TÙY CHỌN · CHỈ WINDOWS',
+            setup_method2_title: '3. Bật/Tắt Server 1-Click ngay trong Popup (Native Host)',
+            setup_method2_desc: 'Nếu không muốn mở Terminal mỗi lần nghe truyện, bạn có thể cài thêm gói Windows Companion để bấm nút "Bật Server" chạy ngầm ngay trong Popup (đồng thời tối ưu đa luồng cho AMD DirectML / CPU).',
+            setup_ext_id_label: 'Extension ID hiện tại của bạn:',
+            setup_ext_id_note: 'Lưu ý: Extension ID khi cài từ Chrome Web Store sẽ khác bản Load Unpacked. Các lệnh bên dưới đã tự điền sẵn đúng ID hiện tại.',
+            setup_companion_dl_title: 'A. Tải gói Windows Companion',
+            setup_btn_download_companion: '⬇ Tải STV-VieNeu Companion (Windows ZIP)',
+            setup_companion_local_note: 'Tải và giải nén gói STV-VieNeu-Companion-Windows.zip từ trang Releases của extension (hoặc mở thư mục native-host nếu bạn cài bản unpacked).',
+            setup_companion_steps_title: 'B. Mở PowerShell trong thư mục vừa giải nén và chạy 1 lệnh',
+            setup_companion_all_label: 'Nếu chưa cài VieNeu-TTS (tự cài công cụ + tải VieNeu + đăng ký nút Bật Server):',
+            setup_companion_host_label: 'Nếu bạn đã cài VieNeu-TTS ở mục 2 rồi (chỉ đăng ký nút Bật Server):',
+            setup_companion_clean_note: 'Script sẽ lưu cấu hình vào %LOCALAPPDATA%\\STV-VieNeu\\host, sau khi cài xong bạn có thể xóa thư mục giải nén.',
+            setup_btn_test_host: 'Kiểm tra Native Host',
+            setup_host_detail_idle: 'Bấm "Kiểm tra Native Host" để xác minh Chrome đã kết nối được với companion trên máy.',
+            setup_host_detail_ok_running: 'Native Host hoạt động tốt! VieNeu Server đang chạy (PID: {pid}, thư mục: {dir}).',
+            setup_host_detail_ok_stopped: 'Native Host đã sẵn sàng! Thư mục VieNeu: {dir}. Bạn có thể bấm "Bật Server" ngay trong Popup.',
+            setup_host_detail_no_venv: 'Native Host đã đăng ký, nhưng chưa thấy môi trường .venv tại {dir}. Hãy cài VieNeu ở mục 2 hoặc chạy setup_vieneu.bat.',
+            setup_host_detail_denied: 'Bạn chưa cấp quyền nativeMessaging. Hãy bấm lại "Kiểm tra Native Host" và chọn Cho phép.',
+            setup_host_detail_missing: 'Chưa kết nối được Native Host ({error}). Hãy chạy install_host.bat với đúng Extension ID ở trên rồi kiểm tra lại.',
+
+            setup_faq_title: '4. Câu hỏi thường gặp & Xử lý lỗi',
+            setup_faq_q1: 'Bấm "Bật Server" đợi lâu không lên hoặc báo quá thời gian?',
+            setup_faq_a1: 'Ở lần chạy đầu tiên, VieNeu-TTS cần tải bộ model AI (~1–2 GB) từ Hugging Face nên có thể mất vài phút tùy tốc độ mạng. Hãy chạy thử lệnh ở mục 2 một lần để thấy tải xong, từ các lần sau bật trong Popup chỉ mất vài giây.',
+            setup_faq_q2: 'PowerShell báo "uv is not recognized" hoặc "git is not recognized"?',
+            setup_faq_a2: 'Sau khi cài Git hoặc uv, Windows cần mở một cửa sổ PowerShell mới để nạp biến môi trường PATH. Hãy đóng cửa sổ cũ, mở PowerShell mới và chạy lại.',
+            setup_faq_q3: 'Gặp lỗi thiếu espeak / phonemizer khi tạo giọng đọc?',
+            setup_faq_a3: 'VieNeu-TTS bắt buộc dùng eSpeak NG để tách âm tiếng Việt. Hãy tải và cài file .msi của eSpeak NG (link ở Bước 1), sau đó khởi động lại Terminal và VieNeu Server.',
+            setup_faq_q4: 'Extension báo "Native host has exited" hoặc "forbidden"?',
+            setup_faq_a4: 'Lỗi "forbidden" xảy ra khi install_host.bat được chạy với Extension ID cũ (ví dụ đổi từ bản dev sang bản Chrome Web Store). Hãy copy lại Extension ID ở mục 3 và chạy lại install_host.bat.',
+            setup_faq_q5: 'Muốn đổi cổng (mặc định 8000) hoặc chuyển chế độ CPU/GPU?',
+            setup_faq_a5: 'Mở Popup Extension → tab "Cài đặt" → mục "Cấu hình TTS & Tự động chuyển chương" để sửa "VieNeu Server URL" hoặc "Chế độ chạy VieNeu", sau đó bấm "Lưu cấu hình".',
+            setup_footer_note: 'Quick Novel Translator (STV) · VieNeu-TTS chạy cục bộ trên máy tính của bạn; dữ liệu giọng nói không bị gửi lên máy chủ ngoài.'
+        },
+        en: {
+            app_title: 'Quick Novel Translator',
+            nav_translate: 'Translate',
+            nav_tts: 'Listen',
+            nav_glossary: 'Glossary',
+            nav_settings: 'Settings',
+
+            // Onboarding & Permissions
+            onboarding_title: 'Welcome! Quick 2-Step Setup',
+            onboarding_desc: 'Enter your API Key (OpenRouter / OpenAI) to start translating web novels.',
+            onboarding_key_placeholder: 'Paste your API Key (sk-or-...)',
+            onboarding_save_btn: 'Save & Start',
+            site_access_granted: 'Site access granted',
+            site_access_needed: 'Site access not granted yet',
+            site_access_restricted: 'Browser internal page (unsupported)',
+            btn_grant_site: 'Grant Site Access',
+            site_selector_saved: 'Saved selector for {host}',
+            site_selector_none: 'Auto-detecting chapter container',
+            btn_clear_selector: 'Clear saved area',
+
+            // Translate Tab
+            label_model: 'AI Model',
+            model_placeholder: 'stepfun/step-3.5-flash',
+            btn_fetch_models_title: 'Fetch models from API',
+            btn_model_dropdown_title: 'Choose model from list',
+            model_search_ph: 'Search model or provider...',
+            model_provider_all: 'All',
+            model_fetching: 'Fetching models...',
+            model_fetched_count: 'Loaded {count} models ({providers} providers)',
+            model_fetched_count_opaque: 'Loaded {count} models ({providers} providers · API returned raw IDs)',
+            model_fetch_empty: 'API returned no models.',
+            model_fetch_error: 'Failed to fetch models: {error}',
+            model_list_default_hint: 'Showing default presets · Click ↻ to fetch from API',
+            model_no_match: 'No models matching "{query}"',
+            btn_translate: 'Translate Chapter',
+            btn_translating: 'Translating...',
+            btn_retranslate: 'Retranslate',
+            btn_pick_area: 'Pick Content Area',
+            status_ready: 'Ready to translate',
+            status_scanning: 'Scanning chapter content...',
+            status_need_key: 'Please enter an API Key in Settings first.',
+            status_picking: 'Click the novel text area on the page...',
+            status_translating: 'Streaming translation on page...',
+            status_selector_cleared: 'Cleared saved selector for {host}.',
+
+            // TTS Tab & Player
+            tts_engine_label: 'TTS Engine',
+            tts_engine_ws: 'WebSocket TTS (Default + Auto Fallback)',
+            tts_engine_webspeech: 'Web Speech API (Browser Offline)',
+            tts_engine_vieneu: 'VieNeu Local Server (Advanced)',
+            tts_voice_label: 'Voice',
+            tts_speed_label: 'Speed',
+            btn_tts_play: 'Listen to Chapter',
+            btn_tts_resume: 'Resume ({current}/{total})',
+            btn_tts_stop: 'Stop',
+            tts_status_idle: 'Open a chapter and click Listen to start.',
+            tts_status_playing: 'Playing {total} segments...',
+            tts_status_stopped: 'Playback stopped.',
+            tts_no_content: 'No chapter content found. Translate or Pick an area first.',
+            tts_fallback_notice: 'WebSocket TTS unavailable — automatically switched to browser Web Speech API.',
+            tts_webspeech_unavailable: 'Web Speech API is not supported in this browser.',
+            tts_vieneu_guide_title: 'VieNeu-TTS Local Setup (Advanced)',
+            tts_vieneu_guide_desc: 'High-quality local Vietnamese AI voice via Native Messaging Host.',
+            btn_vieneu_setup: 'Setup Guide & Install VieNeu',
+            btn_vieneu_start: 'Start Server',
+            btn_vieneu_stop: 'Stop Server',
+            tts_vieneu_ready: 'VieNeu: Ready ({backend})',
+            tts_vieneu_starting: 'VieNeu: Starting...',
+            tts_vieneu_off: 'VieNeu: Stopped',
+            tts_vieneu_host_missing: 'Native Host not installed. Run native-host/install_host.bat with Extension ID: {id}',
+            tts_vieneu_host_missing_guide: 'Native Host is not installed for 1-click toggle. You can start VieNeu manually in Terminal (no Native Host required) or click "Setup Guide & Install VieNeu" above for step-by-step instructions.',
+            tts_vieneu_first_run_hint: 'Starting / downloading AI model on first run (may take 1–5 min), please wait...',
+            tts_vieneu_timeout_with_log: 'Server did not become ready within {sec}s. On first run, the AI model may still be downloading in the background. Check log: {log}',
+            tts_vieneu_timeout_no_log: 'Server did not become ready within {sec}s. Open "Setup Guide & Install VieNeu" to inspect.',
+            tts_download_title: 'Download Offline Audio (WAV)',
+            tts_download_minutes_label: 'Minimum duration (minutes)',
+            tts_download_hint: 'Automatically chains and completes subsequent chapters until duration is reached.',
+            btn_tts_download: '⬇ Download Audio (WAV)',
+            tts_dl_starting: 'Preparing audio export ({minutes} min)...',
+            tts_dl_waiting_translation: 'Waiting for current chapter translation to finish...',
+            tts_dl_progress: 'Generating: {current}/{target} min · Chap {chap} ({seg}/{totalSeg})',
+            tts_dl_fetching_next: 'Generated {current}/{target}m · Fetching & translating chap {chap}...',
+            tts_dl_done: 'Downloaded {minutes} min ({chapters} chapters)!',
+            tts_dl_webspeech_unsupported: 'Web Speech API does not support WAV export. Please select WebSocket TTS or VieNeu.',
+            tts_dl_save_now: '💾 Save Now',
+            tts_dl_cancel: '✖ Cancel',
+            tts_dl_cancelled: 'Audio download cancelled.',
+            tts_dl_no_audio: 'No audio data generated yet.',
+            tts_dl_open_next: '↪ Open Next Chapter',
+
+            // Floating Reader Menu (Shadow DOM)
+            reader_menu_title: 'STV Reader',
+            reader_toggle_orig: 'Show Original',
+            reader_toggle_trans: 'Show Translated',
+            reader_font_dec: 'Decrease font',
+            reader_font_inc: 'Increase font',
+            reader_retranslate: 'Retranslate Chapter',
+            reader_tts_listen: 'Listen TTS',
+            reader_tts_pause: 'Pause',
+            reader_next_chap: 'Next Chapter',
+            reader_picker_hint: 'Hover to highlight text block · Left-click to select · ESC to cancel',
+            reader_picker_saved: 'Content area saved! You can translate now.',
+            reader_picker_cancelled: 'Selection cancelled.',
+            reader_retranslating_line: '[Retranslating...]',
+
+            // Glossary Tab
+            glossary_profile_label: 'Profile',
+            btn_new_profile: 'New',
+            btn_delete_profile: 'Delete',
+            glossary_add_title: 'Add Term',
+            glossary_orig_ph: 'Source term (CN)',
+            glossary_viet_ph: 'Translation (VI)',
+            btn_add: 'Add',
+            glossary_list_title: 'Terms ({count})',
+            glossary_search_ph: 'Search source or translation...',
+            glossary_filter_all: 'All',
+            glossary_filter_locked: 'Locked',
+            glossary_filter_unlocked: 'Unlocked',
+            glossary_select_all: 'Select all',
+            btn_scan_clean: 'Clean Junk',
+            btn_move_used: 'Move Used',
+            btn_export_json: 'Export JSON',
+            btn_import_json: 'Import JSON',
+            btn_delete_selected: 'Delete ({count})',
+            glossary_empty: 'No terms saved in this profile yet.',
+            glossary_no_match: 'No terms matching "{query}".',
+            glossary_imported: 'Imported {added} new terms (preserved {skipped} locked terms).',
+            glossary_import_invalid: 'Invalid glossary JSON file.',
+
+            // Modals
+            modal_cancel: 'Cancel',
+            modal_confirm: 'Confirm',
+            modal_close: 'Close',
+            modal_new_profile_title: 'Create Glossary Profile',
+            modal_new_profile_ph: 'Enter novel or profile name...',
+            modal_profile_exists: 'A profile with this name already exists.',
+            modal_delete_profile_title: 'Delete Glossary Profile',
+            modal_delete_profile_msg: 'Delete profile "{name}"? All terms inside will be lost.',
+            modal_delete_default_err: 'Cannot delete the default profile "Default".',
+            modal_delete_terms_title: 'Delete Terms',
+            modal_delete_terms_msg: 'Delete {count} selected terms?',
+            modal_delete_term_msg: 'Delete term "{orig}"?',
+            modal_move_title: 'Move Used Terms',
+            modal_move_desc: 'Terms appearing in the current chapter will be moved to the target profile.',
+            modal_move_target: 'Target profile',
+            modal_move_btn: 'Move',
+            modal_clean_title: 'Scan & Clean Glossary',
+
+            // Settings Tab
+            settings_lang_label: 'Interface Language',
+            settings_ai_section: 'AI Connection & Shortcut',
+            settings_endpoint_label: 'API Endpoint URL',
+            settings_apikey_label: 'API Key',
+            settings_shortcut_label: 'Shortcut (press keys to set)',
+            settings_prompt_label: 'System Prompt',
+            settings_reader_section: 'Reader Typography',
+            settings_fontsize_label: 'Font Size (px)',
+            settings_fontfamily_label: 'Font Family',
+            settings_lineheight_label: 'Line Height',
+            settings_tts_section: 'TTS & Auto-Advance',
+            settings_ws_url_label: 'WebSocket TTS Endpoint URL',
+            settings_ws_voice_label: 'WebSocket Voice Param',
+            settings_ws_fallback_label: 'Auto-fallback to Web Speech API on network error',
+            settings_vieneu_url_label: 'VieNeu Server URL',
+            settings_vieneu_backend_label: 'VieNeu Backend',
+            optBackendAmdGpu: 'AMD GPU (DirectML - Accelerated, Lossless)',
+            optBackendCpuFp32: 'CPU (ONNX FP32 - Standard)',
+            settings_vieneu_key_label: 'VieNeu API Key (optional)',
+            settings_tts_autoplay: 'Auto-play TTS after translation completes',
+            settings_tts_autonext: 'Auto-preload & advance to next chapter',
+            settings_tts_preload_sec: 'Preload lead time (seconds)',
+            settings_debug_log: 'Enable verbose debug logging in Console',
+            btn_save_settings: 'Save Settings',
+            settings_saved: 'Settings saved!',
+            settings_invalid_url: 'Invalid URL (only http://, https://, ws://, wss:// are allowed).',
+
+            // Legacy / Contract Aliases
+            app_name: 'Quick Novel Translator',
+            tabTranslate: 'Translate',
+            tabListen: 'Listen',
+            tabSettings: 'Settings',
+            tabGlossary: 'Glossary',
+            btnTranslateThisChapter: 'Translate this chapter',
+            btnSave: 'Save',
+            btnCancel: 'Cancel',
+            btnConfirm: 'Confirm',
+            foundLines: 'Found {count} lines',
+            progress_status: 'Line {current} / {total}',
+            menuOriginal: 'Show original',
+            menuTranslated: 'Translation',
+            menuFontSize: 'Font size',
+            menuNextChapter: 'Next chapter',
+            menuRepick: 'Re-select area',
+            toastFallbackWebSpeech: 'Switched to Web Speech API',
+            toastInvalidApiKey: 'Invalid API Key',
+            toastOutOfCredit: 'API credit exhausted',
+            toastRateLimited: 'Rate limit exceeded',
+            onboardingTitle: 'Welcome to STV!',
+            onboardingDesc: 'Please enter your API Key to get started translating novels.',
+            vieneuGuideTitle: 'VieNeu-TTS Setup Guide',
+            vieneuGuideDesc: 'Download and install the local VieNeu TTS server on your computer.',
+
+            // VieNeu Interactive Setup Page
+            setup_page_title: 'VieNeu-TTS Local Setup Guide | Quick Novel Translator',
+            setup_skip_link: 'Skip to setup guide',
+            setup_header_title: 'VieNeu-TTS Local Setup',
+            setup_header_subtitle: 'Free 48kHz local Vietnamese AI voices on your computer — works seamlessly with Chrome Web Store installs.',
+            setup_toggle_lang_label: 'Switch interface language',
+            setup_toggle_theme_label: 'Toggle light or dark theme',
+
+            setup_diag_title: '1. Live Connection Check',
+            setup_diag_server_label: 'VieNeu Server',
+            setup_diag_host_label: 'Native Host (optional)',
+            setup_diag_checking: 'Checking...',
+            setup_diag_server_online: 'Running ({voices} voices)',
+            setup_diag_server_online_default: 'Running (ready)',
+            setup_diag_server_offline: 'Offline / unreachable',
+            setup_diag_host_ready: 'Installed (server running)',
+            setup_diag_host_ready_stopped: 'Installed (ready for 1-click start)',
+            setup_diag_host_missing_venv: 'Host installed, but .venv missing at {dir}',
+            setup_diag_host_not_installed: 'Not installed (optional)',
+            setup_diag_host_perm_needed: 'nativeMessaging permission needed',
+            setup_diag_host_non_windows: 'Windows only (use Method 1)',
+            setup_server_url_label: 'VieNeu Server URL',
+            setup_btn_check_conn: 'Check Connection',
+            setup_btn_activate: 'Use VieNeu Now',
+            setup_msg_invalid_url: 'Invalid URL. Only http:// or https:// URLs are supported.',
+            setup_msg_server_ok: 'Connected to {url}! Detected {voices} voices. Click "Use VieNeu Now" to switch.',
+            setup_msg_server_ok_default: 'Connected to {url}! Server is ready. Click "Use VieNeu Now" to switch.',
+            setup_msg_server_fail: 'Cannot reach VieNeu server at {url}. On first run, wait for the ~1–2 GB model download to finish and try again.',
+            setup_msg_activated: 'VieNeu selected as TTS engine ({backend})! Return to your novel tab and click "Listen to Chapter".',
+            setup_no_install_tip: 'Prefer zero local setup? In the Extension Listen tab, "WebSocket TTS" and "Web Speech API" work immediately with nothing extra to install.',
+
+            setup_prereq_title: 'System Requirements & Overview',
+            setup_prereq_os: 'OS: Windows 10/11 (64-bit), macOS, or Linux. Minimum 8 GB RAM.',
+            setup_prereq_disk: 'Free disk space: ~4–5 GB. Internet is required once to auto-download the AI model (~1–2 GB), then it runs offline.',
+            setup_prereq_cws: 'Chrome Web Store ready: The extension talks over localhost 127.0.0.1:8000, so Method 1 works immediately with no Native Host needed.',
+
+            setup_method1_badge: 'RECOMMENDED · EASIEST',
+            setup_method1_title: '2. Install & Run VieNeu in 3 Steps',
+            setup_method1_desc: 'Choose your OS/GPU tab below and copy the 3 steps into PowerShell (Windows) or Terminal (macOS/Linux).',
+            setup_hw_tablist_label: 'Select platform and hardware',
+            setup_tab_win_cpu: 'Windows · CPU (Recommended)',
+            setup_tab_win_nvidia: 'Windows · NVIDIA GPU',
+            setup_tab_win_amd: 'Windows · AMD GPU',
+            setup_tab_unix: 'macOS / Linux',
+            setup_win_cpu_note: 'Lightweight ONNX Runtime setup for any modern CPU (no discrete GPU or PyTorch required).',
+            setup_win_nvidia_note: 'CUDA acceleration for NVIDIA GPUs (4 GB+ VRAM and a recent NVIDIA driver recommended).',
+            setup_win_amd_note: 'DirectML acceleration for AMD Radeon discrete GPUs on Windows. Works best with the Method 3 runner.',
+            setup_unix_note: 'Supports macOS (Apple Silicon / Intel) and Linux (Ubuntu / Debian). Run directly in Terminal.',
+            setup_step1_heading: 'Step 1: Install prerequisite tools (one-time)',
+            setup_step1_win_desc: 'Install Git, uv (auto-manages Python), and eSpeak NG (required for Vietnamese phonemization). You can also download the eSpeak NG .msi installer directly below:',
+            setup_step1_unix_desc: 'Install Git, uv, and eSpeak NG on macOS (Homebrew) or Ubuntu/Debian:',
+            setup_link_espeak: 'Download eSpeak NG (.msi)',
+            setup_link_git: 'Git Download Page',
+            setup_link_repo: 'VieNeu-TTS Source (GitHub)',
+            setup_reopen_shell_tip: 'Important: After Step 1 finishes, CLOSE your old PowerShell window and open a NEW PowerShell window so git and uv are on PATH.',
+            setup_step2_heading: 'Step 2: Clone VieNeu-TTS and install dependencies',
+            setup_step2_desc: 'Download the source into your user folder and create the virtual environment (.venv):',
+            setup_step3_heading: 'Step 3: Start VieNeu Server',
+            setup_step3_desc: 'Whenever you want to listen with VieNeu (unless using Section 3), run this command to start the server on port 8000:',
+            setup_first_run_callout: 'First launch note: The server will automatically download the AI model (~1–2 GB) from Hugging Face, taking 1–5 minutes. Keep the Terminal open until it logs listening on http://127.0.0.1:8000 (or Uvicorn running), then click "Check Connection" at the top!',
+
+            setup_copy_btn_tip_ok: 'Copied',
+            setup_copy_btn_tip_fail: 'Copy failed',
+            setup_aria_copy_win_cpu_1: 'Copy Step 1 command for Windows CPU',
+            setup_aria_copy_win_cpu_2: 'Copy Step 2 command for Windows CPU',
+            setup_aria_copy_win_cpu_3: 'Copy Step 3 command for Windows CPU',
+            setup_aria_copy_win_nv_1: 'Copy Step 1 command for Windows NVIDIA GPU',
+            setup_aria_copy_win_nv_2: 'Copy Step 2 command for Windows NVIDIA GPU',
+            setup_aria_copy_win_nv_3: 'Copy Step 3 command for Windows NVIDIA GPU',
+            setup_aria_copy_win_amd_1: 'Copy Step 1 command for Windows AMD GPU',
+            setup_aria_copy_win_amd_2: 'Copy Step 2 command for Windows AMD GPU',
+            setup_aria_copy_win_amd_3: 'Copy Step 3 command for Windows AMD GPU',
+            setup_aria_copy_unix_1: 'Copy Step 1 command for macOS or Linux',
+            setup_aria_copy_unix_2: 'Copy Step 2 command for macOS or Linux',
+            setup_aria_copy_unix_3: 'Copy Step 3 command for macOS or Linux',
+            setup_aria_copy_ext_id: 'Copy current Extension ID',
+            setup_aria_copy_setup_all: 'Copy all-in-one setup_vieneu.bat command',
+            setup_aria_copy_install_host: 'Copy install_host.bat registration command',
+
+            setup_method2_badge: 'OPTIONAL · WINDOWS ONLY',
+            setup_method2_title: '3. One-Click Background Server in Popup (Native Host)',
+            setup_method2_desc: 'If you prefer not to keep a Terminal window open while listening, install the Windows Companion so you can use "Start Server" in the Popup silently (also unlocks multi-worker AMD DirectML / CPU tuning).',
+            setup_ext_id_label: 'Your current Extension ID:',
+            setup_ext_id_note: 'Note: Chrome Web Store and Load Unpacked installs have different Extension IDs. The commands below automatically include your active ID.',
+            setup_companion_dl_title: 'A. Get the Windows Companion package',
+            setup_btn_download_companion: '⬇ Download STV-VieNeu Companion (Windows ZIP)',
+            setup_companion_local_note: 'Download and extract STV-VieNeu-Companion-Windows.zip from the extension Releases page (or open the native-host folder if running unpacked).',
+            setup_companion_steps_title: 'B. Open PowerShell inside the extracted folder and run 1 command',
+            setup_companion_all_label: 'If you have NOT installed VieNeu-TTS yet (auto-installs tools + VieNeu + registers Start Server):',
+            setup_companion_host_label: 'If you ALREADY installed VieNeu-TTS in Section 2 (registers Start Server only):',
+            setup_companion_clean_note: 'The installer copies host files into %LOCALAPPDATA%\\STV-VieNeu\\host, so you can safely delete the extracted folder afterward.',
+            setup_btn_test_host: 'Test Native Host',
+            setup_host_detail_idle: 'Click "Test Native Host" to verify Chrome can communicate with the local companion.',
+            setup_host_detail_ok_running: 'Native Host is working! VieNeu Server is running (PID: {pid}, dir: {dir}).',
+            setup_host_detail_ok_stopped: 'Native Host is ready! VieNeu folder: {dir}. You can click "Start Server" in the Popup.',
+            setup_host_detail_no_venv: 'Native Host is registered, but .venv was not found at {dir}. Complete Section 2 or run setup_vieneu.bat.',
+            setup_host_detail_denied: 'nativeMessaging permission was not granted. Click "Test Native Host" again and allow the prompt.',
+            setup_host_detail_missing: 'Native Host not reachable ({error}). Run install_host.bat with the Extension ID shown above and re-test.',
+
+            setup_faq_title: '4. Troubleshooting & FAQ',
+            setup_faq_q1: 'Clicked "Start Server" and it timed out or stayed pending?',
+            setup_faq_a1: 'On the very first launch, VieNeu-TTS downloads ~1–2 GB of AI weights from Hugging Face, which can take a few minutes depending on your internet speed. Run Section 2 once in Terminal to watch the initial download complete; subsequent Popup launches take seconds.',
+            setup_faq_q2: 'PowerShell says "uv is not recognized" or "git is not recognized"?',
+            setup_faq_a2: 'After installing Git or uv, Windows requires a new PowerShell window to load the updated PATH. Close the old window completely, open a fresh PowerShell window, and try again.',
+            setup_faq_q3: 'Getting errors mentioning espeak or phonemizer during playback?',
+            setup_faq_a3: 'VieNeu-TTS requires eSpeak NG for Vietnamese phonemization. Install the eSpeak NG .msi package (linked in Step 1), then restart your Terminal and VieNeu Server.',
+            setup_faq_q4: 'Extension reports "Native host has exited" or "forbidden"?',
+            setup_faq_a4: '"Forbidden" means install_host.bat was run with an older Extension ID (for example after switching from Load Unpacked to Chrome Web Store). Copy your current ID in Section 3 and re-run install_host.bat.',
+            setup_faq_q5: 'How do I change the port (default 8000) or switch CPU/GPU mode?',
+            setup_faq_a5: 'Open the Extension Popup → "Settings" tab → "TTS & Auto-Advance" to change "VieNeu Server URL" or "VieNeu Backend", then click "Save Settings".',
+            setup_footer_note: 'Quick Novel Translator (STV) · VieNeu-TTS runs locally on your computer; speech audio never leaves your device.'
+        }
+    };
+
+    let currentLocale = 'vi';
+
+    function normalizeLocale(loc) {
+        if (!loc || typeof loc !== 'string') return 'vi';
+        const lower = loc.toLowerCase();
+        if (lower.startsWith('en')) return 'en';
+        if (lower.startsWith('vi')) return 'vi';
+        return 'vi';
+    }
+
+    function detectDefaultLocale() {
+        try {
+            if (typeof chrome !== 'undefined' && chrome.i18n && typeof chrome.i18n.getUILanguage === 'function') {
+                return normalizeLocale(chrome.i18n.getUILanguage());
+            }
+            if (typeof navigator !== 'undefined' && navigator.language) {
+                return normalizeLocale(navigator.language);
+            }
+        } catch {
+            // ignore
+        }
+        return 'vi';
+    }
+
+    currentLocale = detectDefaultLocale();
+
+    async function setLocale(locale) {
+        currentLocale = normalizeLocale(locale);
+        try {
+            if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+                await new Promise((resolve) => chrome.runtime.sendMessage({ action: 'set_runtime_setting', key: 'stv_locale', value: currentLocale }, () => resolve()));
+            }
+        } catch {
+            // ignore
+        }
+        return currentLocale;
+    }
+
+    function getLocale() {
+        return currentLocale;
+    }
+
+    function t(key, params = null, explicitLocale = null) {
+        const loc = explicitLocale ? normalizeLocale(explicitLocale) : currentLocale;
+        const dict = DICTIONARY[loc] || DICTIONARY.vi;
+        let template = dict[key] !== undefined ? dict[key] : (DICTIONARY.vi[key] !== undefined ? DICTIONARY.vi[key] : key);
+        if (params && typeof params === 'object') {
+            for (const [k, v] of Object.entries(params)) {
+                template = template.replace(new RegExp(`\\{${k}\\}`, 'g'), String(v));
+            }
+        }
+        return template;
+    }
+
+    function applyToDOM(root) {
+        if (!root || typeof root.querySelectorAll !== 'function') return;
+        const textEls = root.querySelectorAll('[data-i18n]');
+        textEls.forEach((el) => {
+            const key = el.getAttribute('data-i18n');
+            if (key) el.textContent = t(key);
+        });
+        const attrEls = root.querySelectorAll('[data-i18n-attr]');
+        attrEls.forEach((el) => {
+            const spec = el.getAttribute('data-i18n-attr');
+            if (!spec) return;
+            for (const pair of spec.split(',')) {
+                const [attr, key] = pair.split(':').map((s) => s.trim());
+                if (attr && key) {
+                    el.setAttribute(attr, t(key));
+                }
+            }
+        });
+    }
+
+    async function loadSavedLocale() {
+        try {
+            if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+                const res = await new Promise((resolve) => chrome.runtime.sendMessage({ action: 'get_runtime_config' }, (value) => resolve(value || {})));
+                if (res.stv_locale) currentLocale = normalizeLocale(res.stv_locale);
+            }
+        } catch {
+            // Content script with TRUSTED_CONTEXTS might not read storage; fallback handled via message/args
+        }
+        return currentLocale;
+    }
+
+    async function saveLocale(locale) {
+        return await setLocale(locale);
+    }
+
+    const inst = {
+        DICTIONARY,
+        dictionaries: DICTIONARY,
+        t,
+        setLocale,
+        getLocale,
+        normalizeLocale,
+        applyToDOM,
+        loadSavedLocale,
+        saveLocale
+    };
+    Object.defineProperty(inst, 'currentLocale', {
+        get() { return currentLocale; },
+        set(v) { setLocale(v); }
+    });
+    return inst;
+});

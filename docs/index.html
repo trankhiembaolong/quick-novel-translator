@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
+    <title>Quick Novel Translator — Dịch &amp; Nghe Tiểu Thuyết AI</title>
+    <style>
+        :root {
+            color-scheme: light dark;
+            --bg: #f8fafc;
+            --surface: #ffffff;
+            --surface-2: #f1f5f9;
+            --border: #e2e8f0;
+            --text: #0f172a;
+            --text-muted: #475569;
+            --primary: #4f46e5;
+            --accent: #0d9488;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #0b1120;
+                --surface: #111c33;
+                --surface-2: #1e293b;
+                --border: #26354d;
+                --text: #f8fafc;
+                --text-muted: #94a3b8;
+                --primary: #818cf8;
+                --accent: #2dd4bf;
+            }
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 16px;
+            line-height: 1.65;
+            color: var(--text);
+            background: var(--bg);
+        }
+
+        :where(a:any-link):focus-visible {
+            outline: 2px solid var(--primary);
+            outline-offset: 2px;
+        }
+
+        .visually-hidden:where(:not(:focus-within, :active)) {
+            position: absolute !important;
+            clip-path: inset(50%) !important;
+            overflow: hidden !important;
+            width: 1px !important;
+            height: 1px !important;
+            margin: -1px !important;
+            padding: 0 !important;
+            border: 0 !important;
+            white-space: nowrap !important;
+        }
+
+        .skip-link:focus {
+            position: fixed;
+            inset-block-start: 12px;
+            inset-inline-start: 12px;
+            z-index: 100;
+            padding: 8px 14px;
+            border-radius: 8px;
+            background: var(--primary);
+            color: #fff;
+            font-weight: 600;
+            text-decoration: none;
+        }
+
+        .container {
+            max-width: 820px;
+            margin: 0 auto;
+            padding: 32px 16px;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 28px;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: 28px;
+        }
+
+        h2 {
+            margin: 0 0 12px;
+            font-size: 20px;
+        }
+
+        p {
+            margin: 0 0 14px;
+            color: var(--text-muted);
+        }
+
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 10px 16px;
+            border-radius: 8px;
+            font-weight: 600;
+            text-decoration: none;
+            font-size: 14.5px;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: #fff;
+        }
+
+        .btn-secondary {
+            background: var(--surface-2);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+    </style>
+</head>
+
+<body>
+    <a href="#main-title" class="skip-link visually-hidden">Skip to content</a>
+
+    <main class="container">
+        <section class="card">
+            <h1 id="main-title" tabindex="-1">Quick Novel Translator (STV) v1.0</h1>
+            <p>Tiện ích Chrome dịch trực tiếp chương tiểu thuyết trên web bằng AI, quản lý từ điển khóa thuật ngữ theo từng bộ truyện và nghe đọc truyện giọng tiếng Việt (Web Speech, WebSocket TTS, hoặc VieNeu-TTS cục bộ 48kHz).</p>
+            <div class="actions">
+                <a class="btn btn-primary" href="https://github.com/trankhiembaolong/quick-novel-translator/releases/download/v1.0/STV-VieNeu-Companion-Windows-v1.0.zip">⬇ Tải VieNeu Companion (Windows v1.0)</a>
+                <a class="btn btn-secondary" href="./privacy.html">Chính sách quyền riêng tư / Privacy Policy</a>
+                <a class="btn btn-secondary" href="https://github.com/trankhiembaolong/quick-novel-translator" target="_blank" rel="noopener noreferrer">Mã nguồn GitHub</a>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>Hỗ trợ &amp; Liên hệ / Support</h2>
+            <p>Email: <a href="mailto:long38128@gmail.com">long38128@gmail.com</a> · Báo lỗi / Góp ý: <a href="https://github.com/trankhiembaolong/quick-novel-translator/issues" target="_blank" rel="noopener noreferrer">GitHub Issues</a></p>
+        </section>
+    </main>
+</body>
+
+</html>

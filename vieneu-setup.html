@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark light">
+    <title data-i18n="setup_page_title">Hướng dẫn cài đặt VieNeu-TTS Local | Quick Novel Translator</title>
+    <link rel="stylesheet" href="vieneu-setup.css">
+</head>
+
+<body>
+    <a href="#setup-main-heading" class="skip-link visually-hidden" data-i18n="setup_skip_link">Chuyển đến nội dung hướng dẫn</a>
+
+    <header class="setup-header">
+        <div class="setup-header-inner">
+            <div class="brand">
+                <img src="icons/icon48.png" alt="" class="brand-icon">
+                <div>
+                    <h1 id="setup-main-heading" tabindex="-1" class="brand-title" data-i18n="setup_header_title">Cài đặt VieNeu-TTS Local</h1>
+                    <p class="brand-subtitle" data-i18n="setup_header_subtitle">Giọng đọc AI tiếng Việt 48kHz miễn phí chạy trên máy tính của bạn — tương thích ngay với bản Chrome Web Store.</p>
+                </div>
+            </div>
+            <div class="header-actions">
+                <button id="btn-setup-lang" class="icon-btn" type="button" data-i18n-attr="aria-label:setup_toggle_lang_label,title:setup_toggle_lang_label" aria-label="Chuyển ngôn ngữ giao diện">VI</button>
+                <button id="btn-setup-theme" class="icon-btn" type="button" data-i18n-attr="aria-label:setup_toggle_theme_label,title:setup_toggle_theme_label" aria-label="Chuyển giao diện sáng hoặc tối">🌙</button>
+            </div>
+        </div>
+    </header>
+
+    <main class="setup-main">
+        <!-- 1. Live Connection & Diagnostics -->
+        <section class="card diag-card" aria-labelledby="diag-section-heading">
+            <h2 id="diag-section-heading" class="section-heading" data-i18n="setup_diag_title">1. Kiểm tra kết nối nhanh</h2>
+
+            <div class="diag-badges">
+                <div class="diag-pill">
+                    <span class="diag-pill-label" data-i18n="setup_diag_server_label">VieNeu Server</span>
+                    <span id="diag-server-badge" class="badge">
+                        <span class="dot" aria-hidden="true"></span>
+                        <span id="diag-server-text" data-i18n="setup_diag_checking">Đang kiểm tra...</span>
+                    </span>
+                </div>
+                <div class="diag-pill">
+                    <span class="diag-pill-label" data-i18n="setup_diag_host_label">Native Host (tùy chọn)</span>
+                    <span id="diag-host-badge" class="badge">
+                        <span class="dot" aria-hidden="true"></span>
+                        <span id="diag-host-text" data-i18n="setup_diag_checking">Đang kiểm tra...</span>
+                    </span>
+                </div>
+            </div>
+
+            <div class="diag-controls">
+                <div class="field diag-url-field">
+                    <label class="field-label" for="setup-server-url" data-i18n="setup_server_url_label">Địa chỉ VieNeu Server</label>
+                    <input type="text" id="setup-server-url" placeholder="http://127.0.0.1:8000" autocomplete="off">
+                </div>
+                <div class="diag-btn-group">
+                    <button id="btn-check-connection" class="btn btn-primary" type="button" data-i18n="setup_btn_check_conn">Kiểm tra kết nối</button>
+                    <button id="btn-activate-vieneu" class="btn btn-accent" type="button" hidden data-i18n="setup_btn_activate">Dùng VieNeu ngay</button>
+                </div>
+            </div>
+
+            <div id="diag-live-status" class="diag-feedback" role="status" aria-live="polite"></div>
+
+            <div class="callout callout-info">
+                <p data-i18n="setup_no_install_tip">Không muốn cài đặt trên máy? Trong tab Nghe của Extension, bạn luôn có thể dùng "WebSocket TTS" hoặc "Web Speech API" miễn phí mà không cần cài thêm gì.</p>
+            </div>
+        </section>
+
+        <!-- System Requirements Overview -->
+        <section class="card" aria-labelledby="prereq-heading">
+            <h2 id="prereq-heading" class="section-heading" data-i18n="setup_prereq_title">Yêu cầu hệ thống &amp; Tổng quan</h2>
+            <ul class="bullet-list">
+                <li data-i18n="setup_prereq_os">Hệ điều hành: Windows 10/11 (64-bit), macOS hoặc Linux. RAM tối thiểu 8 GB.</li>
+                <li data-i18n="setup_prereq_disk">Dung lượng trống: ~4–5 GB. Lần chạy đầu tiên cần Internet để tự tải model AI (~1–2 GB), sau đó có thể chạy offline.</li>
+                <li data-i18n="setup_prereq_cws">Tương thích Chrome Web Store: Extension giao tiếp qua cổng nội bộ 127.0.0.1:8000 nên dùng được ngay sau Cách 1 mà không cần Native Host.</li>
+            </ul>
+        </section>
+
+        <!-- 2. Method 1: Recommended 3-Step Terminal Install -->
+        <section class="card" aria-labelledby="method1-heading">
+            <div class="section-badge-row">
+                <span class="pill-tag pill-tag-success" data-i18n="setup_method1_badge">KHUYÊN DÙNG · ĐƠN GIẢN NHẤT</span>
+            </div>
+            <h2 id="method1-heading" class="section-heading" data-i18n="setup_method1_title">2. Cài &amp; chạy VieNeu trong 3 bước</h2>
+            <p class="muted" data-i18n="setup_method1_desc">Chọn tab đúng với máy của bạn rồi sao chép lần lượt 3 bước vào PowerShell (Windows) hoặc Terminal (macOS/Linux).</p>
+
+            <div class="hw-tabs-wrapper">
+                <div class="hw-tablist" role="tablist" focusgroup="tablist nomemory" data-i18n-attr="aria-label:setup_hw_tablist_label" aria-label="Chọn hệ điều hành và phần cứng">
+                    <button type="button" role="tab" id="tab-win-cpu" data-hw="win-cpu" aria-selected="true" focusgroupstart tabindex="0" data-i18n="setup_tab_win_cpu">Windows · CPU (Khuyên dùng)</button>
+                    <button type="button" role="tab" id="tab-win-nvidia" data-hw="win-nvidia" aria-selected="false" tabindex="-1" data-i18n="setup_tab_win_nvidia">Windows · GPU NVIDIA</button>
+                    <button type="button" role="tab" id="tab-win-amd" data-hw="win-amd" aria-selected="false" tabindex="-1" data-i18n="setup_tab_win_amd">Windows · GPU AMD</button>
+                    <button type="button" role="tab" id="tab-unix" data-hw="unix" aria-selected="false" tabindex="-1" data-i18n="setup_tab_unix">macOS / Linux</button>
+                </div>
+
+                <div class="hw-panels-grid">
+                    <!-- Panel 1: Windows CPU -->
+                    <div id="panel-win-cpu" role="tabpanel" aria-labelledby="tab-win-cpu" data-hw="win-cpu">
+                        <div class="hw-panel-body">
+                            <p class="hw-note" data-i18n="setup_win_cpu_note">Chạy nhẹ trên mọi CPU hiện đại qua ONNX Runtime (không cần card rời, không cần PyTorch).</p>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step1_heading">Bước 1: Cài công cụ nền (chỉ làm 1 lần)</h3>
+                                <p class="muted" data-i18n="setup_step1_win_desc">Cài Git, uv (tự quản lý Python) và eSpeak NG (bắt buộc để phiên âm tiếng Việt). Nếu ngại cài bằng lệnh, bạn có thể bấm link bên dưới để tải trực tiếp eSpeak NG (.msi):</p>
+                                <div class="link-row">
+                                    <a class="ext-link" href="https://github.com/espeak-ng/espeak-ng/releases/latest" target="_blank" rel="noopener noreferrer" data-i18n="setup_link_espeak">Tải eSpeak NG (.msi)</a>
+                                    <a class="ext-link" href="https://git-scm.com/downloads" target="_blank" rel="noopener noreferrer" data-i18n="setup_link_git">Trang tải Git</a>
+                                    <a class="ext-link" href="https://github.com/pnnbao97/VieNeu-TTS" target="_blank" rel="noopener noreferrer" data-i18n="setup_link_repo">Mã nguồn VieNeu-TTS (GitHub)</a>
+                                </div>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-win-cpu-1" data-i18n-attr="aria-label:setup_aria_copy_win_cpu_1" aria-label="Sao chép lệnh Bước 1 cho Windows CPU">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-win-cpu-1">winget install --id Git.Git -e --source winget
+winget install --id eSpeak-NG.eSpeak-NG -e --source winget
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"</code></pre>
+                                </div>
+                                <div class="callout callout-warn">
+                                    <p data-i18n="setup_reopen_shell_tip">Quan trọng: Sau khi cài xong Bước 1, hãy ĐÓNG cửa sổ PowerShell cũ và mở cửa sổ PowerShell MỚI để máy nhận lệnh git và uv.</p>
+                                </div>
+                            </div>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step2_heading">Bước 2: Tải VieNeu-TTS và cài thư viện</h3>
+                                <p class="muted" data-i18n="setup_step2_desc">Tải mã nguồn vào thư mục cá nhân và đồng bộ môi trường ảo (.venv):</p>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-win-cpu-2" data-i18n-attr="aria-label:setup_aria_copy_win_cpu_2" aria-label="Sao chép lệnh Bước 2 cho Windows CPU">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-win-cpu-2">git clone https://github.com/pnnbao97/VieNeu-TTS.git "$env:USERPROFILE\vieneu-tts"
+cd "$env:USERPROFILE\vieneu-tts"
+uv sync</code></pre>
+                                </div>
+                            </div>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step3_heading">Bước 3: Khởi động VieNeu Server</h3>
+                                <p class="muted" data-i18n="setup_step3_desc">Mỗi lần muốn dùng giọng VieNeu (nếu không cài mục 3), chạy lệnh sau để bật server tại cổng 8000:</p>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-win-cpu-3" data-i18n-attr="aria-label:setup_aria_copy_win_cpu_3" aria-label="Sao chép lệnh Bước 3 cho Windows CPU">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-win-cpu-3">cd "$env:USERPROFILE\vieneu-tts"
+uv run python -m apps.openai_speech</code></pre>
+                                </div>
+                                <div class="callout callout-warn">
+                                    <p data-i18n="setup_first_run_callout">Lần chạy đầu tiên: Server sẽ tự tải model AI (~1–2 GB) từ Hugging Face nên có thể mất 1–5 phút. Hãy giữ nguyên cửa sổ Terminal đến khi thấy thông báo đang lắng nghe ở http://127.0.0.1:8000 (hoặc Uvicorn running), rồi bấm "Kiểm tra kết nối" ở đầu trang!</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Panel 2: Windows NVIDIA -->
+                    <div id="panel-win-nvidia" role="tabpanel" aria-labelledby="tab-win-nvidia" data-hw="win-nvidia" hidden="until-found">
+                        <div class="hw-panel-body">
+                            <p class="hw-note" data-i18n="setup_win_nvidia_note">Tăng tốc CUDA cho card đồ họa NVIDIA (khuyên dùng VRAM ≥ 4 GB và driver NVIDIA mới).</p>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step1_heading">Bước 1: Cài công cụ nền (chỉ làm 1 lần)</h3>
+                                <p class="muted" data-i18n="setup_step1_win_desc">Cài Git, uv (tự quản lý Python) và eSpeak NG (bắt buộc để phiên âm tiếng Việt). Nếu ngại cài bằng lệnh, bạn có thể bấm link bên dưới để tải trực tiếp eSpeak NG (.msi):</p>
+                                <div class="link-row">
+                                    <a class="ext-link" href="https://github.com/espeak-ng/espeak-ng/releases/latest" target="_blank" rel="noopener noreferrer" data-i18n="setup_link_espeak">Tải eSpeak NG (.msi)</a>
+                                    <a class="ext-link" href="https://git-scm.com/downloads" target="_blank" rel="noopener noreferrer" data-i18n="setup_link_git">Trang tải Git</a>
+                                    <a class="ext-link" href="https://github.com/pnnbao97/VieNeu-TTS" target="_blank" rel="noopener noreferrer" data-i18n="setup_link_repo">Mã nguồn VieNeu-TTS (GitHub)</a>
+                                </div>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-win-nv-1" data-i18n-attr="aria-label:setup_aria_copy_win_nv_1" aria-label="Sao chép lệnh Bước 1 cho Windows GPU NVIDIA">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-win-nv-1">winget install --id Git.Git -e --source winget
+winget install --id eSpeak-NG.eSpeak-NG -e --source winget
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"</code></pre>
+                                </div>
+                                <div class="callout callout-warn">
+                                    <p data-i18n="setup_reopen_shell_tip">Quan trọng: Sau khi cài xong Bước 1, hãy ĐÓNG cửa sổ PowerShell cũ và mở cửa sổ PowerShell MỚI để máy nhận lệnh git và uv.</p>
+                                </div>
+                            </div>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step2_heading">Bước 2: Tải VieNeu-TTS và cài thư viện</h3>
+                                <p class="muted" data-i18n="setup_step2_desc">Tải mã nguồn vào thư mục cá nhân và đồng bộ môi trường ảo (.venv):</p>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-win-nv-2" data-i18n-attr="aria-label:setup_aria_copy_win_nv_2" aria-label="Sao chép lệnh Bước 2 cho Windows GPU NVIDIA">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-win-nv-2">git clone https://github.com/pnnbao97/VieNeu-TTS.git "$env:USERPROFILE\vieneu-tts"
+cd "$env:USERPROFILE\vieneu-tts"
+uv sync --extra cuda</code></pre>
+                                </div>
+                            </div>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step3_heading">Bước 3: Khởi động VieNeu Server</h3>
+                                <p class="muted" data-i18n="setup_step3_desc">Mỗi lần muốn dùng giọng VieNeu (nếu không cài mục 3), chạy lệnh sau để bật server tại cổng 8000:</p>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-win-nv-3" data-i18n-attr="aria-label:setup_aria_copy_win_nv_3" aria-label="Sao chép lệnh Bước 3 cho Windows GPU NVIDIA">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-win-nv-3">cd "$env:USERPROFILE\vieneu-tts"
+uv run python -m apps.openai_speech</code></pre>
+                                </div>
+                                <div class="callout callout-warn">
+                                    <p data-i18n="setup_first_run_callout">Lần chạy đầu tiên: Server sẽ tự tải model AI (~1–2 GB) từ Hugging Face nên có thể mất 1–5 phút. Hãy giữ nguyên cửa sổ Terminal đến khi thấy thông báo đang lắng nghe ở http://127.0.0.1:8000 (hoặc Uvicorn running), rồi bấm "Kiểm tra kết nối" ở đầu trang!</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Panel 3: Windows AMD DirectML -->
+                    <div id="panel-win-amd" role="tabpanel" aria-labelledby="tab-win-amd" data-hw="win-amd" hidden="until-found">
+                        <div class="hw-panel-body">
+                            <p class="hw-note" data-i18n="setup_win_amd_note">Tăng tốc DirectML cho card rời AMD Radeon trên Windows. Kết hợp tốt nhất với runner ở mục 3.</p>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step1_heading">Bước 1: Cài công cụ nền (chỉ làm 1 lần)</h3>
+                                <p class="muted" data-i18n="setup_step1_win_desc">Cài Git, uv (tự quản lý Python) và eSpeak NG (bắt buộc để phiên âm tiếng Việt). Nếu ngại cài bằng lệnh, bạn có thể bấm link bên dưới để tải trực tiếp eSpeak NG (.msi):</p>
+                                <div class="link-row">
+                                    <a class="ext-link" href="https://github.com/espeak-ng/espeak-ng/releases/latest" target="_blank" rel="noopener noreferrer" data-i18n="setup_link_espeak">Tải eSpeak NG (.msi)</a>
+                                    <a class="ext-link" href="https://git-scm.com/downloads" target="_blank" rel="noopener noreferrer" data-i18n="setup_link_git">Trang tải Git</a>
+                                    <a class="ext-link" href="https://github.com/pnnbao97/VieNeu-TTS" target="_blank" rel="noopener noreferrer" data-i18n="setup_link_repo">Mã nguồn VieNeu-TTS (GitHub)</a>
+                                </div>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-win-amd-1" data-i18n-attr="aria-label:setup_aria_copy_win_amd_1" aria-label="Sao chép lệnh Bước 1 cho Windows GPU AMD">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-win-amd-1">winget install --id Git.Git -e --source winget
+winget install --id eSpeak-NG.eSpeak-NG -e --source winget
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"</code></pre>
+                                </div>
+                                <div class="callout callout-warn">
+                                    <p data-i18n="setup_reopen_shell_tip">Quan trọng: Sau khi cài xong Bước 1, hãy ĐÓNG cửa sổ PowerShell cũ và mở cửa sổ PowerShell MỚI để máy nhận lệnh git và uv.</p>
+                                </div>
+                            </div>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step2_heading">Bước 2: Tải VieNeu-TTS và cài thư viện</h3>
+                                <p class="muted" data-i18n="setup_step2_desc">Tải mã nguồn vào thư mục cá nhân và đồng bộ môi trường ảo (.venv):</p>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-win-amd-2" data-i18n-attr="aria-label:setup_aria_copy_win_amd_2" aria-label="Sao chép lệnh Bước 2 cho Windows GPU AMD">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-win-amd-2">git clone https://github.com/pnnbao97/VieNeu-TTS.git "$env:USERPROFILE\vieneu-tts"
+cd "$env:USERPROFILE\vieneu-tts"
+uv sync
+uv pip install onnxruntime-directml</code></pre>
+                                </div>
+                            </div>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step3_heading">Bước 3: Khởi động VieNeu Server</h3>
+                                <p class="muted" data-i18n="setup_step3_desc">Mỗi lần muốn dùng giọng VieNeu (nếu không cài mục 3), chạy lệnh sau để bật server tại cổng 8000:</p>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-win-amd-3" data-i18n-attr="aria-label:setup_aria_copy_win_amd_3" aria-label="Sao chép lệnh Bước 3 cho Windows GPU AMD">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-win-amd-3">cd "$env:USERPROFILE\vieneu-tts"
+uv run python -m apps.openai_speech</code></pre>
+                                </div>
+                                <div class="callout callout-warn">
+                                    <p data-i18n="setup_first_run_callout">Lần chạy đầu tiên: Server sẽ tự tải model AI (~1–2 GB) từ Hugging Face nên có thể mất 1–5 phút. Hãy giữ nguyên cửa sổ Terminal đến khi thấy thông báo đang lắng nghe ở http://127.0.0.1:8000 (hoặc Uvicorn running), rồi bấm "Kiểm tra kết nối" ở đầu trang!</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Panel 4: macOS / Linux -->
+                    <div id="panel-unix" role="tabpanel" aria-labelledby="tab-unix" data-hw="unix" hidden="until-found">
+                        <div class="hw-panel-body">
+                            <p class="hw-note" data-i18n="setup_unix_note">Hỗ trợ macOS (Apple Silicon / Intel) và Linux (Ubuntu / Debian). Chạy trực tiếp trong Terminal.</p>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step1_heading">Bước 1: Cài công cụ nền (chỉ làm 1 lần)</h3>
+                                <p class="muted" data-i18n="setup_step1_unix_desc">Cài Git, uv và eSpeak NG trên macOS (Homebrew) hoặc Ubuntu/Debian:</p>
+                                <div class="link-row">
+                                    <a class="ext-link" href="https://github.com/pnnbao97/VieNeu-TTS" target="_blank" rel="noopener noreferrer" data-i18n="setup_link_repo">Mã nguồn VieNeu-TTS (GitHub)</a>
+                                </div>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-unix-1" data-i18n-attr="aria-label:setup_aria_copy_unix_1" aria-label="Sao chép lệnh Bước 1 cho macOS hoặc Linux">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-unix-1"># macOS (Homebrew):
+brew install git espeak-ng uv
+
+# Ubuntu / Debian:
+sudo apt update &amp;&amp; sudo apt install -y git espeak-ng curl
+curl -LsSf https://astral.sh/uv/install.sh | sh</code></pre>
+                                </div>
+                            </div>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step2_heading">Bước 2: Tải VieNeu-TTS và cài thư viện</h3>
+                                <p class="muted" data-i18n="setup_step2_desc">Tải mã nguồn vào thư mục cá nhân và đồng bộ môi trường ảo (.venv):</p>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-unix-2" data-i18n-attr="aria-label:setup_aria_copy_unix_2" aria-label="Sao chép lệnh Bước 2 cho macOS hoặc Linux">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-unix-2">git clone https://github.com/pnnbao97/VieNeu-TTS.git "$HOME/vieneu-tts"
+cd "$HOME/vieneu-tts"
+uv sync</code></pre>
+                                </div>
+                            </div>
+
+                            <div class="step-block">
+                                <h3 class="step-heading" data-i18n="setup_step3_heading">Bước 3: Khởi động VieNeu Server</h3>
+                                <p class="muted" data-i18n="setup_step3_desc">Mỗi lần muốn dùng giọng VieNeu (nếu không cài mục 3), chạy lệnh sau để bật server tại cổng 8000:</p>
+                                <div class="code-block copyable">
+                                    <span class="copy">
+                                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-unix-3" data-i18n-attr="aria-label:setup_aria_copy_unix_3" aria-label="Sao chép lệnh Bước 3 cho macOS hoặc Linux">
+                                            <span class="copy-icon" aria-hidden="true"></span>
+                                        </button>
+                                        <span class="tip" role="status"></span>
+                                    </span>
+                                    <pre tabindex="0"><code id="cmd-unix-3">cd "$HOME/vieneu-tts"
+uv run python -m apps.openai_speech</code></pre>
+                                </div>
+                                <div class="callout callout-warn">
+                                    <p data-i18n="setup_first_run_callout">Lần chạy đầu tiên: Server sẽ tự tải model AI (~1–2 GB) từ Hugging Face nên có thể mất 1–5 phút. Hãy giữ nguyên cửa sổ Terminal đến khi thấy thông báo đang lắng nghe ở http://127.0.0.1:8000 (hoặc Uvicorn running), rồi bấm "Kiểm tra kết nối" ở đầu trang!</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 3. Method 2: Optional Windows 1-Click Native Host -->
+        <section class="card" aria-labelledby="method2-heading">
+            <div class="section-badge-row">
+                <span class="pill-tag pill-tag-neutral" data-i18n="setup_method2_badge">TÙY CHỌN · CHỈ WINDOWS</span>
+            </div>
+            <h2 id="method2-heading" class="section-heading" data-i18n="setup_method2_title">3. Bật/Tắt Server 1-Click ngay trong Popup (Native Host)</h2>
+            <p class="muted" data-i18n="setup_method2_desc">Nếu không muốn mở Terminal mỗi lần nghe truyện, bạn có thể cài thêm gói Windows Companion để bấm nút "Bật Server" chạy ngầm ngay trong Popup (đồng thời tối ưu đa luồng cho AMD DirectML / CPU).</p>
+
+            <div class="ext-id-box">
+                <span class="field-label" data-i18n="setup_ext_id_label">Extension ID hiện tại của bạn:</span>
+                <div class="code-block copyable inline-code-block">
+                    <span class="copy">
+                        <button type="button" class="copy-button" command="--copy" commandfor="setup-ext-id" data-i18n-attr="aria-label:setup_aria_copy_ext_id" aria-label="Sao chép Extension ID hiện tại">
+                            <span class="copy-icon" aria-hidden="true"></span>
+                        </button>
+                        <span class="tip" role="status"></span>
+                    </span>
+                    <pre tabindex="0"><code id="setup-ext-id">...</code></pre>
+                </div>
+                <p class="muted" data-i18n="setup_ext_id_note">Lưu ý: Extension ID khi cài từ Chrome Web Store sẽ khác bản Load Unpacked. Các lệnh bên dưới đã tự điền sẵn đúng ID hiện tại.</p>
+            </div>
+
+            <div class="step-block">
+                <h3 class="step-heading" data-i18n="setup_companion_dl_title">A. Tải gói Windows Companion</h3>
+                <div id="companion-download-row" hidden>
+                    <a id="btn-download-companion" class="btn btn-primary" href="#" target="_blank" rel="noopener noreferrer" data-i18n="setup_btn_download_companion">⬇ Tải STV-VieNeu Companion (Windows ZIP)</a>
+                </div>
+                <p id="companion-local-note" class="muted" data-i18n="setup_companion_local_note">Tải và giải nén gói STV-VieNeu-Companion-Windows.zip từ trang Releases của extension (hoặc mở thư mục native-host nếu bạn cài bản unpacked).</p>
+            </div>
+
+            <div class="step-block">
+                <h3 class="step-heading" data-i18n="setup_companion_steps_title">B. Mở PowerShell trong thư mục vừa giải nén và chạy 1 lệnh</h3>
+
+                <p class="cmd-sublabel" data-i18n="setup_companion_all_label">Nếu chưa cài VieNeu-TTS (tự cài công cụ + tải VieNeu + đăng ký nút Bật Server):</p>
+                <div class="code-block copyable">
+                    <span class="copy">
+                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-setup-all" data-i18n-attr="aria-label:setup_aria_copy_setup_all" aria-label="Sao chép lệnh cài trọn gói setup_vieneu.bat">
+                            <span class="copy-icon" aria-hidden="true"></span>
+                        </button>
+                        <span class="tip" role="status"></span>
+                    </span>
+                    <pre tabindex="0"><code id="cmd-setup-all">.\setup_vieneu.bat</code></pre>
+                </div>
+
+                <p class="cmd-sublabel" data-i18n="setup_companion_host_label">Nếu bạn đã cài VieNeu-TTS ở mục 2 rồi (chỉ đăng ký nút Bật Server):</p>
+                <div class="code-block copyable">
+                    <span class="copy">
+                        <button type="button" class="copy-button" command="--copy" commandfor="cmd-install-host" data-i18n-attr="aria-label:setup_aria_copy_install_host" aria-label="Sao chép lệnh đăng ký Native Host install_host.bat">
+                            <span class="copy-icon" aria-hidden="true"></span>
+                        </button>
+                        <span class="tip" role="status"></span>
+                    </span>
+                    <pre tabindex="0"><code id="cmd-install-host">.\install_host.bat</code></pre>
+                </div>
+
+                <p class="muted" data-i18n="setup_companion_clean_note">Script sẽ lưu cấu hình vào %LOCALAPPDATA%\STV-VieNeu\host, sau khi cài xong bạn có thể xóa thư mục giải nén.</p>
+            </div>
+
+            <div class="host-test-row">
+                <button id="btn-test-native-host" class="btn btn-secondary" type="button" data-i18n="setup_btn_test_host">Kiểm tra Native Host</button>
+                <p id="native-host-diag-detail" class="muted host-detail-text" role="status" aria-live="polite" data-i18n="setup_host_detail_idle">Bấm "Kiểm tra Native Host" để xác minh Chrome đã kết nối được với companion trên máy.</p>
+            </div>
+        </section>
+
+        <!-- 4. Troubleshooting & FAQ -->
+        <section class="card" aria-labelledby="faq-heading">
+            <h2 id="faq-heading" class="section-heading" data-i18n="setup_faq_title">4. Câu hỏi thường gặp &amp; Xử lý lỗi</h2>
+
+            <details class="faq-item">
+                <summary data-i18n="setup_faq_q1">Bấm "Bật Server" đợi lâu không lên hoặc báo quá thời gian?</summary>
+                <div class="faq-body">
+                    <p data-i18n="setup_faq_a1">Ở lần chạy đầu tiên, VieNeu-TTS cần tải bộ model AI (~1–2 GB) từ Hugging Face nên có thể mất vài phút tùy tốc độ mạng. Hãy chạy thử lệnh ở mục 2 một lần để thấy tải xong, từ các lần sau bật trong Popup chỉ mất vài giây.</p>
+                </div>
+            </details>
+
+            <details class="faq-item">
+                <summary data-i18n="setup_faq_q2">PowerShell báo "uv is not recognized" hoặc "git is not recognized"?</summary>
+                <div class="faq-body">
+                    <p data-i18n="setup_faq_a2">Sau khi cài Git hoặc uv, Windows cần mở một cửa sổ PowerShell mới để nạp biến môi trường PATH. Hãy đóng cửa sổ cũ, mở PowerShell mới và chạy lại.</p>
+                </div>
+            </details>
+
+            <details class="faq-item">
+                <summary data-i18n="setup_faq_q3">Gặp lỗi thiếu espeak / phonemizer khi tạo giọng đọc?</summary>
+                <div class="faq-body">
+                    <p data-i18n="setup_faq_a3">VieNeu-TTS bắt buộc dùng eSpeak NG để tách âm tiếng Việt. Hãy tải và cài file .msi của eSpeak NG (link ở Bước 1), sau đó khởi động lại Terminal và VieNeu Server.</p>
+                </div>
+            </details>
+
+            <details class="faq-item">
+                <summary data-i18n="setup_faq_q4">Extension báo "Native host has exited" hoặc "forbidden"?</summary>
+                <div class="faq-body">
+                    <p data-i18n="setup_faq_a4">Lỗi "forbidden" xảy ra khi install_host.bat được chạy với Extension ID cũ (ví dụ đổi từ bản dev sang bản Chrome Web Store). Hãy copy lại Extension ID ở mục 3 và chạy lại install_host.bat.</p>
+                </div>
+            </details>
+
+            <details class="faq-item">
+                <summary data-i18n="setup_faq_q5">Muốn đổi cổng (mặc định 8000) hoặc chuyển chế độ CPU/GPU?</summary>
+                <div class="faq-body">
+                    <p data-i18n="setup_faq_a5">Mở Popup Extension → tab "Cài đặt" → mục "Cấu hình TTS &amp; Tự động chuyển chương" để sửa "VieNeu Server URL" hoặc "Chế độ chạy VieNeu", sau đó bấm "Lưu cấu hình".</p>
+                </div>
+            </details>
+        </section>
+    </main>
+
+    <footer class="setup-footer">
+        <p class="muted" data-i18n="setup_footer_note">Quick Novel Translator (STV) · VieNeu-TTS chạy cục bộ trên máy tính của bạn; dữ liệu giọng nói không bị gửi lên máy chủ ngoài.</p>
+    </footer>
+
+    <script src="i18n.js"></script>
+    <script src="url-validator.js"></script>
+    <script src="vieneu-setup.js"></script>
+</body>
+
+</html>
