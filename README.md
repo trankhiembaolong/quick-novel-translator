@@ -1,6 +1,6 @@
 # Quick Novel Translator (STV) — v1.0
 
-Tiện ích Chrome Manifest V3 giúp dịch trực tiếp tiểu thuyết tiếng Trung/ngoại ngữ ngay trên trang web đang mở, quản lý từ điển khóa tên nhân vật/thuật ngữ và nghe truyện thông minh bằng giọng đọc AI tiếng Việt chất lượng cao (**VieNeu-TTS Local 48kHz**).
+Extension giúp dịch trực tiếp tiểu thuyết tiếng Trung/ngoại ngữ ngay trên trang web đang mở, quản lý từ điển khóa tên nhân vật/thuật ngữ và nghe truyện thông minh bằng giọng đọc AI (**VieNeu-TTS Local**).
 
 ## Tính năng chính
 - **Dịch trực tiếp trên trang web**: Tự nhận diện vùng truyện hoặc chọn vùng thủ công, hỗ trợ đổi xem Bản dịch / Bản gốc, tùy chỉnh font, cỡ chữ, giãn dòng và phím tắt nhanh (`Ctrl+Q`).
@@ -22,7 +22,7 @@ Mở tiện ích → tab **Nghe** → chọn **VieNeu Local Server** → bấm *
   - Markdown: [PRIVACY.md](PRIVACY.md)
 - **Liên hệ**: `long38128@gmail.com` hoặc mở [GitHub Issues](https://github.com/trankhiembaolong/quick-novel-translator/issues).
 
-## Đóng gói & Kiểm thử (Dành cho lập trình viên)
+## Đóng gói & Kiểm thử
 ```powershell
 # Chạy toàn bộ 174 bài kiểm thử đơn vị & E2E
 node --test tests/*.test.js test-e2e/tier1-features/*.test.js test-e2e/tier2-boundaries/*.test.js test-e2e/tier3-pairwise/*.test.js test-e2e/tier4-scenarios/*.test.js
