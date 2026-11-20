@@ -12,6 +12,7 @@ import atexit
 import json
 import logging
 import os
+import struct
 import subprocess
 import sys
 import threading
@@ -19,7 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 for _env_key in (
     "OPENBLAS_NUM_THREADS",
@@ -41,6 +42,123 @@ _GPU_TIER_LIMITS = {
     "L4": (4, 8),
     "A100": (6, 12),
 }
+
+_GPU_BATCH_LIMITS = {
+    "T4": 16,
+    "L4": 32,
+    "A100": 32,
+}
+
+
+def resolve_batch_limit(gpu_tier: str) -> int:
+    """Resolve static batch size (power-of-two aligned for FusedFrame CUDA graphs)."""
+    default_bs = _GPU_BATCH_LIMITS.get(str(gpu_tier or "T4").strip().upper(), 16)
+    try:
+        return max(1, min(64, int(os.environ.get("VIENEU_BATCH_SIZE", str(default_bs)))))
+    except ValueError:
+        return default_bs
+
+
+def _patch_cuda_dtype_for_colab() -> str:
+    """Force native Tensor Core dtype: FP16 on Turing T4 (sm_75), BF16 on Ampere+ (sm_80+).
+
+    VieNeu-TTS v3 Turbo's default ``_resolve_dtype`` checks ``torch.cuda.is_bf16_supported()``,
+    which returns True on Turing T4 via slow software emulation, and ``hub_load_v3_turbo._apply_dtype``
+    has no ``float16`` branch so it leaves weights in FP32 even when FP16 is requested.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return "cpu"
+
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+
+        raw_dtype = str(os.environ.get("VIENEU_COLAB_DTYPE", "auto") or "auto").strip().lower()
+        major, _minor = torch.cuda.get_device_capability(0)
+        if raw_dtype in ("fp16", "float16"):
+            target_dtype, dtype_label = torch.float16, "float16"
+        elif raw_dtype in ("bf16", "bfloat16"):
+            target_dtype, dtype_label = torch.bfloat16, "bfloat16"
+        elif raw_dtype in ("fp32", "float32"):
+            target_dtype, dtype_label = torch.float32, "float32"
+        elif major >= 8:
+            target_dtype, dtype_label = torch.bfloat16, "bfloat16"
+        elif major == 7:
+            target_dtype, dtype_label = torch.float16, "float16"
+        else:
+            target_dtype, dtype_label = torch.float32, "float32"
+
+        import vieneu._v3_turbo_engine.hub_load_v3_turbo as hub_load_mod
+        import vieneu._v3_turbo_engine.inference_v3_turbo as inf_mod
+
+        def _colab_apply_dtype(model, device: torch.device, dtype: torch.dtype):
+            model = model.to(device=device)
+            if dtype == torch.float32:
+                return model.float()
+            if device.type == "cuda":
+                if dtype == torch.float16:
+                    return model.to(dtype=torch.float16)
+                if dtype == torch.bfloat16:
+                    return model.to(dtype=torch.bfloat16)
+            return model
+
+        def _colab_resolve_dtype(self, dtype: str) -> torch.dtype:
+            if dtype == "auto":
+                if self.device.type == "cuda":
+                    return target_dtype
+                return torch.float32
+            return {
+                "float32": torch.float32,
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+            }[dtype]
+
+        hub_load_mod._apply_dtype = _colab_apply_dtype
+        inf_mod.VieNeuTTSv3Turbo._resolve_dtype = _colab_resolve_dtype
+        return dtype_label
+    except Exception as exc:
+        log.debug("Colab CUDA dtype patch skipped: %s", exc)
+        return "unknown"
+
+
+def _detect_model_dtype_label(eng, fallback: str = "unknown") -> str:
+    """Read actual parameter dtype of loaded v3 Turbo model when available."""
+    try:
+        model = getattr(getattr(getattr(eng, "tts", None), "engine", None), "model", None)
+        if model is not None:
+            param = next(model.parameters(), None)
+            if param is not None:
+                return str(param.dtype).replace("torch.", "")
+    except Exception:
+        pass
+    return fallback
+
+
+def _wav_to_pcm16_bytes(wav, src_sr: int, target_sr: int, oai) -> bytes:
+    """Resample float32 waveform from ``src_sr`` to ``target_sr`` and encode s16le PCM."""
+    import numpy as np
+
+    arr = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return b""
+    if target_sr != src_sr:
+        try:
+            import soxr
+
+            arr = np.asarray(soxr.resample(arr, src_sr, target_sr, quality="HQ"), dtype=np.float32)
+        except Exception:
+            out_len = max(1, int(round(arr.size * (target_sr / float(src_sr)))))
+            xp = np.linspace(0.0, 1.0, arr.size, endpoint=False)
+            x = np.linspace(0.0, 1.0, out_len, endpoint=False)
+            arr = np.asarray(np.interp(x, xp, arr), dtype=np.float32)
+    pcm_fn = getattr(oai, "_pcm16", None)
+    if callable(pcm_fn):
+        return pcm_fn(arr)
+    return (np.asarray(arr, dtype=np.float32) * 32767).clip(-32768, 32767).astype("<i2").tobytes()
 
 
 def detect_cuda_gpu() -> Tuple[str, float]:
@@ -495,8 +613,20 @@ class ColabEnginePool:
             self._slots = [s for s in self._slots if not s.is_extra]
 
 
-def _setup_cors_and_routes(oai, eng, pool: Optional[ColabEnginePool], *, gpu_name: str, gpu_tier: str, vram_gb: float, listen_streams: int, export_cap: int) -> None:
-    from fastapi import Depends
+def _setup_cors_and_routes(
+    oai,
+    eng,
+    pool: Optional[ColabEnginePool],
+    *,
+    gpu_name: str,
+    gpu_tier: str,
+    vram_gb: float,
+    listen_streams: int,
+    export_cap: int,
+    batch_cap: int = 16,
+    model_dtype: str = "auto",
+) -> None:
+    from fastapi import Depends, HTTPException, Response
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
     from pydantic import BaseModel, Field
@@ -510,10 +640,17 @@ def _setup_cors_and_routes(oai, eng, pool: Optional[ColabEnginePool], *, gpu_nam
             allow_credentials=False,
             allow_methods=["*"],
             allow_headers=["*"],
+            expose_headers=[
+                "X-Batch-Audio-Sec",
+                "X-Batch-Wall-Sec",
+                "X-Batch-Speedup",
+                "X-Batch-Dtype",
+                "X-Sample-Rate",
+            ],
         )
 
-    # Bind into module globals so FastAPI resolves the annotation under `from __future__ import annotations`.
-    global ColabWorkerModeRequest
+    # Bind into module globals so FastAPI resolves annotations under `from __future__ import annotations`.
+    global ColabWorkerModeRequest, ColabBatchSpeechRequest
 
     class ColabWorkerModeRequest(BaseModel):
         mode: str = "listen"
@@ -522,14 +659,28 @@ def _setup_cors_and_routes(oai, eng, pool: Optional[ColabEnginePool], *, gpu_nam
         ttl_sec: float = Field(default=_DEFAULT_EXPORT_LEASE_TTL_SEC, ge=10.0, le=600.0)
         gpu_tier: Optional[str] = None
 
+    class ColabBatchSpeechRequest(BaseModel):
+        model: str = "vieneu-v3-turbo"
+        inputs: List[str] = Field(min_length=1, max_length=64)
+        voice: Optional[str] = None
+        sample_rate: int = 24000
+        temperature: float = Field(0.4, ge=0.0, le=2.0, allow_inf_nan=False)
+        top_k: int = Field(12, ge=1, le=1024)
+        top_p: float = Field(0.85, gt=0.0, le=1.0, allow_inf_nan=False)
+        repetition_penalty: float = Field(1.05, ge=1.0, le=2.0, allow_inf_nan=False)
+        max_chars: int = Field(380, ge=64, le=512)
+        batch_size: Optional[int] = Field(default=None, ge=1, le=64)
+
     oai.app.router.routes = [
         r
         for r in oai.app.router.routes
-        if getattr(r, "path", None) not in ("/health", "/v1/workers/mode")
+        if getattr(r, "path", None) not in ("/health", "/v1/workers/mode", "/v1/audio/batch")
     ]
 
     active_leases: dict[str, float] = {}
     lease_lock = threading.Lock()
+    batch_lock = threading.Lock()
+    batch_stats = {"total_batches": 0, "total_audio_sec": 0.0, "last_speedup": 0.0}
 
     @oai.app.get("/health")
     def health():
@@ -547,6 +698,14 @@ def _setup_cors_and_routes(oai, eng, pool: Optional[ColabEnginePool], *, gpu_nam
             "workers": active_workers,
             "worker_mode": "export" if active_workers > 1 else "listen",
             "export_max_streams": cap,
+            "batch_supported": True,
+            "batch_max_size": batch_cap,
+            "model_dtype": _detect_model_dtype_label(eng, model_dtype),
+            "stats": {
+                "total_batches": batch_stats["total_batches"],
+                "total_audio_sec": round(batch_stats["total_audio_sec"], 2),
+                "last_speedup": round(batch_stats["last_speedup"], 2),
+            },
             "active": eng.active,
             "waiting": eng.waiting,
             "sample_rate": getattr(oai, "SAMPLE_RATE", 24000),
@@ -558,6 +717,106 @@ def _setup_cors_and_routes(oai, eng, pool: Optional[ColabEnginePool], *, gpu_nam
                 status_code=503,
             )
         return body
+
+    @oai.app.post("/v1/audio/batch", dependencies=[Depends(oai._auth)])
+    def speech_batch(req: ColabBatchSpeechRequest):
+        if req.sample_rate not in (48000, 24000, 16000, 8000):
+            raise HTTPException(400, "sample_rate must be one of (48000, 24000, 16000, 8000)")
+        tts = getattr(eng, "tts", None)
+        if tts is None:
+            raise HTTPException(503, "speech engine not ready")
+        if req.voice and hasattr(tts, "resolve_voice_name") and tts.resolve_voice_name(req.voice) is None:
+            raise HTTPException(400, f"unknown voice '{req.voice}'; see GET /v1/voices")
+
+        non_empty_indices: List[int] = []
+        non_empty_texts: List[str] = []
+        for idx, raw_text in enumerate(req.inputs):
+            txt = str(raw_text or "").strip()
+            if txt:
+                non_empty_indices.append(idx)
+                non_empty_texts.append(txt)
+
+        t0 = time.perf_counter()
+        effective_bs = max(1, min(batch_cap, int(req.batch_size or batch_cap)))
+        src_sr = int(getattr(tts, "sample_rate", getattr(oai, "SAMPLE_RATE", 48000)) or 48000)
+
+        wavs_by_index: dict[int, object] = {}
+        total_src_samples = 0
+        if non_empty_texts:
+            with batch_lock:
+                if hasattr(tts, "infer_batch"):
+                    wavs = tts.infer_batch(
+                        non_empty_texts,
+                        voice=req.voice or None,
+                        apply_watermark=getattr(eng, "watermark", False),
+                        temperature=req.temperature,
+                        top_k=req.top_k,
+                        top_p=req.top_p,
+                        repetition_penalty=req.repetition_penalty,
+                        max_chars=req.max_chars,
+                        batch_size=effective_bs,
+                    )
+                else:
+                    wavs = [
+                        tts.infer(
+                            t,
+                            voice=req.voice or None,
+                            apply_watermark=getattr(eng, "watermark", False),
+                            temperature=req.temperature,
+                            top_k=req.top_k,
+                            top_p=req.top_p,
+                            repetition_penalty=req.repetition_penalty,
+                            max_chars=req.max_chars,
+                        )
+                        for t in non_empty_texts
+                    ]
+            for idx, w in zip(non_empty_indices, wavs):
+                wavs_by_index[idx] = w
+                if w is not None:
+                    total_src_samples += len(w)
+
+        pcm_items = [
+            _wav_to_pcm16_bytes(wavs_by_index[idx], src_sr, req.sample_rate, oai)
+            if idx in wavs_by_index
+            else b""
+            for idx in range(len(req.inputs))
+        ]
+
+        payload = bytearray(b"STVB")
+        payload.extend(struct.pack("<III", 1, req.sample_rate, len(pcm_items)))
+        for pcm_bytes in pcm_items:
+            payload.extend(struct.pack("<I", len(pcm_bytes)))
+            payload.extend(pcm_bytes)
+
+        audio_sec = total_src_samples / float(src_sr or 48000)
+        wall_sec = max(1e-3, time.perf_counter() - t0)
+        speedup = audio_sec / wall_sec
+        actual_dtype = _detect_model_dtype_label(eng, model_dtype)
+        batch_stats["total_batches"] += 1
+        batch_stats["total_audio_sec"] += audio_sec
+        batch_stats["last_speedup"] = speedup
+        log.info(
+            "⚡ BATCH done: items=%d bs=%d audio=%.1fs wall=%.2fs speed=%.1fx dtype=%s",
+            len(req.inputs),
+            effective_bs,
+            audio_sec,
+            wall_sec,
+            speedup,
+            actual_dtype,
+        )
+
+        return Response(
+            content=bytes(payload),
+            media_type="application/octet-stream",
+            headers={
+                "X-Sample-Rate": str(req.sample_rate),
+                "X-Batch-Audio-Sec": f"{audio_sec:.2f}",
+                "X-Batch-Wall-Sec": f"{wall_sec:.2f}",
+                "X-Batch-Speedup": f"{speedup:.1f}",
+                "X-Batch-Dtype": actual_dtype,
+                "Cache-Control": "no-store",
+            },
+        )
 
     @oai.app.post("/v1/workers/mode", dependencies=[Depends(oai._auth)])
     def set_worker_mode(req: ColabWorkerModeRequest):
@@ -616,6 +875,8 @@ def configure_colab_server() -> None:
     gpu_name, vram_gb = detect_cuda_gpu()
     requested_tier = os.environ.get("VIENEU_COLAB_GPU_TIER", "auto")
     gpu_tier, listen_streams, export_cap = resolve_tier_limits(requested_tier, vram_gb, gpu_name)
+    batch_cap = resolve_batch_limit(gpu_tier)
+    requested_dtype = _patch_cuda_dtype_for_colab()
 
     os.environ.setdefault("HOST", "127.0.0.1")
     os.environ.setdefault("PORT", "8000")
@@ -625,6 +886,10 @@ def configure_colab_server() -> None:
     os.environ.setdefault("VIENEU_QUEUE_TIMEOUT", "180")
 
     eng = oai.engine()
+    if hasattr(eng, "tts") and hasattr(eng.tts, "max_batch_size"):
+        cur_bs = int(getattr(eng.tts, "max_batch_size", 32) or 32)
+        eng.tts.max_batch_size = max(cur_bs, batch_cap)
+    actual_dtype = _detect_model_dtype_label(eng, requested_dtype)
     pool: Optional[ColabEnginePool] = None
 
     if getattr(eng, "backend", None) == "onnx":
@@ -668,13 +933,17 @@ def configure_colab_server() -> None:
         vram_gb=vram_gb,
         listen_streams=listen_streams,
         export_cap=export_cap,
+        batch_cap=batch_cap,
+        model_dtype=actual_dtype,
     )
 
     log.info(
-        "VieNeu Colab GPU Server ready: gpu=%s tier=%s vram=%.2fGB listen=%d export_max=%d backend=%s",
+        "VieNeu Colab GPU Server ready: gpu=%s tier=%s vram=%.2fGB dtype=%s batch=%d listen=%d export_max=%d backend=%s",
         gpu_name,
         gpu_tier,
         vram_gb,
+        actual_dtype,
+        batch_cap,
         listen_streams,
         export_cap,
         getattr(eng, "backend", "unknown"),

@@ -34,6 +34,27 @@
             maxChunkChars: base.maxChunkChars
         };
     }
+
+    const COLAB_BATCH_SIZE_BY_TIER = {
+        T4: 16,
+        L4: 32,
+        A100: 32,
+        auto: 16
+    };
+
+    function getColabGpuBatchSize(tier = 'T4', healthData = null) {
+        const raw = String(tier || 'T4').trim().toUpperCase();
+        const key = raw === 'AUTO' ? 'auto' : (COLAB_BATCH_SIZE_BY_TIER[raw] ? raw : 'T4');
+        const defaultBatch = COLAB_BATCH_SIZE_BY_TIER[key];
+        if (healthData && typeof healthData === 'object') {
+            const reported = Number(healthData.batch_max_size);
+            if (Number.isFinite(reported) && reported >= 1) {
+                const cap = key === 'auto' ? 32 : defaultBatch;
+                return Math.max(1, Math.min(cap, Math.floor(reported)));
+            }
+        }
+        return defaultBatch;
+    }
     const MAX_CHUNK_CHARS = 240;
     const FIRST_CHUNK_PREROLL_SEC = 0.04;
     const CONTINUATION_PREROLL_SEC = 0.015;
@@ -806,7 +827,9 @@
         appendPackedSegment,
         packSegmentsForExport,
         COLAB_TIER_CONFIG,
-        getColabGpuExportConfig
+        getColabGpuExportConfig,
+        COLAB_BATCH_SIZE_BY_TIER,
+        getColabGpuBatchSize
     };
     global.splitLongTextForTTS = splitLongTextForTTS;
     global.cleanTextForSpeech = cleanTextForSpeech;
@@ -1212,6 +1235,8 @@
         runId: 0,
         leaseId: null,
         useColabGpu: false,
+        useBatchApi: false,
+        batchSize: 16,
         effectiveEngine: 'ws_default',
         effectiveServerUrl: '',
         effectiveVoice: '',
@@ -1999,10 +2024,10 @@
         }
     }
 
-    function safeConnectTtsPort() {
+    function safeConnectTtsPort(portName = 'stv-tts-stream') {
         if (!isExtensionAlive()) return null;
         try {
-            return chrome.runtime.connect({ name: 'stv-tts-stream' });
+            return chrome.runtime.connect({ name: portName });
         } catch {
             return null;
         }
@@ -3894,12 +3919,22 @@
             const colabCfg = getColabGpuExportConfig(state.colabGpuTier, health);
             exportState.targetWorkers = colabCfg.workers;
             exportState.maxChunkChars = colabCfg.maxChunkChars;
+            exportState.useBatchApi = Boolean(health && health.batch_supported);
+            exportState.batchSize = getColabGpuBatchSize(state.colabGpuTier, health);
             const gpuLabel = (health && health.gpu_name) ? health.gpu_name : colabCfg.tier;
-            updatePlayerUI(
-                tTts('tts_dl_scaling_colab', `Đang kết nối Colab GPU (${gpuLabel} · ${colabCfg.workers} luồng song song)...`)
-                    .replace('{gpu}', String(gpuLabel))
-                    .replace('{workers}', String(colabCfg.workers))
-            );
+            if (exportState.useBatchApi) {
+                updatePlayerUI(
+                    tTts('tts_dl_scaling_colab_batch', `Đang chạy Colab GPU Batch (${gpuLabel} · Batch ${exportState.batchSize})...`)
+                        .replace('{gpu}', String(gpuLabel))
+                        .replace('{batchSize}', String(exportState.batchSize))
+                );
+            } else {
+                updatePlayerUI(
+                    tTts('tts_dl_scaling_colab', `Đang kết nối Colab GPU (${gpuLabel} · ${colabCfg.workers} luồng song song)...`)
+                        .replace('{gpu}', String(gpuLabel))
+                        .replace('{workers}', String(colabCfg.workers))
+                );
+            }
             const scaled = await new Promise((resolve) => {
                 chrome.runtime.sendMessage({
                     action: 'vieneu_set_worker_mode',
@@ -4117,6 +4152,195 @@
         });
     }
 
+    function createExportPcmCollector() {
+        const chunks = [];
+        let totalSamples = 0;
+        let firstOutputEmitted = false;
+        let resampler = null;
+        let resamplerRate = 0;
+        let anchorTrimmer = null;
+        let anchorRate = 0;
+        let wsola = null;
+        let wsolaRate = 0;
+        let lastSr = EXPORT_SAMPLE_RATE;
+
+        const pushStretchedFloat32 = (samples, sr) => {
+            if (!samples || samples.length === 0) return;
+            const effectiveSr = sr || EXPORT_SAMPLE_RATE;
+            let data = samples;
+            if (!firstOutputEmitted) {
+                firstOutputEmitted = true;
+                const copy = new Float32Array(data);
+                const fadeLen = Math.min(copy.length, Math.round(effectiveSr * 0.005));
+                for (let i = 0; i < fadeLen; i++) copy[i] *= i / fadeLen;
+                data = copy;
+            }
+            if (effectiveSr !== EXPORT_SAMPLE_RATE) {
+                if (!resampler || resamplerRate !== effectiveSr) {
+                    resampler = new ContinuousResampler(effectiveSr, EXPORT_SAMPLE_RATE);
+                    resamplerRate = effectiveSr;
+                }
+                data = resampler.process(data);
+            }
+            if (!data || data.length === 0) return;
+            const int16 = float32ToInt16(data);
+            if (int16.length > 0) {
+                chunks.push(int16);
+                totalSamples += int16.length;
+            }
+        };
+
+        const pushTrimmedRaw = (raw, sr) => {
+            if (!raw || raw.length === 0) return;
+            const effectiveSr = sr || lastSr || EXPORT_SAMPLE_RATE;
+            lastSr = effectiveSr;
+            if (wsolaRate !== effectiveSr) {
+                wsolaRate = effectiveSr;
+                wsola = Math.abs(state.speed - 1.0) < 0.001
+                    ? null
+                    : new WSOLAProcessor(effectiveSr, state.speed);
+            }
+            const processed = wsola ? wsola.process(raw) : raw;
+            pushStretchedFloat32(processed, effectiveSr);
+        };
+
+        return {
+            pushStretchedFloat32,
+            pushBase64Pcm(b64Audio, sampleRate) {
+                if (!b64Audio) return;
+                const sr = sampleRate || EXPORT_SAMPLE_RATE;
+                lastSr = sr;
+                if (!anchorTrimmer || anchorRate !== sr) {
+                    anchorRate = sr;
+                    anchorTrimmer = createAnchorTrimmer(sr);
+                }
+                const rawChunk = decodePcm16Base64ToFloat32(b64Audio);
+                if (rawChunk.length > 0) {
+                    const trimmed = anchorTrimmer.push(rawChunk);
+                    if (trimmed && trimmed.length > 0) {
+                        pushTrimmedRaw(trimmed, sr);
+                    }
+                }
+            },
+            finish() {
+                if (anchorTrimmer) {
+                    const rest = anchorTrimmer.flush();
+                    if (rest && rest.length > 0) pushTrimmedRaw(rest, lastSr);
+                }
+                if (wsola) {
+                    const flushed = wsola.flush();
+                    if (flushed && flushed.length > 0) pushStretchedFloat32(flushed, lastSr);
+                }
+                return { chunks, totalSamples };
+            }
+        };
+    }
+
+    function decodeAndPostProcessExportPcm(base64Audio, sampleRate) {
+        const collector = createExportPcmCollector();
+        collector.pushBase64Pcm(base64Audio, sampleRate);
+        return collector.finish();
+    }
+
+    function synthesizeBatchForExport(segTexts, exportRunId) {
+        return new Promise((resolve, reject) => {
+            if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+                reject(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+                return;
+            }
+            const port = safeConnectTtsPort('stv-tts-batch');
+            if (!port) {
+                reject(new Error('Extension vừa được cập nhật — hãy tải lại trang (F5).'));
+                return;
+            }
+            exportState.activePorts.add(port);
+
+            let settled = false;
+            const items = new Array(segTexts.length);
+            let timer = null;
+
+            const cleanup = () => {
+                if (timer) clearTimeout(timer);
+                exportState.activePorts.delete(port);
+                exportState.abortRejects.delete(abortHandler);
+                try { port.disconnect(); } catch {}
+            };
+
+            const finishErr = (err) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(err instanceof Error ? err : new Error(String(err)));
+            };
+
+            const finishOk = (stats) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                for (let i = 0; i < items.length; i++) {
+                    if (!items[i]) items[i] = { chunks: [], totalSamples: 0 };
+                }
+                ttsLog('Batch synthesized', { count: segTexts.length, ...(stats || {}) });
+                resolve({ items, stats: stats || null });
+            };
+
+            const abortHandler = (err) => finishErr(err);
+            exportState.abortRejects.add(abortHandler);
+
+            const resetTimer = () => {
+                if (timer) clearTimeout(timer);
+                timer = setTimeout(() => finishErr(new Error('VieNeu Batch GPU timeout khi tạo audio.')), 120000);
+            };
+            resetTimer();
+
+            port.onMessage.addListener((msg) => {
+                if (settled || !msg) return;
+                if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+                    finishErr(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+                    return;
+                }
+                resetTimer();
+                if (msg.type === 'item') {
+                    const idx = Number(msg.index);
+                    if (Number.isInteger(idx) && idx >= 0 && idx < items.length) {
+                        items[idx] = decodeAndPostProcessExportPcm(msg.audio, msg.sampleRate || EXPORT_SAMPLE_RATE);
+                    }
+                } else if (msg.type === 'done') {
+                    finishOk(msg.stats);
+                } else if (msg.type === 'error') {
+                    const err = Object.assign(new Error(msg.error || 'Lỗi VieNeu Batch GPU'), {
+                        unsupported: Boolean(msg.unsupported)
+                    });
+                    finishErr(err);
+                }
+            });
+
+            port.onDisconnect.addListener(() => {
+                void chrome?.runtime?.lastError;
+                if (!settled) {
+                    finishErr(new Error('Kết nối VieNeu Batch GPU bị ngắt khi đang tạo audio.'));
+                }
+            });
+
+            try {
+                const maxChars = Math.min(512, Math.max(380, (exportState.maxChunkChars || 320) + 60));
+                const sampling = { ...getSamplingParams(state.stabilityProfile), max_chars: maxChars };
+                port.postMessage({
+                    type: 'start',
+                    inputs: segTexts.map((txt) => formatTtsInputText(txt)),
+                    voice: exportState.effectiveVoice,
+                    serverUrl: exportState.effectiveServerUrl,
+                    apiKey: state.apiKey,
+                    sampleRate: EXPORT_SAMPLE_RATE,
+                    sampling,
+                    batchSize: exportState.batchSize
+                });
+            } catch (err) {
+                finishErr(err);
+            }
+        });
+    }
+
     function synthesizeSegmentForExport(segText, exportRunId) {
         return new Promise((resolve, reject) => {
             if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
@@ -4124,37 +4348,8 @@
                 return;
             }
 
-            const chunks = [];
-            let totalSamples = 0;
-            let firstOutputEmitted = false;
-            let resampler = null;
-            let resamplerRate = 0;
-
-            const pushStretchedFloat32 = (samples, sr) => {
-                if (!samples || samples.length === 0) return;
-                const effectiveSr = sr || EXPORT_SAMPLE_RATE;
-                let data = samples;
-                if (!firstOutputEmitted) {
-                    firstOutputEmitted = true;
-                    const copy = new Float32Array(data);
-                    const fadeLen = Math.min(copy.length, Math.round(effectiveSr * 0.005));
-                    for (let i = 0; i < fadeLen; i++) copy[i] *= i / fadeLen;
-                    data = copy;
-                }
-                if (effectiveSr !== EXPORT_SAMPLE_RATE) {
-                    if (!resampler || resamplerRate !== effectiveSr) {
-                        resampler = new ContinuousResampler(effectiveSr, EXPORT_SAMPLE_RATE);
-                        resamplerRate = effectiveSr;
-                    }
-                    data = resampler.process(data);
-                }
-                if (!data || data.length === 0) return;
-                const int16 = float32ToInt16(data);
-                if (int16.length > 0) {
-                    chunks.push(int16);
-                    totalSamples += int16.length;
-                }
-            };
+            const collector = createExportPcmCollector();
+            const pushStretchedFloat32 = collector.pushStretchedFloat32;
 
             const activeExportEngine = exportState.useColabGpu ? 'vieneu' : state.engine;
             if (activeExportEngine === 'ws_default') {
@@ -4186,7 +4381,7 @@
                     settled = true;
                     cleanup();
                     try { ws?.close(); } catch {}
-                    resolve({ chunks, totalSamples });
+                    resolve(collector.finish());
                 };
                 const abortHandler = (err) => finishErr(err);
                 exportState.abortRejects.add(abortHandler);
@@ -4266,25 +4461,6 @@
             exportState.activePorts.add(port);
 
             let settled = false;
-            let anchorTrimmer = null;
-            let anchorRate = 0;
-            let wsola = null;
-            let wsolaRate = 0;
-            let lastSr = EXPORT_SAMPLE_RATE;
-
-            const pushTrimmedRaw = (raw, sr) => {
-                if (!raw || raw.length === 0) return;
-                const effectiveSr = sr || lastSr || EXPORT_SAMPLE_RATE;
-                lastSr = effectiveSr;
-                if (wsolaRate !== effectiveSr) {
-                    wsolaRate = effectiveSr;
-                    wsola = Math.abs(state.speed - 1.0) < 0.001
-                        ? null
-                        : new WSOLAProcessor(effectiveSr, state.speed);
-                }
-                const processed = wsola ? wsola.process(raw) : raw;
-                pushStretchedFloat32(processed, effectiveSr);
-            };
 
             const cleanup = () => {
                 if (timer) clearTimeout(timer);
@@ -4303,16 +4479,9 @@
             const finishOk = () => {
                 if (settled) return;
                 settled = true;
-                if (anchorTrimmer) {
-                    const rest = anchorTrimmer.flush();
-                    if (rest && rest.length > 0) pushTrimmedRaw(rest, lastSr);
-                }
-                if (wsola) {
-                    const flushed = wsola.flush();
-                    if (flushed && flushed.length > 0) pushStretchedFloat32(flushed, lastSr);
-                }
+                const res = collector.finish();
                 cleanup();
-                resolve({ chunks, totalSamples });
+                resolve(res);
             };
 
             const abortHandler = (err) => finishErr(err);
@@ -4334,19 +4503,7 @@
                 }
                 resetTimer();
                 if (msg.type === 'chunk') {
-                    const sr = msg.sampleRate || EXPORT_SAMPLE_RATE;
-                    lastSr = sr;
-                    if (!anchorTrimmer || anchorRate !== sr) {
-                        anchorRate = sr;
-                        anchorTrimmer = createAnchorTrimmer(sr);
-                    }
-                    const rawChunk = decodePcm16Base64ToFloat32(msg.audio);
-                    if (rawChunk.length > 0) {
-                        const trimmed = anchorTrimmer.push(rawChunk);
-                        if (trimmed && trimmed.length > 0) {
-                            pushTrimmedRaw(trimmed, sr);
-                        }
-                    }
+                    collector.pushBase64Pcm(msg.audio, msg.sampleRate || EXPORT_SAMPLE_RATE);
                 } else if (msg.type === 'done') {
                     finishOk();
                 } else if (msg.type === 'error') {
@@ -4442,6 +4599,8 @@
                 }
                 const colabCfg = getColabGpuExportConfig(resolvedColabTier);
                 exportState.useColabGpu = true;
+                exportState.useBatchApi = false;
+                exportState.batchSize = getColabGpuBatchSize(resolvedColabTier);
                 exportState.effectiveEngine = 'vieneu';
                 exportState.effectiveServerUrl = resolvedColabUrl;
                 exportState.effectiveVoice = resolvedColabVoice;
@@ -4449,6 +4608,8 @@
                 exportState.maxChunkChars = Number(options.colabMaxChunkChars) || colabCfg.maxChunkChars;
             } else {
                 exportState.useColabGpu = false;
+                exportState.useBatchApi = false;
+                exportState.batchSize = 16;
                 exportState.effectiveEngine = state.engine;
                 exportState.effectiveServerUrl = state.serverUrl;
                 exportState.effectiveVoice = state.voice;
@@ -4538,10 +4699,8 @@
                     }
 
                     const results = new Array(N);
-                    let nextAssignIdx = 0;
                     let nextCommitIdx = 0;
                     let completedCount = 0;
-                    let firstWorkerErr = null;
 
                     const commitReadySegments = () => {
                         while (nextCommitIdx < N && results[nextCommitIdx]) {
@@ -4560,43 +4719,92 @@
                         }
                     };
 
-                    const workerCount = Math.min(effectiveConcurrency, N);
-                    const runWorker = async () => {
-                        while (true) {
-                            if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId || firstWorkerErr) {
-                                return;
+                    let batchFallbackStartIdx = 0;
+                    let batchHandledAll = false;
+                    if (exportState.useColabGpu && exportState.useBatchApi) {
+                        const bs = Math.max(1, Math.min(32, Number(exportState.batchSize) || 16));
+                        let batchStart = 0;
+                        let fellBackToStream = false;
+                        while (batchStart < N) {
+                            if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) {
+                                break;
                             }
-                            const idx = nextAssignIdx++;
-                            if (idx >= N) return;
-
-                            exportState.segIndex = Math.min(N, Math.max(exportState.segIndex, idx + 1));
+                            const batchSlice = chapterSegments.slice(batchStart, batchStart + bs);
+                            exportState.segIndex = Math.min(N, batchStart + batchSlice.length);
                             updatePlayerUI();
-
                             try {
-                                const segRes = await synthesizeSegmentForExport(chapterSegments[idx].text, myRunId);
+                                const batchRes = await synthesizeBatchForExport(
+                                    batchSlice.map((seg) => seg.text),
+                                    myRunId
+                                );
                                 if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) {
-                                    return;
+                                    break;
                                 }
-                                results[idx] = segRes;
-                                completedCount += 1;
+                                const items = Array.isArray(batchRes?.items) ? batchRes.items : [];
+                                for (let k = 0; k < batchSlice.length; k++) {
+                                    results[batchStart + k] = items[k] || { chunks: [], totalSamples: 0 };
+                                }
+                                completedCount += batchSlice.length;
                                 commitReadySegments();
                                 exportState.segIndex = Math.min(N, completedCount);
                                 updatePlayerUI();
-                            } catch (err) {
-                                if (!firstWorkerErr) firstWorkerErr = err;
-                                if (err?.message !== 'EXPORT_SAVE_PARTIAL' && err?.message !== 'EXPORT_ABORTED') {
-                                    abortActiveExportNetwork();
+                                batchStart += batchSlice.length;
+                            } catch (batchErr) {
+                                if (batchErr?.unsupported) {
+                                    ttsLog('Colab /v1/audio/batch unsupported, falling back to /v1/audio/speech');
+                                    exportState.useBatchApi = false;
+                                    batchFallbackStartIdx = batchStart;
+                                    fellBackToStream = true;
+                                    break;
                                 }
-                                return;
+                                throw batchErr;
                             }
                         }
-                    };
+                        batchHandledAll = !fellBackToStream;
+                    }
 
-                    await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
-                    commitReadySegments();
+                    if (!batchHandledAll && !exportState.aborted && !exportState.savePartialRequested && exportState.runId === myRunId) {
+                        let nextAssignIdx = batchFallbackStartIdx;
+                        let firstWorkerErr = null;
+                        const remainingCount = Math.max(0, N - batchFallbackStartIdx);
+                        const workerCount = Math.min(effectiveConcurrency, remainingCount);
+                        const runWorker = async () => {
+                            while (true) {
+                                if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId || firstWorkerErr) {
+                                    return;
+                                }
+                                const idx = nextAssignIdx++;
+                                if (idx >= N) return;
 
-                    if (firstWorkerErr) {
-                        throw firstWorkerErr;
+                                exportState.segIndex = Math.min(N, Math.max(exportState.segIndex, idx + 1));
+                                updatePlayerUI();
+
+                                try {
+                                    const segRes = await synthesizeSegmentForExport(chapterSegments[idx].text, myRunId);
+                                    if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) {
+                                        return;
+                                    }
+                                    results[idx] = segRes;
+                                    completedCount += 1;
+                                    commitReadySegments();
+                                    exportState.segIndex = Math.min(N, completedCount);
+                                    updatePlayerUI();
+                                } catch (err) {
+                                    if (!firstWorkerErr) firstWorkerErr = err;
+                                    if (err?.message !== 'EXPORT_SAVE_PARTIAL' && err?.message !== 'EXPORT_ABORTED') {
+                                        abortActiveExportNetwork();
+                                    }
+                                    return;
+                                }
+                            }
+                        };
+
+                        await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+                        commitReadySegments();
+
+                        if (firstWorkerErr) {
+                            throw firstWorkerErr;
+                        }
                     }
                     if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) {
                         break;
@@ -4717,6 +4925,8 @@
                 exportState.active = false;
                 exportState.leaseId = null;
                 exportState.useColabGpu = false;
+                exportState.useBatchApi = false;
+                exportState.batchSize = 16;
                 exportState.effectiveEngine = 'ws_default';
                 exportState.effectiveServerUrl = '';
                 exportState.effectiveVoice = '';

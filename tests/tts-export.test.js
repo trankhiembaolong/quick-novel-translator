@@ -321,6 +321,15 @@ test('getColabGpuExportConfig returns exact workers and maxChunkChars per GPU ti
     assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('auto', { export_max_streams: 24 }) }, { tier: 'auto', workers: 12, maxChunkChars: 300 });
     assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('T4', { export_max_streams: 12 }) }, { tier: 'T4', workers: 6, maxChunkChars: 300 });
     assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('unknown-tier') }, { tier: 'T4', workers: 6, maxChunkChars: 300 });
+
+    assert.equal(typeof helpers.getColabGpuBatchSize, 'function');
+    assert.equal(helpers.getColabGpuBatchSize('T4'), 16);
+    assert.equal(helpers.getColabGpuBatchSize('L4'), 32);
+    assert.equal(helpers.getColabGpuBatchSize('A100'), 32);
+    assert.equal(helpers.getColabGpuBatchSize('auto'), 16);
+    assert.equal(helpers.getColabGpuBatchSize('auto', { batch_max_size: 32 }), 32);
+    assert.equal(helpers.getColabGpuBatchSize('auto', { batch_max_size: 64 }), 32);
+    assert.equal(helpers.getColabGpuBatchSize('L4', { batch_max_size: 16 }), 16);
 });
 
 test('Google Colab GPU export option and GPU tier selector are wired across popup, i18n, background, tts-player, and colab assets', () => {
@@ -354,7 +363,9 @@ test('Google Colab GPU export option and GPU tier selector are wired across popu
     assert.ok(backgroundJs.includes('Math.min(12, Math.floor(Number(request.workers)))'));
     assert.ok(backgroundJs.includes('ngrok-skip-browser-warning'));
     assert.ok(backgroundJs.includes('syncColabOriginStripRule'));
+    assert.ok(backgroundJs.includes('stv-tts-batch'));
     assert.ok(playerJs.includes('COLAB_TIER_CONFIG') && playerJs.includes('getColabGpuExportConfig'));
+    assert.ok(playerJs.includes('getColabGpuBatchSize'));
     assert.ok(playerJs.includes("requestedSource === 'colab_gpu'"));
 
     // Colab notebook & runner
@@ -364,6 +375,7 @@ test('Google Colab GPU export option and GPU tier selector are wired across popu
     assert.ok(runnerPy.includes('CORSMiddleware'));
     assert.ok(runnerPy.includes('le=12'));
     assert.ok(runnerPy.includes('"colab": True'));
+    assert.ok(runnerPy.includes('/v1/audio/batch'));
 
     // i18n keys
     for (const key of [
@@ -489,13 +501,21 @@ async function runColabDownloadTest({
                         disconnect() {},
                         postMessage(msg) {
                             if (msg.type === 'start') {
-                                portStarts.push(msg);
+                                portStarts.push({ portName: name, ...msg });
                                 activeStreams += 1;
                                 maxConcurrentStreams = Math.max(maxConcurrentStreams, activeStreams);
                                 const pcm = new Int16Array(2400).fill(500);
                                 const b64 = Buffer.from(pcm.buffer).toString('base64');
                                 const finish = () => {
                                     activeStreams -= 1;
+                                    if (name === 'stv-tts-batch') {
+                                        const inputs = Array.isArray(msg.inputs) ? msg.inputs : [];
+                                        inputs.forEach((_, idx) => {
+                                            listeners.msg.forEach((fn) => fn({ type: 'item', index: idx, audio: b64, sampleRate: 24000 }));
+                                        });
+                                        listeners.msg.forEach((fn) => fn({ type: 'done', stats: { audioSec: 1.0, wallSec: 0.1, speedup: 10.0, dtype: 'float16' } }));
+                                        return;
+                                    }
                                     listeners.msg.forEach((fn) => fn({ type: 'chunk', audio: b64, sampleRate: 24000 }));
                                     listeners.msg.forEach((fn) => fn({ type: 'done' }));
                                 };
@@ -553,4 +573,31 @@ test('colab_gpu fallback caps export concurrency to health.max_streams when scal
     assert.equal(res.ok, true, `Expected fallback download ok, got: ${JSON.stringify(res)}`);
     assert.ok(portStarts.length >= 4, `Expected >=4 segments, got ${portStarts.length}`);
     assert.ok(maxConcurrentStreams <= 2, `Expected concurrency <= health.max_streams (2), got ${maxConcurrentStreams}`);
+});
+
+test('startTTSDownload uses stv-tts-batch port and STV anchor prefix when Colab reports batch_supported', async () => {
+    const longParagraph = 'Tiêu Viêm đứng trên đỉnh núi nhìn xuống hẻm núi sâu thẳm phía trước, đấu khí trong cơ thể chậm rãi vận chuyển qua từng kinh mạch khiến khí thế quanh thân càng thêm ngưng thực.';
+    const lines = Array.from({ length: 5 }, (_, i) => `Khúc ${i + 1}: ${longParagraph} ${longParagraph}`);
+    const { res, portStarts, createdAnchorClicks } = await runColabDownloadTest({
+        lines,
+        ttsColabGpu: 'T4',
+        healthData: {
+            status: 'ok',
+            gpu_name: 'Tesla T4',
+            batch_supported: true,
+            batch_max_size: 16,
+            model_dtype: 'float16',
+            max_streams: 6,
+            export_max_streams: 6
+        }
+    });
+    assert.equal(res.ok, true, `Expected batch download ok, got: ${JSON.stringify(res)}`);
+    assert.equal(createdAnchorClicks.length, 1);
+    assert.equal(portStarts.length, 1, `Expected all segments sent in 1 batch call, got ${portStarts.length}`);
+    assert.equal(portStarts[0].portName, 'stv-tts-batch');
+    assert.equal(portStarts[0].batchSize, 16);
+    assert.equal(portStarts[0].serverUrl, 'https://fast-gpu.trycloudflare.com');
+    assert.equal(portStarts[0].voice, 'Binh');
+    assert.ok(Array.isArray(portStarts[0].inputs) && portStarts[0].inputs.length >= 4);
+    assert.ok(portStarts[0].inputs.every((txt) => txt.startsWith('Một. ')), 'Every batch input must include anchor prefix');
 });

@@ -2569,12 +2569,214 @@ function handleStreamConnection(port) {
     });
 }
 
+function clampTtsNumber(val, min, max, fallback) {
+    const num = Number(val);
+    return Number.isFinite(num) ? Math.max(min, Math.min(max, num)) : fallback;
+}
+
+function buildVieNeuSamplingParams(sampling, defaultMaxChars = 280) {
+    const s = sampling && typeof sampling === 'object' ? sampling : {};
+    return {
+        temperature: clampTtsNumber(s.temperature, 0.0, 2.0, 0.4),
+        top_k: Math.round(clampTtsNumber(s.top_k, 1, 1024, 12)),
+        top_p: clampTtsNumber(s.top_p, 0.01, 1.0, 0.85),
+        repetition_penalty: clampTtsNumber(s.repetition_penalty, 1.0, 2.0, 1.05),
+        max_chars: Math.round(clampTtsNumber(s.max_chars, 64, 512, defaultMaxChars))
+    };
+}
+
+function uint8ArrayToBase64(bytes) {
+    if (!bytes || bytes.length === 0) return '';
+    const chunkSize = 0x8000;
+    const parts = [];
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize)));
+    }
+    return btoa(parts.join(''));
+}
+
+function waitTtsRetryDelay(ms, signal, isDisconnected) {
+    return new Promise((resolve, reject) => {
+        const abortErr = () => Object.assign(new Error('Aborted'), { name: 'AbortError' });
+        if (signal.aborted || isDisconnected()) {
+            reject(abortErr());
+            return;
+        }
+        let timerId = null;
+        const onAbort = () => {
+            if (timerId !== null) clearTimeout(timerId);
+            reject(abortErr());
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        timerId = setTimeout(() => {
+            signal.removeEventListener('abort', onAbort);
+            if (signal.aborted || isDisconnected()) {
+                reject(abortErr());
+                return;
+            }
+            resolve();
+        }, ms);
+    });
+}
+
+function handleTtsBatchPortConnection(port) {
+    let activeController = null;
+    let disconnected = false;
+
+    const abortCurrent = () => {
+        if (activeController) {
+            activeController.abort();
+            activeController = null;
+        }
+    };
+
+    port.onDisconnect.addListener(() => {
+        void chrome?.runtime?.lastError;
+        disconnected = true;
+        abortCurrent();
+    });
+
+    port.onMessage.addListener(async (msg) => {
+        if (!msg) return;
+        if (msg.type === 'abort') {
+            abortCurrent();
+            return;
+        }
+        if (msg.type !== 'start') return;
+
+        abortCurrent();
+        activeController = new AbortController();
+        const controller = activeController;
+
+        const serverUrl = normalizeServerUrl(msg.serverUrl);
+        const sampleRate = Number(msg.sampleRate) || 24000;
+        const inputs = Array.isArray(msg.inputs) ? msg.inputs : [];
+        if (inputs.length === 0) {
+            safePortPost(port, { type: 'done', stats: { audioSec: 0, wallSec: 0, speedup: 0, dtype: '' } });
+            return;
+        }
+
+        const body = {
+            model: 'vieneu-v3-turbo',
+            inputs,
+            sample_rate: sampleRate,
+            ...buildVieNeuSamplingParams(msg.sampling, 380)
+        };
+        if (msg.voice) body.voice = msg.voice;
+        if (Number.isFinite(Number(msg.batchSize)) && Number(msg.batchSize) >= 1) {
+            body.batch_size = Math.min(64, Math.floor(Number(msg.batchSize)));
+        }
+
+        try {
+            const ttsCfg = await chrome.storage.local.get(['ttsApiKey', 'stvDebugLog']);
+            const resolvedApiKey = (msg.apiKey !== undefined && msg.apiKey !== '') ? msg.apiKey : (ttsCfg.ttsApiKey || '');
+            if (ttsCfg.stvDebugLog) {
+                console.log('[STV Background TTS] POST /v1/audio/batch', {
+                    serverUrl,
+                    voice: body.voice || '(default)',
+                    items: body.inputs.length,
+                    batch_size: body.batch_size || '(auto)',
+                    sample_rate: body.sample_rate
+                });
+            }
+
+            const maxBatchRetries = 2;
+            let response = null;
+            for (let attempt = 0; attempt <= maxBatchRetries; attempt += 1) {
+                response = await fetch(`${serverUrl}/v1/audio/batch`, {
+                    method: 'POST',
+                    headers: buildAuthHeaders(resolvedApiKey, { 'Content-Type': 'application/json' }),
+                    body: JSON.stringify(body),
+                    signal: controller.signal
+                });
+                if ((response.status !== 429 && response.status !== 503) || attempt >= maxBatchRetries) break;
+                await response.body?.cancel?.().catch(() => {});
+                await waitTtsRetryDelay(2000 * (attempt + 1), controller.signal, () => disconnected);
+            }
+
+            if (!response.ok) {
+                const errJson = await response.json().catch(() => null);
+                const errMsg = errJson?.error?.message || `VieNeu Batch API trả lỗi HTTP ${response.status}`;
+                const unsupported = response.status === 404 || response.status === 405;
+                if (!disconnected && !controller.signal.aborted) {
+                    safePortPost(port, { type: 'error', unsupported, status: response.status, error: errMsg });
+                }
+                return;
+            }
+
+            const buf = await response.arrayBuffer();
+            if (disconnected || controller.signal.aborted) return;
+            if (buf.byteLength < 16) {
+                throw new Error('Dữ liệu VieNeu Batch không hợp lệ (header quá ngắn).');
+            }
+            const view = new DataView(buf);
+            if (
+                view.getUint8(0) !== 0x53 ||
+                view.getUint8(1) !== 0x54 ||
+                view.getUint8(2) !== 0x56 ||
+                view.getUint8(3) !== 0x42
+            ) {
+                throw new Error('Dữ liệu VieNeu Batch không đúng định dạng STVB.');
+            }
+            const version = view.getUint32(4, true);
+            if (version !== 1) {
+                throw new Error(`Phiên bản STVB không được hỗ trợ: ${version}`);
+            }
+            const respSampleRate = view.getUint32(8, true) || sampleRate;
+            const count = view.getUint32(12, true);
+            let offset = 16;
+
+            for (let i = 0; i < count; i += 1) {
+                if (disconnected || controller.signal.aborted) return;
+                if (offset + 4 > buf.byteLength) {
+                    throw new Error('Dữ liệu VieNeu Batch bị cắt cụt.');
+                }
+                const byteLen = view.getUint32(offset, true);
+                offset += 4;
+                if (offset + byteLen > buf.byteLength) {
+                    throw new Error('Độ dài chunk VieNeu Batch vượt quá buffer.');
+                }
+                const b64 = uint8ArrayToBase64(new Uint8Array(buf, offset, byteLen));
+                offset += byteLen;
+                if (!safePortPost(port, { type: 'item', index: i, audio: b64, sampleRate: respSampleRate })) {
+                    abortCurrent();
+                    return;
+                }
+            }
+
+            const stats = {
+                audioSec: Number(response.headers?.get('X-Batch-Audio-Sec') || 0) || 0,
+                wallSec: Number(response.headers?.get('X-Batch-Wall-Sec') || 0) || 0,
+                speedup: Number(response.headers?.get('X-Batch-Speedup') || 0) || 0,
+                dtype: response.headers?.get('X-Batch-Dtype') || ''
+            };
+            if (!disconnected && !controller.signal.aborted) {
+                safePortPost(port, { type: 'done', stats });
+            }
+        } catch (err) {
+            if (err.name === 'AbortError' || disconnected) return;
+            const friendly = /Failed to fetch|NetworkError/i.test(err.message)
+                ? `Không kết nối được tới VieNeu server (${serverUrl}). Hãy kiểm tra Server/Tunnel trước.`
+                : err.message;
+            safePortPost(port, { type: 'error', error: friendly });
+        } finally {
+            if (activeController === controller) {
+                activeController = null;
+            }
+        }
+    });
+}
+
 // Stream TTS audio qua Port (vượt CORS & Mixed Content, hỗ trợ hủy tức thì)
 // và nhận đăng ký stream preload chương tiếp theo
 chrome.runtime.onConnect.addListener((port) => {
     // Broker streaming dịch văn bản cho Content Script (cách ly hoàn toàn API Key trong Background)
     if (port.name === 'stv-translate-stream') {
         handleStreamConnection(port);
+        return;
+    }
+    if (port.name === 'stv-tts-batch') {
+        handleTtsBatchPortConnection(port);
         return;
     }
     if (port.name === 'stv-preload-stream') {
@@ -2627,28 +2829,6 @@ chrome.runtime.onConnect.addListener((port) => {
         }
     };
 
-    const waitRetryDelay = (ms, signal) => new Promise((resolve, reject) => {
-        const abortErr = () => Object.assign(new Error('Aborted'), { name: 'AbortError' });
-        if (signal.aborted || disconnected) {
-            reject(abortErr());
-            return;
-        }
-        let timerId = null;
-        const onAbort = () => {
-            if (timerId !== null) clearTimeout(timerId);
-            reject(abortErr());
-        };
-        signal.addEventListener('abort', onAbort, { once: true });
-        timerId = setTimeout(() => {
-            signal.removeEventListener('abort', onAbort);
-            if (signal.aborted || disconnected) {
-                reject(abortErr());
-                return;
-            }
-            resolve();
-        }, ms);
-    });
-
     port.onDisconnect.addListener(() => {
         void chrome?.runtime?.lastError;
         disconnected = true;
@@ -2669,22 +2849,13 @@ chrome.runtime.onConnect.addListener((port) => {
 
         const serverUrl = normalizeServerUrl(msg.serverUrl);
         const sampleRate = Number(msg.sampleRate) || 48000;
-        const s = msg.sampling && typeof msg.sampling === 'object' ? msg.sampling : {};
-        const clamp = (val, min, max, fallback) => {
-            const num = Number(val);
-            return Number.isFinite(num) ? Math.max(min, Math.min(max, num)) : fallback;
-        };
         const body = {
             model: 'vieneu-v3-turbo',
             input: msg.text || '',
             response_format: 'pcm',
             stream_format: 'sse',
             sample_rate: sampleRate,
-            temperature: clamp(s.temperature, 0.0, 2.0, 0.4),
-            top_k: Math.round(clamp(s.top_k, 1, 1024, 12)),
-            top_p: clamp(s.top_p, 0.01, 1.0, 0.85),
-            repetition_penalty: clamp(s.repetition_penalty, 1.0, 2.0, 1.05),
-            max_chars: Math.round(clamp(s.max_chars, 64, 512, 280))
+            ...buildVieNeuSamplingParams(msg.sampling, 280)
         };
         if (msg.voice) {
             body.voice = msg.voice;
@@ -2714,7 +2885,7 @@ chrome.runtime.onConnect.addListener((port) => {
                 });
                 if (response.status !== 429 || attempt >= maxBusyRetries) break;
                 await response.body?.cancel?.().catch(() => {});
-                await waitRetryDelay(1500 * (attempt + 1), controller.signal);
+                await waitTtsRetryDelay(1500 * (attempt + 1), controller.signal, () => disconnected);
             }
 
             if (!response.ok) {

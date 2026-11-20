@@ -81,6 +81,7 @@
         colabOnline: false,
         colabGpuName: '',
         colabWorkers: 6,
+        colabBatchSize: 0,
         fetchedModels: [],
         modelsEndpoint: '',
         isFetchingModels: false,
@@ -1685,9 +1686,13 @@
                 : t('tts_colab_badge_offline');
         }
         if (pill) {
-            pill.textContent = state.colabOnline && state.colabGpuName
-                ? `${state.colabWorkers || profile.workers}x`
-                : profile.label;
+            if (state.colabOnline && state.colabGpuName) {
+                pill.textContent = state.colabBatchSize > 0
+                    ? `Batch ${state.colabBatchSize}`
+                    : `${state.colabWorkers || profile.workers}x`;
+            } else {
+                pill.textContent = profile.label;
+            }
         }
     }
 
@@ -1800,6 +1805,7 @@
         if (!url || !UrlValidator || !UrlValidator.isValidUrl(url, ['http:', 'https:'])) {
             state.colabOnline = false;
             state.colabGpuName = '';
+            state.colabBatchSize = 0;
             updateColabStatusUI();
             if (!silent) setColabHint(t('tts_colab_err_url_missing'), 'error');
             return false;
@@ -1836,6 +1842,9 @@
             state.colabWorkers = Number.isFinite(reportedWorkers) && reportedWorkers >= 1
                 ? reportedWorkers
                 : profile.workers;
+            state.colabBatchSize = res.data?.batch_supported
+                ? (Number(res.data?.batch_max_size) || 0)
+                : 0;
             updateColabStatusUI();
             setColabHint(t('tts_colab_step_hint'));
             await chrome.storage.local.set({ ttsColabUrl: url });
@@ -1844,6 +1853,7 @@
         } catch (_) {
             state.colabOnline = false;
             state.colabGpuName = '';
+            state.colabBatchSize = 0;
             updateColabStatusUI();
             if (!silent) setColabHint(t('tts_colab_err_connect_fail', { url }), 'error');
             return false;
@@ -1886,7 +1896,7 @@
             'repo_dir = "/content/vieneu-tts"',
             'if not os.path.isdir(repo_dir):',
             '    subprocess.run(["git", "clone", "--depth", "1", "https://github.com/pnnbao97/VieNeu-TTS.git", repo_dir], check=True)',
-            'subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", repo_dir, "onnxruntime-gpu", "fastapi", "uvicorn", "huggingface_hub", "tokenizers"], check=True)',
+            'subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", repo_dir, "fastapi", "uvicorn", "huggingface_hub", "tokenizers"], check=True)',
             'runner_path = os.path.join(repo_dir, "vieneu_colab_runner.py")',
             'try:',
             '    urllib.request.urlretrieve("https://raw.githubusercontent.com/trankhiembaolong/quick-novel-translator/main/colab/vieneu_colab_runner.py", runner_path)',
