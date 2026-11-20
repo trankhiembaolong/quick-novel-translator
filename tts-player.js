@@ -3922,8 +3922,11 @@
                 return Math.max(1, Math.min(12, streams));
             }
             if (health) {
-                const curStreams = Number(health.export_max_streams || health.max_streams || colabCfg.workers);
-                return Math.max(1, Math.min(12, curStreams));
+                const curStreams = Number(health.max_streams || colabCfg.workers);
+                if (colabCfg.tier === 'auto') {
+                    return Math.max(1, Math.min(12, curStreams));
+                }
+                return Math.max(1, Math.min(colabCfg.workers, curStreams));
             }
             return colabCfg.workers;
         }

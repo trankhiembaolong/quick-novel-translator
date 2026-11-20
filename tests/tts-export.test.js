@@ -375,11 +375,19 @@ test('Google Colab GPU export option and GPU tier selector are wired across popu
     }
 });
 
-test('startTTSDownload routes colab_gpu exports independently of webspeech listening engine', async () => {
+async function runColabDownloadTest({
+    lines = ['Tiêu Viêm bước ra khỏi đại điện.'],
+    ttsColabGpu = 'A100',
+    healthData = { status: 'ok', gpu_name: 'NVIDIA A100', export_max_streams: 12 },
+    workerModeHandler = (msg) => ({ ok: true, data: { mode: msg.mode, max_streams: msg.workers || 6, active_workers: msg.workers || 6 } }),
+    asyncDelayMs = 0
+} = {}) {
     const code = fs.readFileSync(path.resolve(__dirname, '..', 'tts-player.js'), 'utf8');
     const messages = [];
     const portStarts = [];
     const createdAnchorClicks = [];
+    let activeStreams = 0;
+    let maxConcurrentStreams = 0;
 
     const makeEl = (tag) => ({
         tagName: tag.toUpperCase(),
@@ -397,7 +405,7 @@ test('startTTSDownload routes colab_gpu exports independently of webspeech liste
         addEventListener() {}
     });
 
-    const lineEl = { textContent: 'Tiêu Viêm bước ra khỏi đại điện.', classList: { contains: () => false } };
+    const lineEls = lines.map((textContent) => ({ textContent, classList: { contains: () => false } }));
     const doc = {
         head: { appendChild() {} },
         body: { appendChild() {} },
@@ -410,7 +418,7 @@ test('startTTSDownload routes colab_gpu exports independently of webspeech liste
             return null;
         },
         querySelectorAll(sel) {
-            if (sel && sel.includes('.stv-line')) return [lineEl];
+            if (sel && sel.includes('.stv-line')) return lineEls;
             return [];
         },
         createElement: makeEl
@@ -460,14 +468,14 @@ test('startTTSDownload routes colab_gpu exports independently of webspeech liste
                                 ttsDownloadSource: 'colab_gpu',
                                 ttsColabUrl: 'https://fast-gpu.trycloudflare.com',
                                 ttsColabVoice: 'Binh',
-                                ttsColabGpu: 'A100',
+                                ttsColabGpu,
                                 ttsIconMode: 'off'
                             }
                         });
                     } else if (msg.action === 'vieneu_check_health') {
-                        cb({ ok: true, data: { status: 'ok', gpu_name: 'NVIDIA A100', export_max_streams: 12 } });
+                        cb({ ok: true, data: healthData });
                     } else if (msg.action === 'vieneu_set_worker_mode') {
-                        cb({ ok: true, data: { mode: msg.mode, max_streams: msg.workers || 6, active_workers: msg.workers || 6 } });
+                        cb(workerModeHandler(msg));
                     } else {
                         cb({ ok: true });
                     }
@@ -482,12 +490,20 @@ test('startTTSDownload routes colab_gpu exports independently of webspeech liste
                         postMessage(msg) {
                             if (msg.type === 'start') {
                                 portStarts.push(msg);
+                                activeStreams += 1;
+                                maxConcurrentStreams = Math.max(maxConcurrentStreams, activeStreams);
                                 const pcm = new Int16Array(2400).fill(500);
                                 const b64 = Buffer.from(pcm.buffer).toString('base64');
-                                queueMicrotask(() => {
+                                const finish = () => {
+                                    activeStreams -= 1;
                                     listeners.msg.forEach((fn) => fn({ type: 'chunk', audio: b64, sampleRate: 24000 }));
                                     listeners.msg.forEach((fn) => fn({ type: 'done' }));
-                                });
+                                };
+                                if (asyncDelayMs > 0) {
+                                    setTimeout(finish, asyncDelayMs);
+                                } else {
+                                    queueMicrotask(finish);
+                                }
                             }
                         }
                     };
@@ -500,6 +516,11 @@ test('startTTSDownload routes colab_gpu exports independently of webspeech liste
     vm.runInNewContext(code, sandbox);
 
     const res = await sandbox.STV_TTSController.startDownload({ downloadMinutes: 1 });
+    return { res, sandbox, messages, portStarts, createdAnchorClicks, maxConcurrentStreams };
+}
+
+test('startTTSDownload routes colab_gpu exports independently of webspeech listening engine', async () => {
+    const { res, sandbox, messages, portStarts, createdAnchorClicks } = await runColabDownloadTest();
     assert.equal(res.ok, true, `Expected download ok, got: ${JSON.stringify(res)}`);
     assert.equal(sandbox.STV_TTSController.getState().engine, 'webspeech');
     assert.equal(portStarts.length, 1);
@@ -516,4 +537,20 @@ test('startTTSDownload routes colab_gpu exports independently of webspeech liste
     assert.ok(scaleListenMsg);
     assert.equal(scaleListenMsg.serverUrl, 'https://fast-gpu.trycloudflare.com');
     assert.equal(createdAnchorClicks.length, 1);
+});
+
+test('colab_gpu fallback caps export concurrency to health.max_streams when scaling fails', async () => {
+    // 6 distinct segments > 200 chars each so the exporter dispatches multiple concurrent requests
+    const longParagraph = 'Tiêu Viêm vận chuyển đấu khí trong kinh mạch suốt một canh giờ không ngừng nghỉ, linh lực cuồn cuộn tụ lại thành vòng xoáy rực sáng khắp cả thạch thất rộng lớn trước ánh nhìn kinh ngạc của mọi người.';
+    const lines = Array.from({ length: 6 }, (_, i) => `Đoạn ${i + 1}: ${longParagraph} ${longParagraph}`);
+    const { res, portStarts, maxConcurrentStreams } = await runColabDownloadTest({
+        lines,
+        ttsColabGpu: 'L4',
+        healthData: { status: 'ok', gpu_name: 'Tesla T4', max_streams: 2, export_max_streams: 8 },
+        workerModeHandler: () => ({ ok: false, error: 'HTTP 422' }),
+        asyncDelayMs: 10
+    });
+    assert.equal(res.ok, true, `Expected fallback download ok, got: ${JSON.stringify(res)}`);
+    assert.ok(portStarts.length >= 4, `Expected >=4 segments, got ${portStarts.length}`);
+    assert.ok(maxConcurrentStreams <= 2, `Expected concurrency <= health.max_streams (2), got ${maxConcurrentStreams}`);
 });

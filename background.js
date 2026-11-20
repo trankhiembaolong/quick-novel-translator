@@ -2627,6 +2627,28 @@ chrome.runtime.onConnect.addListener((port) => {
         }
     };
 
+    const waitRetryDelay = (ms, signal) => new Promise((resolve, reject) => {
+        const abortErr = () => Object.assign(new Error('Aborted'), { name: 'AbortError' });
+        if (signal.aborted || disconnected) {
+            reject(abortErr());
+            return;
+        }
+        let timerId = null;
+        const onAbort = () => {
+            if (timerId !== null) clearTimeout(timerId);
+            reject(abortErr());
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        timerId = setTimeout(() => {
+            signal.removeEventListener('abort', onAbort);
+            if (signal.aborted || disconnected) {
+                reject(abortErr());
+                return;
+            }
+            resolve();
+        }, ms);
+    });
+
     port.onDisconnect.addListener(() => {
         void chrome?.runtime?.lastError;
         disconnected = true;
@@ -2681,12 +2703,19 @@ chrome.runtime.onConnect.addListener((port) => {
                     textLen: body.input.length
                 });
             }
-            const response = await fetch(`${serverUrl}/v1/audio/speech`, {
-                method: 'POST',
-                headers: buildAuthHeaders(resolvedApiKey, { 'Content-Type': 'application/json' }),
-                body: JSON.stringify(body),
-                signal: controller.signal
-            });
+            const maxBusyRetries = 3;
+            let response = null;
+            for (let attempt = 0; attempt <= maxBusyRetries; attempt += 1) {
+                response = await fetch(`${serverUrl}/v1/audio/speech`, {
+                    method: 'POST',
+                    headers: buildAuthHeaders(resolvedApiKey, { 'Content-Type': 'application/json' }),
+                    body: JSON.stringify(body),
+                    signal: controller.signal
+                });
+                if (response.status !== 429 || attempt >= maxBusyRetries) break;
+                await response.body?.cancel?.().catch(() => {});
+                await waitRetryDelay(1500 * (attempt + 1), controller.signal);
+            }
 
             if (!response.ok) {
                 const errJson = await response.json().catch(() => null);

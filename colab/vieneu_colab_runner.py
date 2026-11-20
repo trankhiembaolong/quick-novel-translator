@@ -512,6 +512,9 @@ def _setup_cors_and_routes(oai, eng, pool: Optional[ColabEnginePool], *, gpu_nam
             allow_headers=["*"],
         )
 
+    # Bind into module globals so FastAPI resolves the annotation under `from __future__ import annotations`.
+    global ColabWorkerModeRequest
+
     class ColabWorkerModeRequest(BaseModel):
         mode: str = "listen"
         lease_id: Optional[str] = None
@@ -617,6 +620,9 @@ def configure_colab_server() -> None:
     os.environ.setdefault("HOST", "127.0.0.1")
     os.environ.setdefault("PORT", "8000")
     os.environ.setdefault("VIENEU_WATERMARK", "0")
+    os.environ.setdefault("VIENEU_MAX_STREAMS", str(export_cap))
+    os.environ.setdefault("VIENEU_QUEUE", str(max(64, export_cap * 8)))
+    os.environ.setdefault("VIENEU_QUEUE_TIMEOUT", "180")
 
     eng = oai.engine()
     pool: Optional[ColabEnginePool] = None
@@ -647,9 +653,11 @@ def configure_colab_server() -> None:
             pool = None
 
     if pool is None:
-        eng._gate = ResizableGate(listen_streams)
-        eng.max_streams = listen_streams
-        eng.max_queue = max(export_cap * 4, int(os.environ.get("VIENEU_QUEUE", "32")))
+        eng._gate = ResizableGate(export_cap)
+        eng.max_streams = export_cap
+
+    eng.queue_timeout = 180.0
+    eng.max_queue = max(64, export_cap * 8)
 
     _setup_cors_and_routes(
         oai,

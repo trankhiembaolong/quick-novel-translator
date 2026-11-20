@@ -1259,6 +1259,9 @@ def _register_worker_routes(oai, pool: Optional[OnnxEnginePool]) -> None:
     from fastapi.responses import JSONResponse
     from pydantic import BaseModel, Field
 
+    # Bind into module globals so FastAPI resolves the annotation under `from __future__ import annotations`.
+    global WorkerModeRequest
+
     class WorkerModeRequest(BaseModel):
         mode: str = "listen"
         lease_id: Optional[str] = None
