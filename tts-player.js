@@ -851,6 +851,33 @@
         return segments;
     }
 
+    const FOREIGN_SCRIPT_CHAR_RE = /[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uAC00-\uD7AF]/g;
+
+    /**
+     * Detect whether segments still consist primarily of untranslated CJK/Kana/Hangul prose.
+     * Tolerates occasional stray characters in translated Vietnamese text.
+     */
+    function containsForeignCjkText(segments) {
+        const list = Array.isArray(segments) ? segments : [segments];
+        let foreignChars = 0;
+        let totalChars = 0;
+        for (const item of list) {
+            const text = typeof item === 'string'
+                ? item
+                : (item && typeof item.text === 'string' ? item.text : '');
+            if (!text) continue;
+            const compact = text.replace(/\s+/g, '');
+            if (!compact) continue;
+            totalChars += compact.length;
+            const matches = compact.match(FOREIGN_SCRIPT_CHAR_RE);
+            if (matches) {
+                foreignChars += matches.length;
+            }
+        }
+        if (foreignChars === 0 || totalChars === 0) return false;
+        return foreignChars >= 12 || (foreignChars / totalChars) >= 0.15;
+    }
+
     // Export DSP helpers for testing and external consumption
     global.STV_TTSHelpers = {
         cleanTextForSpeech,
@@ -865,6 +892,7 @@
         extractCleanTranslatedLines,
         appendPackedSegment,
         packSegmentsForExport,
+        containsForeignCjkText,
         COLAB_TIER_CONFIG,
         getColabGpuExportConfig,
         COLAB_BATCH_SIZE_BY_TIER,
@@ -1266,6 +1294,7 @@
         iconCustomMap: {},
         aiIconsUnavailable: false,
         liveIconDebounceTimer: null,
+        hasTranslationApiKey: false,
         debugLog: false
     };
 
@@ -3848,6 +3877,9 @@
             ? describer.normalizeCustomIconsMap(customSrc)
             : ((customSrc && typeof customSrc === 'object' && !Array.isArray(customSrc)) ? { ...customSrc } : {});
         state.aiIconsUnavailable = false;
+        state.hasTranslationApiKey = options.hasTranslationApiKey !== undefined
+            ? Boolean(options.hasTranslationApiKey)
+            : Boolean(config.hasTranslationApiKey);
 
         return config;
     }
@@ -4096,6 +4128,102 @@
             exportState.abortRejects.add(abortHandler);
             global.addEventListener('stv-translation-progress', onProgress);
         });
+    }
+
+    /** Check whether the current chapter DOM already contains finalized translated lines. */
+    function hasTranslatedStvLines() {
+        const doc = (typeof document !== 'undefined') ? document : (global?.document || null);
+        if (!doc || typeof doc.querySelectorAll !== 'function') return false;
+        return doc.querySelectorAll('.stv-line:not(.stv-line-partial)').length > 0;
+    }
+
+    /**
+     * Wait for an in-flight translation or automatically trigger chapter translation (without live auto-play)
+     * when exporting WAV from an untranslated page with a configured translation API key.
+     */
+    async function ensureCurrentChapterTranslatedForExport(exportRunId, options = {}) {
+        const hadActiveTranslation = Boolean(global.STV_translationState && global.STV_translationState.active);
+        if (hadActiveTranslation) {
+            exportState.waitingTranslation = true;
+            updatePlayerUI();
+            await waitForActiveTranslation(exportRunId);
+            exportState.waitingTranslation = false;
+            updatePlayerUI();
+            if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+                throw new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED');
+            }
+            if (!hasTranslatedStvLines() && global.STV_translationState?.error) {
+                throw new Error(`Dịch chương thất bại: ${global.STV_translationState.error}`);
+            }
+        }
+
+        if (hasTranslatedStvLines() || options.autoTranslateCurrent === false || !state.hasTranslationApiKey || !isExtensionAlive()) {
+            return { ok: true };
+        }
+
+        exportState.waitingTranslation = true;
+        updatePlayerUI(tTts('tts_dl_auto_translating', 'Chương chưa dịch, đang tự động dịch trước khi tạo audio...'));
+
+        const transResp = await new Promise((resolve) => {
+            try {
+                chrome.runtime.sendMessage({
+                    action: 'translate_active_tab',
+                    suppressAutoPlay: true
+                }, (resp) => {
+                    if (chrome.runtime.lastError) {
+                        resolve({ ok: false, error: chrome.runtime.lastError.message || 'translate_active_tab failed' });
+                        return;
+                    }
+                    resolve(resp || { ok: false, error: 'translate_active_tab empty response' });
+                });
+            } catch (err) {
+                resolve({ ok: false, error: err?.message || String(err) });
+            }
+        });
+
+        if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+            throw new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED');
+        }
+
+        if (!transResp || !transResp.ok) {
+            exportState.waitingTranslation = false;
+            throw new Error(transResp?.error || 'Không thể tự động dịch chương trước khi tải audio.');
+        }
+
+        const transResult = transResp.data;
+        if (transResult === 'auto_pick_started') {
+            exportState.waitingTranslation = false;
+            return { ok: false, error: 'auto_pick_started' };
+        }
+        if (
+            transResult === 'no_api_key' ||
+            transResult === 'chrome_scripting_error' ||
+            transResult === 'extractor_error'
+        ) {
+            exportState.waitingTranslation = false;
+            throw new Error(`Không thể tự động dịch chương (${transResult}).`);
+        }
+
+        if (global.STV_translationState && global.STV_translationState.active) {
+            updatePlayerUI();
+            await waitForActiveTranslation(exportRunId);
+        }
+
+        exportState.waitingTranslation = false;
+        updatePlayerUI();
+
+        if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+            throw new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED');
+        }
+
+        if (!hasTranslatedStvLines()) {
+            const transErr = global.STV_translationState?.error;
+            throw new Error(transErr
+                ? `Dịch chương thất bại: ${transErr}`
+                : 'Không thể tự động dịch chương trước khi tạo audio.');
+        }
+
+        return { ok: true };
     }
 
     function fetchAndTranslateChapterForExport(targetUrl, mode, exportRunId) {
@@ -4707,10 +4835,10 @@
         }
 
         const wasLiveActive = state.isPlaying || state.isPaused;
-        const resumeIdx = wasLiveActive ? state.currentIndex : 0;
         if (wasLiveActive) {
             stopPlayback(false);
         }
+        clearHighlight();
 
         exportState.runId += 1;
         const myRunId = exportState.runId;
@@ -4789,11 +4917,13 @@
 
             updatePlayerUI(tTts('tts_dl_starting', `Đang chuẩn bị tạo audio (${exportState.targetMinutes} phút)...`).replace('{minutes}', String(exportState.targetMinutes)));
 
-            if (global.STV_translationState && global.STV_translationState.active) {
-                exportState.waitingTranslation = true;
-                updatePlayerUI();
-                await waitForActiveTranslation(myRunId);
-                exportState.waitingTranslation = false;
+            const ensureTransRes = await ensureCurrentChapterTranslatedForExport(myRunId, options);
+            if (!ensureTransRes.ok) {
+                exportState.active = false;
+                const pickMsg = tTts('tts_dl_pick_region', 'Chưa xác định vùng truyện. Hãy chọn vùng nội dung trên trang rồi bấm tải lại.');
+                updatePlayerUI(pickMsg, true);
+                notifyTtsToast(pickMsg, 'warning');
+                return ensureTransRes;
             }
 
             const collected = await collectReadableSegments();
@@ -4804,7 +4934,19 @@
                 return { ok: false, error: 'no_segments' };
             }
 
+            if (!collected.usedStvLines && containsForeignCjkText(collected.segments)) {
+                exportState.active = false;
+                const errMsg = tTts(
+                    'tts_dl_untranslated_foreign',
+                    'Chương đang là văn bản tiếng nước ngoài chưa được dịch. Hãy cấu hình API Key dịch rồi thử lại.'
+                );
+                updatePlayerUI(errMsg, true);
+                notifyTtsToast(errMsg, 'warning');
+                return { ok: false, error: 'untranslated_foreign_text' };
+            }
+
             state.segments = collected.segments;
+            state.currentIndex = 0;
             state.consumedLineEls = collected.consumedEls;
             state.wasTranslated = Boolean(
                 collected.usedStvLines ||
@@ -4821,13 +4963,10 @@
                 throw new Error('EXPORT_ABORTED');
             }
 
-            const startSliceIdx = (!options.startFromBeginning && resumeIdx > 0 && resumeIdx < collected.segments.length)
-                ? resumeIdx
-                : 0;
             const exportIconOpts = getActiveIconOptions();
-            let chapterSegments = packSegmentsForExport(collected.segments.slice(startSliceIdx), exportState.maxChunkChars, exportIconOpts);
+            let chapterSegments = packSegmentsForExport(collected.segments, exportState.maxChunkChars, exportIconOpts);
             if (chapterSegments.length === 0) {
-                chapterSegments = collected.segments.slice(startSliceIdx);
+                chapterSegments = collected.segments;
             }
 
             const pcmInt16Chunks = [];

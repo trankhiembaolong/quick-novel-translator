@@ -481,21 +481,23 @@
                 try { port.disconnect(); } catch {}
             } else if (msg.type === 'error') {
                 settled = true;
-                global.STV_translationState = { active: false, runId: translationRunId };
+                const errText = msg.error || 'Translation failed';
+                global.STV_translationState = { active: false, runId: translationRunId, error: errText };
                 global.dispatchEvent(new CustomEvent('stv-translation-progress', {
-                    detail: { runId: translationRunId, active: false }
+                    detail: { runId: translationRunId, active: false, error: errText }
                 }));
                 try { port.disconnect(); } catch {}
-                notify(msg.error || 'Translation failed', 'error');
+                notify(errText, 'error');
             }
         });
 
         port.onDisconnect.addListener(() => {
             void chrome?.runtime?.lastError;
             if (!settled) {
-                global.STV_translationState = { active: false, runId: translationRunId };
+                const errText = 'Mất kết nối tiến trình dịch với extension.';
+                global.STV_translationState = { active: false, runId: translationRunId, error: errText };
                 global.dispatchEvent(new CustomEvent('stv-translation-progress', {
-                    detail: { runId: translationRunId, active: false }
+                    detail: { runId: translationRunId, active: false, error: errText }
                 }));
             }
         });

@@ -1647,7 +1647,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (request.action === 'translate_active_tab') {
-        const targetTabId = request.tabId;
+        const targetTabId = request.tabId || (sender && sender.tab && sender.tab.id);
         (async () => {
             let tabId = targetTabId;
             if (!tabId) {
@@ -1655,7 +1655,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 tabId = tab && tab.id;
             }
             if (!tabId) throw new Error('Không tìm thấy tab đang mở');
-            return await runTranslationSequence(tabId);
+            return await runTranslationSequence(tabId, {
+                suppressAutoPlay: Boolean(request.suppressAutoPlay)
+            });
         })()
             .then((data) => sendResponse({ ok: true, data }))
             .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
@@ -1901,6 +1903,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (request.action === 'get_tts_runtime_config') {
         chrome.storage.local.get([
+            'apikey',
             'ttsEngine', 'ttsWsEndpoint', 'ttsWsVoice', 'ttsWsFallback', 'ttsWsAutoFallback',
             'ttsEndpoint', 'ttsVoice', 'ttsApiKey', 'ttsSpeed', 'ttsStability', 'ttsStabilityProfile',
             'ttsAutoNext', 'ttsAutoNextChapter', 'ttsPreloadSec', 'ttsPreloadSeconds', 'ttsDownloadMinutes',
@@ -1908,6 +1911,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             'ttsIconMode', 'ttsIconStyle', TTS_ICON_CACHE_KEY, TTS_CUSTOM_ICONS_KEY,
             'stv_locale', 'stvDebugLog'
         ], (data) => {
+            data.hasTranslationApiKey = Boolean((data.apikey || '').trim());
+            delete data.apikey;
             if (data.ttsWsAutoFallback === undefined) data.ttsWsAutoFallback = data.ttsWsFallback;
             if (data.ttsStabilityProfile === undefined) data.ttsStabilityProfile = data.ttsStability;
             if (data.ttsAutoNextChapter === undefined) data.ttsAutoNextChapter = data.ttsAutoNext;
@@ -3170,8 +3175,8 @@ async function runTranslationSequence(tabId, options = {}) {
                 window.STV_startTranslation(chunks, fSize, lHeight, fFamily, opts || {});
             },
             args: [htmlChunks, currentFontSize, currentLineHeight, currentFontFamily, {
-                forceAutoPlay: Boolean(options.forceAutoPlay),
-                autoPlayAfterTranslate: Boolean(config.ttsAutoPlay)
+                forceAutoPlay: options.suppressAutoPlay ? false : Boolean(options.forceAutoPlay),
+                autoPlayAfterTranslate: options.suppressAutoPlay ? false : Boolean(config.ttsAutoPlay)
             }]
         });
 

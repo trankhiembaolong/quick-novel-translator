@@ -389,10 +389,15 @@ test('Google Colab GPU export option and GPU tier selector are wired across popu
 
 async function runColabDownloadTest({
     lines = ['Tiêu Viêm bước ra khỏi đại điện.'],
+    initialTranslated = true,
+    hasTranslationApiKey = false,
+    contentBoxText = '',
     ttsColabGpu = 'A100',
     healthData = { status: 'ok', gpu_name: 'NVIDIA A100', export_max_streams: 12 },
     workerModeHandler = (msg) => ({ ok: true, data: { mode: msg.mode, max_streams: msg.workers || 6, active_workers: msg.workers || 6 } }),
     batchPortHandler = null,
+    onSendMessage = null,
+    beforeDownload = null,
     extraSandbox = null,
     asyncDelayMs = 0
 } = {}) {
@@ -419,7 +424,28 @@ async function runColabDownloadTest({
         addEventListener() {}
     });
 
-    const lineEls = lines.map((textContent) => ({ textContent, classList: { contains: () => false } }));
+    const makeLineEl = (textContent) => {
+        const cls = new Set(['stv-line']);
+        return {
+            textContent,
+            innerText: textContent,
+            scrollIntoView() {},
+            classList: {
+                contains: (c) => cls.has(c),
+                add: (c) => cls.add(c),
+                remove: (c) => cls.delete(c)
+            }
+        };
+    };
+
+    const lineEls = initialTranslated ? lines.map(makeLineEl) : [];
+    const setTranslatedLines = (newLines) => {
+        lineEls.length = 0;
+        for (const text of newLines) {
+            lineEls.push(makeLineEl(text));
+        }
+    };
+    const windowListeners = new Map();
     const doc = {
         head: { appendChild() {} },
         body: { appendChild() {} },
@@ -460,23 +486,54 @@ async function runColabDownloadTest({
         Map,
         Promise,
         Error,
+        CustomEvent: function CustomEvent(type, init = {}) {
+            this.type = type;
+            this.detail = init.detail;
+        },
         setTimeout: (fn, ms, ...args) => {
             const handle = setTimeout(fn, ms, ...args);
             if (handle && typeof handle.unref === 'function') handle.unref();
             return handle;
         },
         clearTimeout,
-        addEventListener() {},
+        addEventListener(type, fn) {
+            if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+            windowListeners.get(type).add(fn);
+        },
+        removeEventListener(type, fn) {
+            const set = windowListeners.get(type);
+            if (set) set.delete(fn);
+        },
+        dispatchEvent(ev) {
+            const set = windowListeners.get(ev && ev.type);
+            if (!set) return true;
+            for (const fn of Array.from(set)) {
+                fn(ev);
+            }
+            return true;
+        },
+        ...(contentBoxText ? {
+            STV_activeContentBox: {
+                innerText: contentBoxText,
+                querySelector: () => null,
+                querySelectorAll: () => []
+            }
+        } : {}),
         chrome: {
             runtime: {
                 id: 'test-ext-id',
                 lastError: null,
                 sendMessage(msg, cb) {
                     messages.push(msg);
+                    if (typeof onSendMessage === 'function') {
+                        const handled = onSendMessage({ msg, cb, sandbox, setTranslatedLines });
+                        if (handled) return;
+                    }
                     if (msg.action === 'get_tts_runtime_config') {
                         cb({
                             ok: true,
                             data: {
+                                hasTranslationApiKey,
                                 ttsEngine: 'webspeech',
                                 ttsEndpoint: 'http://127.0.0.1:8000',
                                 ttsDownloadSource: 'colab_gpu',
@@ -548,8 +605,11 @@ async function runColabDownloadTest({
     sandbox.globalThis = sandbox;
     vm.runInNewContext(code, sandbox);
 
+    if (typeof beforeDownload === 'function') {
+        await beforeDownload({ sandbox, lineEls });
+    }
     const res = await sandbox.STV_TTSController.startDownload({ downloadMinutes: 1 });
-    return { res, sandbox, messages, portStarts, createdAnchorClicks, maxConcurrentStreams };
+    return { res, sandbox, messages, portStarts, createdAnchorClicks, maxConcurrentStreams, lineEls };
 }
 
 test('startTTSDownload routes colab_gpu exports independently of webspeech listening engine', async () => {
@@ -828,4 +888,136 @@ test('startTTSDownload uses OGG/Opus audioFormat and pipelines 2 concurrent stv-
     assert.ok(portStarts.every((p) => p.audioFormat === 'opus'), 'Every batch request must request audioFormat=opus');
     assert.equal(maxConcurrentBatches, 2, `Expected 2 concurrent pipelined batches, got ${maxConcurrentBatches}`);
     assert.equal(decodeCalls.length, 25, `Expected OfflineAudioContext.decodeAudioData called 25 times, got ${decodeCalls.length}`);
+});
+
+test('containsForeignCjkText distinguishes CJK/Kana/Hangul prose from Vietnamese text', () => {
+    const helpers = loadTtsHelpers();
+    assert.equal(helpers.containsForeignCjkText([{ text: '萧炎站在大殿之外，凝视着远方的火焰山脉，心中却涌起一阵莫名的悸动。' }]), true);
+    assert.equal(helpers.containsForeignCjkText(['ひらがなとカタカナと漢字が混ざった短い文章です。']), true);
+    assert.equal(helpers.containsForeignCjkText(['Tiêu Viêm đứng ngoài đại điện, chăm chú nhìn dãy núi lửa ở phương xa.']), false);
+    assert.equal(
+        helpers.containsForeignCjkText(['Dịch giả ghi chú: chữ 好 xuất hiện một lần ở giữa đoạn văn rất dài tiếng Việt này để kiểm tra bộ lọc.']),
+        false
+    );
+});
+
+test('startTTSDownload exports full chapter from line 0 even when live playback highlights a later line', async () => {
+    const pad = 'Linh khí cuộn trào khắp kinh mạch khiến khung cảnh xung quanh rung chuyển dữ dội, từng luồng ánh sáng lan tỏa khắp đại điện cổ xưa suốt một canh giờ.';
+    const lines = [
+        `Đoạn mở đầu một: ${pad}`,
+        `Đoạn tiếp hai: ${pad}`,
+        `Đoạn giữa ba: ${pad}`,
+        `Đoạn cuối bốn: ${pad}`
+    ];
+
+    class MockSpeechUtterance {
+        constructor(text) {
+            this.text = text;
+            this.rate = 1;
+            this.lang = '';
+        }
+    }
+
+    let highlightedBeforeDownload = false;
+    const { res, portStarts, lineEls, createdAnchorClicks } = await runColabDownloadTest({
+        lines,
+        ttsColabGpu: 'T4',
+        healthData: {
+            status: 'ok',
+            gpu_name: 'Tesla T4',
+            batch_supported: true,
+            batch_max_size: 16,
+            model_dtype: 'float16'
+        },
+        extraSandbox: {
+            SpeechSynthesisUtterance: MockSpeechUtterance,
+            speechSynthesis: {
+                cancel() {},
+                speak() {},
+                getVoices() { return []; }
+            }
+        },
+        async beforeDownload({ sandbox, lineEls: els }) {
+            const playRes = await sandbox.STV_TTSController.start({ engine: 'webspeech', startIndex: 2 });
+            assert.equal(playRes.ok, true);
+            assert.equal(playRes.totalSegments, 4);
+            highlightedBeforeDownload = els[2].classList.contains('stv-tts-speaking');
+        }
+    });
+
+    assert.equal(highlightedBeforeDownload, true, 'Segment 2 should be highlighted before download starts');
+    assert.equal(lineEls[2].classList.contains('stv-tts-speaking'), false, 'Download should clear live highlight');
+    assert.equal(res.ok, true, `Expected full export ok, got: ${JSON.stringify(res)}`);
+    assert.equal(createdAnchorClicks.length, 1);
+    assert.equal(portStarts.length, 1);
+    const exportedInputs = portStarts[0].inputs.join('\n');
+    for (const prefix of ['Đoạn mở đầu một', 'Đoạn tiếp hai', 'Đoạn giữa ba', 'Đoạn cuối bốn']) {
+        assert.ok(exportedInputs.includes(prefix), `Missing full-chapter segment "${prefix}" in exported batch`);
+    }
+});
+
+test('startTTSDownload auto-translates untranslated chapter with suppressAutoPlay before exporting', async () => {
+    const translatedLines = [
+        'Đoạn dịch thứ nhất: Tiêu Viêm nhẹ nhàng đẩy cánh cửa đá cổ xưa bước vào sảnh lớn.',
+        'Đoạn dịch thứ hai: Ánh lửa lập lòe chiếu rọi khắp vách đá khắc đầy minh văn kỳ bí.'
+    ];
+
+    const { res, messages, portStarts, createdAnchorClicks } = await runColabDownloadTest({
+        initialTranslated: false,
+        hasTranslationApiKey: true,
+        ttsColabGpu: 'T4',
+        healthData: {
+            status: 'ok',
+            gpu_name: 'Tesla T4',
+            batch_supported: true,
+            batch_max_size: 16,
+            model_dtype: 'float16'
+        },
+        onSendMessage({ msg, cb, sandbox, setTranslatedLines }) {
+            if (msg.action !== 'translate_active_tab') return false;
+            sandbox.STV_translationState = { active: true, runId: 7 };
+            cb({ ok: true, data: 'success' });
+            setTimeout(() => {
+                setTranslatedLines(translatedLines);
+                sandbox.STV_translationState = { active: false, runId: 7 };
+                sandbox.dispatchEvent(new sandbox.CustomEvent('stv-translation-progress', {
+                    detail: { runId: 7, active: false }
+                }));
+            }, 15);
+            return true;
+        }
+    });
+
+    assert.equal(res.ok, true, `Expected auto-translate download ok, got: ${JSON.stringify(res)}`);
+    const transMsg = messages.find((m) => m.action === 'translate_active_tab');
+    assert.ok(transMsg, 'Expected translate_active_tab to be dispatched for untranslated DOM');
+    assert.equal(transMsg.suppressAutoPlay, true, 'Auto-translation during export must suppress live auto-play');
+    assert.equal(createdAnchorClicks.length, 1);
+    assert.equal(portStarts.length, 1);
+    const exportedText = portStarts[0].inputs.join('\n');
+    assert.ok(exportedText.includes('Đoạn dịch thứ nhất'));
+    assert.ok(exportedText.includes('Đoạn dịch thứ hai'));
+});
+
+test('startTTSDownload stops cleanly without TTS requests when chapter is untranslated CJK without API key', async () => {
+    const { res, messages, portStarts, createdAnchorClicks } = await runColabDownloadTest({
+        initialTranslated: false,
+        hasTranslationApiKey: false,
+        contentBoxText: '萧炎站在大殿之外，凝视着远方的火焰山脉，心中却涌起一阵莫名的悸动。\n药老的声音在他识海中缓缓响起，提醒他小心四周潜伏的危机。',
+        ttsColabGpu: 'T4',
+        healthData: {
+            status: 'ok',
+            gpu_name: 'Tesla T4',
+            batch_supported: true,
+            batch_max_size: 16,
+            model_dtype: 'float16'
+        }
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'untranslated_foreign_text');
+    assert.equal(messages.some((m) => m.action === 'translate_active_tab'), false);
+    assert.equal(messages.some((m) => m.action === 'vieneu_set_worker_mode' && m.mode === 'export'), false);
+    assert.equal(portStarts.length, 0, 'Must not dispatch TTS synthesis on raw foreign CJK prose');
+    assert.equal(createdAnchorClicks.length, 0);
 });
