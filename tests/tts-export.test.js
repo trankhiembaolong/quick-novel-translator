@@ -393,6 +393,7 @@ async function runColabDownloadTest({
     healthData = { status: 'ok', gpu_name: 'NVIDIA A100', export_max_streams: 12 },
     workerModeHandler = (msg) => ({ ok: true, data: { mode: msg.mode, max_streams: msg.workers || 6, active_workers: msg.workers || 6 } }),
     batchPortHandler = null,
+    extraSandbox = null,
     asyncDelayMs = 0
 } = {}) {
     const code = fs.readFileSync(path.resolve(__dirname, '..', 'tts-player.js'), 'utf8');
@@ -540,6 +541,9 @@ async function runColabDownloadTest({
             }
         }
     };
+    if (extraSandbox && typeof extraSandbox === 'object') {
+        Object.assign(sandbox, extraSandbox);
+    }
     sandbox.window = sandbox;
     sandbox.globalThis = sandbox;
     vm.runInNewContext(code, sandbox);
@@ -671,8 +675,8 @@ test('STV_StvbStreamParser decodes fragmented STVB v1 streams including empty it
     const fullStream = Buffer.concat([hdr, wrap(item0), wrap(item1), wrap(item2)]);
 
     const received = [];
-    const parser = createStvbStreamParser((idx, bytes, sr) => {
-        received.push({ idx, sr, buf: Buffer.from(bytes), b64: uint8ArrayToBase64(bytes) });
+    const parser = createStvbStreamParser((idx, bytes, sr, codec) => {
+        received.push({ idx, sr, codec, buf: Buffer.from(bytes), b64: uint8ArrayToBase64(bytes) });
         return true;
     }, 24000);
 
@@ -690,11 +694,35 @@ test('STV_StvbStreamParser decodes fragmented STVB v1 streams including empty it
 
     assert.equal(received.length, 3);
     assert.equal(received[0].sr, 24000);
+    assert.equal(received[0].codec, 'pcm');
     assert.deepStrictEqual(received[0].buf, item0);
     assert.equal(received[1].buf.length, 0);
     assert.equal(received[1].b64, '');
     assert.deepStrictEqual(received[2].buf, item2);
     assert.deepStrictEqual(Buffer.from(received[2].b64, 'base64'), item2);
+
+    // Verify STVB v2 (OGG/Opus) fragmented decoding
+    const hdrV2 = Buffer.alloc(16);
+    hdrV2.write('STVB', 0, 'ascii');
+    hdrV2.writeUInt32LE(2, 4);
+    hdrV2.writeUInt32LE(48000, 8);
+    hdrV2.writeUInt32LE(2, 12);
+    const v2Opus = Buffer.from('OggS-mock-opus-payload', 'ascii');
+    const v2Stream = Buffer.concat([hdrV2, wrap(v2Opus), wrap(Buffer.alloc(0))]);
+    const v2Received = [];
+    const v2Parser = createStvbStreamParser((idx, bytes, sr, codec) => {
+        v2Received.push({ idx, sr, codec, buf: Buffer.from(bytes) });
+        return true;
+    }, 24000);
+    for (let i = 0; i < v2Stream.length; i += 3) {
+        v2Parser.push(new Uint8Array(v2Stream.subarray(i, Math.min(v2Stream.length, i + 3))));
+    }
+    v2Parser.finish();
+    assert.equal(v2Received.length, 2);
+    assert.equal(v2Received[0].codec, 'opus');
+    assert.equal(v2Received[0].sr, 48000);
+    assert.deepStrictEqual(v2Received[0].buf, v2Opus);
+    assert.equal(v2Received[1].buf.length, 0);
 
     const truncParser = createStvbStreamParser(() => true, 24000);
     truncParser.push(new Uint8Array(fullStream.subarray(0, fullStream.length - 5)));
@@ -737,4 +765,67 @@ test('synthesizeBatchForExport ignores keepalive and resumes remaining items aft
     assert.equal(createdAnchorClicks.length, 1);
     assert.equal(seenInputsPerCall.length, 2, 'Should reconnect exactly once after partial disconnect');
     assert.equal(seenInputsPerCall[1].length, seenInputsPerCall[0].length - 2, 'Retry must request ONLY remaining items');
+});
+
+test('startTTSDownload uses OGG/Opus audioFormat and pipelines 2 concurrent stv-tts-batch requests', async () => {
+    const longParagraph = 'Tiêu Viêm đứng trước cửa đá cổ xưa, đấu khí ngưng tụ nơi đầu ngón tay chuẩn bị phá giải phong ấn đã ngủ yên suốt ngàn năm.';
+    // 25 distinct long segments -> with T4 batch_max_size=16 -> 2 batches (16 + 9)
+    const lines = Array.from({ length: 25 }, (_, i) => `Mục ${i + 1}: ${longParagraph} ${longParagraph}`);
+    let inFlightBatches = 0;
+    let maxConcurrentBatches = 0;
+    const decodeCalls = [];
+    const opusB64 = Buffer.from('OggS-fake-opus-stream').toString('base64');
+
+    const { res, portStarts, createdAnchorClicks } = await runColabDownloadTest({
+        lines,
+        ttsColabGpu: 'T4',
+        healthData: {
+            status: 'ok',
+            gpu_name: 'Tesla T4',
+            batch_supported: true,
+            batch_max_size: 16,
+            batch_codecs: ['opus', 'pcm'],
+            model_dtype: 'float16'
+        },
+        extraSandbox: {
+            OfflineAudioContext: class MockOfflineAudioContext {
+                decodeAudioData(arrayBuf) {
+                    decodeCalls.push(arrayBuf.byteLength);
+                    const samples = new Float32Array(9600);
+                    samples.fill(0.15);
+                    return Promise.resolve({
+                        sampleRate: 48000,
+                        getChannelData: () => samples
+                    });
+                }
+            }
+        },
+        batchPortHandler({ msg, listeners }) {
+            inFlightBatches += 1;
+            maxConcurrentBatches = Math.max(maxConcurrentBatches, inFlightBatches);
+            setTimeout(() => {
+                msg.inputs.forEach((_, idx) => {
+                    listeners.msg.forEach((fn) => fn({
+                        type: 'item',
+                        index: idx,
+                        audio: opusB64,
+                        sampleRate: 48000,
+                        codec: 'opus'
+                    }));
+                });
+                inFlightBatches -= 1;
+                listeners.msg.forEach((fn) => fn({
+                    type: 'done',
+                    stats: { audioSec: 5.0, wallSec: 0.2, speedup: 25.0, dtype: 'float16', codec: 'opus' }
+                }));
+            }, 20);
+        }
+    });
+
+    assert.equal(res.ok, true, `Expected pipelined opus batch ok, got: ${JSON.stringify(res)}`);
+    assert.equal(createdAnchorClicks.length, 1);
+    assert.equal(portStarts.length, 2, `Expected 2 batches for 25 segments, got ${portStarts.length}`);
+    assert.ok(portStarts.every((p) => p.audioFormat === 'opus'), 'Every batch request must request audioFormat=opus');
+    assert.equal(maxConcurrentBatches, 2, `Expected 2 concurrent pipelined batches, got ${maxConcurrentBatches}`);
+    assert.equal(decodeCalls.length, 25, `Expected OfflineAudioContext.decodeAudioData called 25 times, got ${decodeCalls.length}`);
 });

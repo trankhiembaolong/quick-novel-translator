@@ -9,9 +9,11 @@ with permissive CORS so the browser extension can connect over an HTTPS Cloudfla
 from __future__ import annotations
 
 import atexit
+import io
 import json
 import logging
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -138,6 +140,23 @@ def _detect_model_dtype_label(eng, fallback: str = "unknown") -> str:
     return fallback
 
 
+def _resample_float32(arr, src_sr: int, target_sr: int):
+    """Resample a 1D float32 numpy waveform from ``src_sr`` to ``target_sr``."""
+    import numpy as np
+
+    if arr.size == 0 or target_sr == src_sr:
+        return arr
+    try:
+        import soxr
+
+        return np.asarray(soxr.resample(arr, src_sr, target_sr, quality="HQ"), dtype=np.float32)
+    except Exception:
+        out_len = max(1, int(round(arr.size * (target_sr / float(src_sr)))))
+        xp = np.linspace(0.0, 1.0, arr.size, endpoint=False)
+        x = np.linspace(0.0, 1.0, out_len, endpoint=False)
+        return np.asarray(np.interp(x, xp, arr), dtype=np.float32)
+
+
 def _wav_to_pcm16_bytes(wav, src_sr: int, target_sr: int, oai) -> bytes:
     """Resample float32 waveform from ``src_sr`` to ``target_sr`` and encode s16le PCM."""
     import numpy as np
@@ -145,20 +164,82 @@ def _wav_to_pcm16_bytes(wav, src_sr: int, target_sr: int, oai) -> bytes:
     arr = np.asarray(wav, dtype=np.float32).reshape(-1)
     if arr.size == 0:
         return b""
-    if target_sr != src_sr:
-        try:
-            import soxr
-
-            arr = np.asarray(soxr.resample(arr, src_sr, target_sr, quality="HQ"), dtype=np.float32)
-        except Exception:
-            out_len = max(1, int(round(arr.size * (target_sr / float(src_sr)))))
-            xp = np.linspace(0.0, 1.0, arr.size, endpoint=False)
-            x = np.linspace(0.0, 1.0, out_len, endpoint=False)
-            arr = np.asarray(np.interp(x, xp, arr), dtype=np.float32)
+    arr = _resample_float32(arr, src_sr, target_sr)
     pcm_fn = getattr(oai, "_pcm16", None)
     if callable(pcm_fn):
         return pcm_fn(arr)
     return (np.asarray(arr, dtype=np.float32) * 32767).clip(-32768, 32767).astype("<i2").tobytes()
+
+
+def _detect_opus_encoder() -> str:
+    """Return available OGG/Opus encoder: ``soundfile``, ``ffmpeg``, or ``none``."""
+    try:
+        import soundfile as sf
+
+        subtypes = sf.available_subtypes("OGG")
+        if isinstance(subtypes, dict) and "OPUS" in subtypes:
+            return "soundfile"
+    except Exception:
+        pass
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+    return "none"
+
+
+def _wav_to_opus_bytes(wav, src_sr: int, encoder: str) -> bytes:
+    """Encode 1D float32 waveform into OGG/Opus container bytes (~6-8x smaller than PCM)."""
+    import numpy as np
+
+    arr = np.asarray(wav, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return b""
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).clip(-1.0, 1.0)
+    enc_sr = src_sr if src_sr in (8000, 12000, 16000, 24000, 48000) else 48000
+    arr = _resample_float32(arr, src_sr, enc_sr)
+
+    if encoder == "soundfile":
+        import soundfile as sf
+
+        buf = io.BytesIO()
+        try:
+            sf.write(buf, arr, enc_sr, format="OGG", subtype="OPUS", compression_level=0.8)
+        except TypeError:
+            buf = io.BytesIO()
+            sf.write(buf, arr, enc_sr, format="OGG", subtype="OPUS")
+        return buf.getvalue()
+
+    if encoder == "ffmpeg":
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "f32le",
+                "-ar",
+                str(enc_sr),
+                "-ac",
+                "1",
+                "-i",
+                "pipe:0",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "56k",
+                "-vbr",
+                "on",
+                "-f",
+                "ogg",
+                "pipe:1",
+            ],
+            input=arr.astype("<f4").tobytes(),
+            capture_output=True,
+            check=True,
+        )
+        return proc.stdout
+
+    raise RuntimeError("No OGG/Opus encoder available")
 
 
 def detect_cuda_gpu() -> Tuple[str, float]:
@@ -645,6 +726,7 @@ def _setup_cors_and_routes(
                 "X-Batch-Wall-Sec",
                 "X-Batch-Speedup",
                 "X-Batch-Dtype",
+                "X-Batch-Codec",
                 "X-Sample-Rate",
             ],
         )
@@ -664,6 +746,7 @@ def _setup_cors_and_routes(
         inputs: List[str] = Field(min_length=1, max_length=64)
         voice: Optional[str] = None
         sample_rate: int = 24000
+        audio_format: str = "pcm"
         temperature: float = Field(0.4, ge=0.0, le=2.0, allow_inf_nan=False)
         top_k: int = Field(12, ge=1, le=1024)
         top_p: float = Field(0.85, gt=0.0, le=1.0, allow_inf_nan=False)
@@ -681,6 +764,7 @@ def _setup_cors_and_routes(
     lease_lock = threading.Lock()
     batch_lock = threading.Lock()
     batch_stats = {"total_batches": 0, "total_audio_sec": 0.0, "last_speedup": 0.0}
+    opus_encoder = _detect_opus_encoder()
 
     @oai.app.get("/health")
     def health():
@@ -700,6 +784,7 @@ def _setup_cors_and_routes(
             "export_max_streams": cap,
             "batch_supported": True,
             "batch_max_size": batch_cap,
+            "batch_codecs": (["opus", "pcm"] if opus_encoder != "none" else ["pcm"]),
             "model_dtype": _detect_model_dtype_label(eng, model_dtype),
             "stats": {
                 "total_batches": batch_stats["total_batches"],
@@ -792,16 +877,34 @@ def _setup_cors_and_routes(
             actual_dtype,
         )
 
+        use_opus = str(req.audio_format or "pcm").strip().lower() == "opus" and opus_encoder != "none"
+        stvb_version = 2 if use_opus else 1
+        codec_label = "opus" if use_opus else "pcm"
+        wire_sr = 48000 if use_opus else req.sample_rate
+
         def _stream_stvb():
-            yield b"STVB" + struct.pack("<III", 1, req.sample_rate, len(req.inputs))
+            t_stream = time.perf_counter()
+            total_bytes = 16
+            yield b"STVB" + struct.pack("<III", stvb_version, wire_sr, len(req.inputs))
             for idx in range(len(req.inputs)):
                 if idx in wavs_by_index:
-                    pcm_bytes = _wav_to_pcm16_bytes(wavs_by_index[idx], src_sr, req.sample_rate, oai)
+                    if use_opus:
+                        item_bytes = _wav_to_opus_bytes(wavs_by_index[idx], src_sr, opus_encoder)
+                    else:
+                        item_bytes = _wav_to_pcm16_bytes(wavs_by_index[idx], src_sr, req.sample_rate, oai)
                 else:
-                    pcm_bytes = b""
-                yield struct.pack("<I", len(pcm_bytes))
-                if pcm_bytes:
-                    yield pcm_bytes
+                    item_bytes = b""
+                total_bytes += 4 + len(item_bytes)
+                yield struct.pack("<I", len(item_bytes))
+                if item_bytes:
+                    yield item_bytes
+            log.info(
+                "📦 BATCH sent: items=%d codec=%s size=%.2fMB stream=%.2fs",
+                len(req.inputs),
+                codec_label,
+                total_bytes / (1024.0 * 1024.0),
+                time.perf_counter() - t_stream,
+            )
 
         return StreamingResponse(
             _stream_stvb(),
@@ -812,6 +915,7 @@ def _setup_cors_and_routes(
                 "X-Batch-Wall-Sec": f"{wall_sec:.2f}",
                 "X-Batch-Speedup": f"{speedup:.1f}",
                 "X-Batch-Dtype": actual_dtype,
+                "X-Batch-Codec": codec_label,
                 "Cache-Control": "no-store",
             },
         )

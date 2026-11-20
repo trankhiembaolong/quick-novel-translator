@@ -383,6 +383,45 @@
     const IS_LITTLE_ENDIAN = new Uint8Array(new Int16Array([1]).buffer)[0] === 1;
     const INV_INT16_SCALE = 1 / 32768;
 
+    function decodeBase64ToUint8Array(base64Str) {
+        if (!base64Str) return new Uint8Array(0);
+        const binary = atob(base64Str);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
+    }
+
+    let exportDecodeCtx = null;
+    function getExportDecodeAudioContext() {
+        const OfflineCtx = global.OfflineAudioContext || global.webkitOfflineAudioContext;
+        if (typeof OfflineCtx !== 'function') return null;
+        if (!exportDecodeCtx) {
+            try {
+                exportDecodeCtx = new OfflineCtx(1, 1, EXPORT_SAMPLE_RATE);
+            } catch {
+                return null;
+            }
+        }
+        return exportDecodeCtx;
+    }
+
+    async function decodeOpusBase64ToFloat32(base64Str, targetSr = EXPORT_SAMPLE_RATE) {
+        if (!base64Str) {
+            return { samples: new Float32Array(0), sampleRate: targetSr };
+        }
+        const ctx = getExportDecodeAudioContext();
+        if (!ctx || typeof ctx.decodeAudioData !== 'function') {
+            throw new Error('Trình duyệt không hỗ trợ decode OGG/Opus offline.');
+        }
+        const bytes = decodeBase64ToUint8Array(base64Str);
+        const ownedBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        const audioBuf = await ctx.decodeAudioData(ownedBuffer);
+        const samples = new Float32Array(audioBuf.getChannelData(0));
+        return { samples, sampleRate: audioBuf.sampleRate || targetSr };
+    }
+
     function decodePcm16Base64ToFloat32(base64Str) {
         const binary = atob(base64Str);
         const evenLen = binary.length - (binary.length % 2);
@@ -1236,6 +1275,7 @@
         leaseId: null,
         useColabGpu: false,
         useBatchApi: false,
+        useBatchOpus: false,
         batchSize: 16,
         effectiveEngine: 'ws_default',
         effectiveServerUrl: '',
@@ -3920,6 +3960,11 @@
             exportState.targetWorkers = colabCfg.workers;
             exportState.maxChunkChars = colabCfg.maxChunkChars;
             exportState.useBatchApi = Boolean(health && health.batch_supported);
+            exportState.useBatchOpus = Boolean(
+                exportState.useBatchApi
+                && getExportDecodeAudioContext()
+                && (!Array.isArray(health?.batch_codecs) || health.batch_codecs.includes('opus'))
+            );
             exportState.batchSize = getColabGpuBatchSize(state.colabGpuTier, health);
             const gpuLabel = (health && health.gpu_name) ? health.gpu_name : colabCfg.tier;
             if (exportState.useBatchApi) {
@@ -4204,23 +4249,26 @@
             pushStretchedFloat32(processed, effectiveSr);
         };
 
+        const pushFloat32Pcm = (rawChunk, sampleRate) => {
+            if (!rawChunk || rawChunk.length === 0) return;
+            const sr = sampleRate || EXPORT_SAMPLE_RATE;
+            lastSr = sr;
+            if (!anchorTrimmer || anchorRate !== sr) {
+                anchorRate = sr;
+                anchorTrimmer = createAnchorTrimmer(sr);
+            }
+            const trimmed = anchorTrimmer.push(rawChunk);
+            if (trimmed && trimmed.length > 0) {
+                pushTrimmedRaw(trimmed, sr);
+            }
+        };
+
         return {
             pushStretchedFloat32,
+            pushFloat32Pcm,
             pushBase64Pcm(b64Audio, sampleRate) {
                 if (!b64Audio) return;
-                const sr = sampleRate || EXPORT_SAMPLE_RATE;
-                lastSr = sr;
-                if (!anchorTrimmer || anchorRate !== sr) {
-                    anchorRate = sr;
-                    anchorTrimmer = createAnchorTrimmer(sr);
-                }
-                const rawChunk = decodePcm16Base64ToFloat32(b64Audio);
-                if (rawChunk.length > 0) {
-                    const trimmed = anchorTrimmer.push(rawChunk);
-                    if (trimmed && trimmed.length > 0) {
-                        pushTrimmedRaw(trimmed, sr);
-                    }
-                }
+                pushFloat32Pcm(decodePcm16Base64ToFloat32(b64Audio), sampleRate);
             },
             finish() {
                 if (anchorTrimmer) {
@@ -4239,6 +4287,14 @@
     function decodeAndPostProcessExportPcm(base64Audio, sampleRate) {
         const collector = createExportPcmCollector();
         collector.pushBase64Pcm(base64Audio, sampleRate);
+        return collector.finish();
+    }
+
+    async function decodeAndPostProcessExportOpus(base64Audio, sampleRate) {
+        if (!base64Audio) return { chunks: [], totalSamples: 0 };
+        const decoded = await decodeOpusBase64ToFloat32(base64Audio, sampleRate || EXPORT_SAMPLE_RATE);
+        const collector = createExportPcmCollector();
+        collector.pushFloat32Pcm(decoded.samples, decoded.sampleRate);
         return collector.finish();
     }
 
@@ -4279,6 +4335,8 @@
 
             let settled = false;
             const items = new Array(subsetTexts.length).fill(null);
+            const pendingDecodes = [];
+            let itemDecodeFailed = false;
             let inactivityTimer = null;
             let hardTimer = null;
 
@@ -4331,10 +4389,27 @@
                 if (msg.type === 'item') {
                     const idx = Number(msg.index);
                     if (Number.isInteger(idx) && idx >= 0 && idx < items.length) {
-                        items[idx] = decodeAndPostProcessExportPcm(msg.audio, msg.sampleRate || EXPORT_SAMPLE_RATE);
+                        if (msg.codec === 'opus') {
+                            const decodePromise = decodeAndPostProcessExportOpus(
+                                msg.audio,
+                                msg.sampleRate || EXPORT_SAMPLE_RATE
+                            ).then((seg) => {
+                                if (!settled) items[idx] = seg;
+                            }).catch((decodeErr) => {
+                                itemDecodeFailed = true;
+                                finishErr(decodeErr);
+                            });
+                            pendingDecodes.push(decodePromise);
+                        } else {
+                            items[idx] = decodeAndPostProcessExportPcm(msg.audio, msg.sampleRate || EXPORT_SAMPLE_RATE);
+                        }
                     }
                 } else if (msg.type === 'done') {
-                    finishOk(msg.stats);
+                    Promise.all(pendingDecodes).then(() => {
+                        if (!settled && !itemDecodeFailed) {
+                            finishOk(msg.stats);
+                        }
+                    }, finishErr);
                 } else if (msg.type === 'error') {
                     const err = Object.assign(new Error(msg.error || 'Lỗi VieNeu Batch GPU'), {
                         unsupported: Boolean(msg.unsupported)
@@ -4345,13 +4420,15 @@
 
             port.onDisconnect.addListener(() => {
                 void chrome?.runtime?.lastError;
-                if (!settled) {
+                if (settled) return;
+                Promise.allSettled(pendingDecodes).then(() => {
+                    if (settled) return;
                     const err = Object.assign(new Error('Kết nối VieNeu Batch GPU bị ngắt khi đang tạo audio.'), {
                         portDisconnected: true,
                         partialItems: items
                     });
                     finishErr(err);
-                }
+                });
             });
 
             try {
@@ -4364,6 +4441,7 @@
                     serverUrl: exportState.effectiveServerUrl,
                     apiKey: state.apiKey,
                     sampleRate: EXPORT_SAMPLE_RATE,
+                    audioFormat: exportState.useBatchOpus ? 'opus' : 'pcm',
                     sampling,
                     batchSize: exportState.batchSize
                 });
@@ -4683,6 +4761,7 @@
                 const colabCfg = getColabGpuExportConfig(resolvedColabTier);
                 exportState.useColabGpu = true;
                 exportState.useBatchApi = false;
+                exportState.useBatchOpus = false;
                 exportState.batchSize = getColabGpuBatchSize(resolvedColabTier);
                 exportState.effectiveEngine = 'vieneu';
                 exportState.effectiveServerUrl = resolvedColabUrl;
@@ -4692,6 +4771,7 @@
             } else {
                 exportState.useColabGpu = false;
                 exportState.useBatchApi = false;
+                exportState.useBatchOpus = false;
                 exportState.batchSize = 16;
                 exportState.effectiveEngine = state.engine;
                 exportState.effectiveServerUrl = state.serverUrl;
@@ -4806,44 +4886,76 @@
                     let batchHandledAll = false;
                     if (exportState.useColabGpu && exportState.useBatchApi) {
                         const bs = Math.max(1, Math.min(32, Number(exportState.batchSize) || 16));
-                        let batchStart = 0;
-                        let fellBackToStream = false;
-                        while (batchStart < N) {
-                            if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) {
-                                break;
-                            }
-                            const batchSlice = chapterSegments.slice(batchStart, batchStart + bs);
-                            exportState.segIndex = Math.min(N, batchStart + batchSlice.length);
-                            updatePlayerUI();
-                            try {
-                                const batchRes = await synthesizeBatchForExport(
-                                    batchSlice.map((seg) => seg.text),
-                                    myRunId
-                                );
-                                if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) {
-                                    break;
-                                }
-                                const items = Array.isArray(batchRes?.items) ? batchRes.items : [];
-                                for (let k = 0; k < batchSlice.length; k++) {
-                                    results[batchStart + k] = items[k] || { chunks: [], totalSamples: 0 };
-                                }
-                                completedCount += batchSlice.length;
-                                commitReadySegments();
-                                exportState.segIndex = Math.min(N, completedCount);
-                                updatePlayerUI();
-                                batchStart += batchSlice.length;
-                            } catch (batchErr) {
-                                if (batchErr?.unsupported) {
-                                    ttsLog('Colab /v1/audio/batch unsupported, falling back to /v1/audio/speech');
-                                    exportState.useBatchApi = false;
-                                    batchFallbackStartIdx = batchStart;
-                                    fellBackToStream = true;
-                                    break;
-                                }
-                                throw batchErr;
-                            }
+                        const batches = [];
+                        for (let start = 0; start < N; start += bs) {
+                            batches.push({
+                                start,
+                                texts: chapterSegments.slice(start, start + bs).map((seg) => seg.text)
+                            });
                         }
-                        batchHandledAll = !fellBackToStream;
+                        let nextBatchIdx = 0;
+                        let batchFatalErr = null;
+                        let unsupportedErr = false;
+
+                        const runBatchWorker = async () => {
+                            while (true) {
+                                if (
+                                    exportState.aborted ||
+                                    exportState.savePartialRequested ||
+                                    exportState.runId !== myRunId ||
+                                    batchFatalErr ||
+                                    unsupportedErr
+                                ) {
+                                    return;
+                                }
+                                const bIdx = nextBatchIdx++;
+                                if (bIdx >= batches.length) return;
+                                const batch = batches[bIdx];
+
+                                exportState.segIndex = Math.min(N, Math.max(exportState.segIndex, batch.start + batch.texts.length));
+                                updatePlayerUI();
+
+                                try {
+                                    const batchRes = await synthesizeBatchForExport(batch.texts, myRunId);
+                                    if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) {
+                                        return;
+                                    }
+                                    const items = Array.isArray(batchRes?.items) ? batchRes.items : [];
+                                    for (let k = 0; k < batch.texts.length; k++) {
+                                        results[batch.start + k] = items[k] || { chunks: [], totalSamples: 0 };
+                                    }
+                                    completedCount += batch.texts.length;
+                                    commitReadySegments();
+                                    exportState.segIndex = Math.min(N, completedCount);
+                                    updatePlayerUI();
+                                } catch (batchErr) {
+                                    if (batchErr?.unsupported) {
+                                        unsupportedErr = true;
+                                        exportState.useBatchApi = false;
+                                        return;
+                                    }
+                                    if (!batchFatalErr) batchFatalErr = batchErr;
+                                    if (batchErr?.message !== 'EXPORT_SAVE_PARTIAL' && batchErr?.message !== 'EXPORT_ABORTED') {
+                                        abortActiveExportNetwork();
+                                    }
+                                    return;
+                                }
+                            }
+                        };
+
+                        const batchWorkers = Math.min(2, batches.length);
+                        await Promise.all(Array.from({ length: batchWorkers }, () => runBatchWorker()));
+
+                        if (unsupportedErr) {
+                            ttsLog('Colab /v1/audio/batch unsupported, falling back to /v1/audio/speech');
+                            exportState.useBatchApi = false;
+                            batchFallbackStartIdx = nextCommitIdx;
+                            batchHandledAll = false;
+                        } else if (batchFatalErr) {
+                            throw batchFatalErr;
+                        } else {
+                            batchHandledAll = true;
+                        }
                     }
 
                     if (!batchHandledAll && !exportState.aborted && !exportState.savePartialRequested && exportState.runId === myRunId) {
@@ -4858,6 +4970,7 @@
                                 }
                                 const idx = nextAssignIdx++;
                                 if (idx >= N) return;
+                                if (results[idx]) continue;
 
                                 exportState.segIndex = Math.min(N, Math.max(exportState.segIndex, idx + 1));
                                 updatePlayerUI();
@@ -5009,6 +5122,7 @@
                 exportState.leaseId = null;
                 exportState.useColabGpu = false;
                 exportState.useBatchApi = false;
+                exportState.useBatchOpus = false;
                 exportState.batchSize = 16;
                 exportState.effectiveEngine = 'ws_default';
                 exportState.effectiveServerUrl = '';

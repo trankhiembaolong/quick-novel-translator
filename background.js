@@ -2598,6 +2598,7 @@ function uint8ArrayToBase64(bytes) {
 function createStvbStreamParser(onItem, fallbackSampleRate = 24000) {
     let stash = new Uint8Array(0);
     let headerParsed = false;
+    let codec = 'pcm';
     let sampleRate = Number(fallbackSampleRate) || 24000;
     let expectedCount = 0;
     let emittedCount = 0;
@@ -2633,9 +2634,10 @@ function createStvbStreamParser(onItem, fallbackSampleRate = 24000) {
             }
             const view = new DataView(stash.buffer, stash.byteOffset, 16);
             const version = view.getUint32(4, true);
-            if (version !== 1) {
+            if (version !== 1 && version !== 2) {
                 throw new Error(`Phiên bản STVB không được hỗ trợ: ${version}`);
             }
+            codec = version === 2 ? 'opus' : 'pcm';
             sampleRate = view.getUint32(8, true) || sampleRate;
             expectedCount = view.getUint32(12, true);
             headerParsed = true;
@@ -2657,7 +2659,7 @@ function createStvbStreamParser(onItem, fallbackSampleRate = 24000) {
             pendingItemLen = -1;
             const idx = emittedCount;
             emittedCount += 1;
-            const keepGoing = onItem(idx, payload, sampleRate);
+            const keepGoing = onItem(idx, payload, sampleRate, codec);
             if (keepGoing === false) {
                 stash = new Uint8Array(0);
                 return false;
@@ -2761,6 +2763,7 @@ function handleTtsBatchPortConnection(port) {
             model: 'vieneu-v3-turbo',
             inputs,
             sample_rate: sampleRate,
+            audio_format: msg.audioFormat === 'opus' ? 'opus' : 'pcm',
             ...buildVieNeuSamplingParams(msg.sampling, 380)
         };
         if (msg.voice) body.voice = msg.voice;
@@ -2823,10 +2826,10 @@ function handleTtsBatchPortConnection(port) {
                 return;
             }
 
-            const parser = createStvbStreamParser((idx, payloadBytes, respSampleRate) => {
+            const parser = createStvbStreamParser((idx, payloadBytes, respSampleRate, codec) => {
                 if (disconnected || controller.signal.aborted) return false;
                 const b64 = uint8ArrayToBase64(payloadBytes);
-                if (!safePortPost(port, { type: 'item', index: idx, audio: b64, sampleRate: respSampleRate })) {
+                if (!safePortPost(port, { type: 'item', index: idx, audio: b64, sampleRate: respSampleRate, codec })) {
                     abortCurrent();
                     return false;
                 }
@@ -2856,7 +2859,8 @@ function handleTtsBatchPortConnection(port) {
                 audioSec: Number(response.headers?.get('X-Batch-Audio-Sec') || 0) || 0,
                 wallSec: Number(response.headers?.get('X-Batch-Wall-Sec') || 0) || 0,
                 speedup: Number(response.headers?.get('X-Batch-Speedup') || 0) || 0,
-                dtype: response.headers?.get('X-Batch-Dtype') || ''
+                dtype: response.headers?.get('X-Batch-Dtype') || '',
+                codec: response.headers?.get('X-Batch-Codec') || ''
             };
             if (!disconnected && !controller.signal.aborted) {
                 safePortPost(port, { type: 'done', stats });
