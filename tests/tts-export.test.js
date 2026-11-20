@@ -307,3 +307,213 @@ test('packSegmentsForExport avoids multi-part rawText duplication and double ico
     assert.equal(packedKaomoji[1].needsAiIconResolve, true);
     assert.ok(!/biểu cảm\s+biểu cảm/i.test(packedKaomoji[1].text), `Must not double-wrap tag: ${packedKaomoji[1].text}`);
 });
+
+test('getColabGpuExportConfig returns exact workers and maxChunkChars per GPU tier and auto-scales from healthData', () => {
+    const helpers = loadTtsHelpers();
+    assert.equal(typeof helpers.getColabGpuExportConfig, 'function');
+
+    assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('T4') }, { tier: 'T4', workers: 6, maxChunkChars: 300 });
+    assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('L4') }, { tier: 'L4', workers: 8, maxChunkChars: 320 });
+    assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('A100') }, { tier: 'A100', workers: 12, maxChunkChars: 350 });
+    assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('auto') }, { tier: 'auto', workers: 6, maxChunkChars: 300 });
+    assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('auto', { export_max_streams: 8 }) }, { tier: 'auto', workers: 8, maxChunkChars: 300 });
+    assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('auto', { export_max_streams: 12 }) }, { tier: 'auto', workers: 12, maxChunkChars: 300 });
+    assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('auto', { export_max_streams: 24 }) }, { tier: 'auto', workers: 12, maxChunkChars: 300 });
+    assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('T4', { export_max_streams: 12 }) }, { tier: 'T4', workers: 6, maxChunkChars: 300 });
+    assert.deepStrictEqual({ ...helpers.getColabGpuExportConfig('unknown-tier') }, { tier: 'T4', workers: 6, maxChunkChars: 300 });
+});
+
+test('Google Colab GPU export option and GPU tier selector are wired across popup, i18n, background, tts-player, and colab assets', () => {
+    const root = path.resolve(__dirname, '..');
+    const html = fs.readFileSync(path.join(root, 'popup.html'), 'utf8');
+    const popupJs = fs.readFileSync(path.join(root, 'popup.js'), 'utf8');
+    const backgroundJs = fs.readFileSync(path.join(root, 'background.js'), 'utf8');
+    const playerJs = fs.readFileSync(path.join(root, 'tts-player.js'), 'utf8');
+    const runnerPy = fs.readFileSync(path.join(root, 'colab', 'vieneu_colab_runner.py'), 'utf8');
+    const notebook = JSON.parse(fs.readFileSync(path.join(root, 'colab', 'VieNeu_Colab_GPU.ipynb'), 'utf8'));
+    const i18n = require(path.join(root, 'i18n.js'));
+
+    // Popup controls & GPU tier options
+    for (const id of [
+        'tts-download-source', 'tts-colab-panel', 'tts-colab-badge', 'tts-colab-status-label',
+        'tts-colab-gpu-pill', 'btn-tts-colab-open', 'btn-tts-colab-copy', 'tts-colab-url',
+        'btn-tts-colab-paste', 'tts-colab-voice', 'tts-colab-hint', 'tts-colab-gpu'
+    ]) {
+        assert.ok(html.includes(`id="${id}"`), `popup.html missing #${id}`);
+    }
+    assert.ok(html.includes('value="colab_gpu"'));
+    for (const tier of ['value="T4"', 'value="L4"', 'value="A100"', 'value="auto"']) {
+        assert.ok(html.includes(tier), `popup.html missing Colab GPU tier ${tier}`);
+    }
+
+    assert.ok(popupJs.includes('https://*.trycloudflare.com/*'));
+    assert.ok(popupJs.includes('ensureColabTunnelPermission'));
+    assert.ok(popupJs.includes('ttsDownloadSource') && popupJs.includes('ttsColabUrl') && popupJs.includes('ttsColabGpu'));
+
+    // Background & Player
+    assert.ok(backgroundJs.includes('Math.min(12, Math.floor(Number(request.workers)))'));
+    assert.ok(backgroundJs.includes('ngrok-skip-browser-warning'));
+    assert.ok(backgroundJs.includes('syncColabOriginStripRule'));
+    assert.ok(playerJs.includes('COLAB_TIER_CONFIG') && playerJs.includes('getColabGpuExportConfig'));
+    assert.ok(playerJs.includes("requestedSource === 'colab_gpu'"));
+
+    // Colab notebook & runner
+    assert.equal(notebook.metadata.accelerator, 'GPU');
+    assert.equal(notebook.metadata.colab.gpuType, 'T4');
+    assert.equal(notebook.cells[0].metadata.cellView, 'form');
+    assert.ok(runnerPy.includes('CORSMiddleware'));
+    assert.ok(runnerPy.includes('le=12'));
+    assert.ok(runnerPy.includes('"colab": True'));
+
+    // i18n keys
+    for (const key of [
+        'tts_download_source_colab', 'tts_colab_btn_open', 'tts_colab_btn_paste',
+        'settings_colab_gpu_label', 'optColabGpuT4', 'optColabGpuL4', 'optColabGpuA100', 'optColabGpuAuto'
+    ]) {
+        assert.ok(typeof i18n.DICTIONARY.vi[key] === 'string' && i18n.DICTIONARY.vi[key].length > 0, `Missing vi key ${key}`);
+        assert.ok(typeof i18n.DICTIONARY.en[key] === 'string' && i18n.DICTIONARY.en[key].length > 0, `Missing en key ${key}`);
+    }
+});
+
+test('startTTSDownload routes colab_gpu exports independently of webspeech listening engine', async () => {
+    const code = fs.readFileSync(path.resolve(__dirname, '..', 'tts-player.js'), 'utf8');
+    const messages = [];
+    const portStarts = [];
+    const createdAnchorClicks = [];
+
+    const makeEl = (tag) => ({
+        tagName: tag.toUpperCase(),
+        style: {},
+        dataset: {},
+        classList: { toggle() {}, add() {}, remove() {} },
+        setAttribute() {},
+        getAttribute() { return ''; },
+        appendChild() {},
+        append() {},
+        remove() {},
+        click() { createdAnchorClicks.push(this.download); },
+        querySelector() { return null; },
+        querySelectorAll() { return []; },
+        addEventListener() {}
+    });
+
+    const lineEl = { textContent: 'Tiêu Viêm bước ra khỏi đại điện.', classList: { contains: () => false } };
+    const doc = {
+        head: { appendChild() {} },
+        body: { appendChild() {} },
+        documentElement: { appendChild() {} },
+        contains: () => true,
+        addEventListener() {},
+        removeEventListener() {},
+        getElementById(id) {
+            if (id === 'stv-tts-root') return { shadowRoot: { innerHTML: '', append() {} } };
+            return null;
+        },
+        querySelectorAll(sel) {
+            if (sel && sel.includes('.stv-line')) return [lineEl];
+            return [];
+        },
+        createElement: makeEl
+    };
+    doc.body.querySelectorAll = doc.querySelectorAll;
+
+    const sandbox = {
+        window: undefined,
+        globalThis: {},
+        document: doc,
+        location: { href: 'https://example.com/ch1' },
+        URL: { createObjectURL: () => 'blob:mock-wav', revokeObjectURL() {} },
+        atob: (b64) => Buffer.from(b64, 'base64').toString('binary'),
+        Blob,
+        Float32Array,
+        Int16Array,
+        Uint8Array,
+        ArrayBuffer,
+        DataView,
+        Math,
+        Number,
+        String,
+        Array,
+        Set,
+        Map,
+        Promise,
+        Error,
+        setTimeout: (fn, ms, ...args) => {
+            const handle = setTimeout(fn, ms, ...args);
+            if (handle && typeof handle.unref === 'function') handle.unref();
+            return handle;
+        },
+        clearTimeout,
+        addEventListener() {},
+        chrome: {
+            runtime: {
+                id: 'test-ext-id',
+                lastError: null,
+                sendMessage(msg, cb) {
+                    messages.push(msg);
+                    if (msg.action === 'get_tts_runtime_config') {
+                        cb({
+                            ok: true,
+                            data: {
+                                ttsEngine: 'webspeech',
+                                ttsEndpoint: 'http://127.0.0.1:8000',
+                                ttsDownloadSource: 'colab_gpu',
+                                ttsColabUrl: 'https://fast-gpu.trycloudflare.com',
+                                ttsColabVoice: 'Binh',
+                                ttsColabGpu: 'A100',
+                                ttsIconMode: 'off'
+                            }
+                        });
+                    } else if (msg.action === 'vieneu_check_health') {
+                        cb({ ok: true, data: { status: 'ok', gpu_name: 'NVIDIA A100', export_max_streams: 12 } });
+                    } else if (msg.action === 'vieneu_set_worker_mode') {
+                        cb({ ok: true, data: { mode: msg.mode, max_streams: msg.workers || 6, active_workers: msg.workers || 6 } });
+                    } else {
+                        cb({ ok: true });
+                    }
+                },
+                connect({ name }) {
+                    const listeners = { msg: [], disc: [] };
+                    return {
+                        name,
+                        onMessage: { addListener: (fn) => listeners.msg.push(fn) },
+                        onDisconnect: { addListener: (fn) => listeners.disc.push(fn) },
+                        disconnect() {},
+                        postMessage(msg) {
+                            if (msg.type === 'start') {
+                                portStarts.push(msg);
+                                const pcm = new Int16Array(2400).fill(500);
+                                const b64 = Buffer.from(pcm.buffer).toString('base64');
+                                queueMicrotask(() => {
+                                    listeners.msg.forEach((fn) => fn({ type: 'chunk', audio: b64, sampleRate: 24000 }));
+                                    listeners.msg.forEach((fn) => fn({ type: 'done' }));
+                                });
+                            }
+                        }
+                    };
+                }
+            }
+        }
+    };
+    sandbox.window = sandbox;
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(code, sandbox);
+
+    const res = await sandbox.STV_TTSController.startDownload({ downloadMinutes: 1 });
+    assert.equal(res.ok, true, `Expected download ok, got: ${JSON.stringify(res)}`);
+    assert.equal(sandbox.STV_TTSController.getState().engine, 'webspeech');
+    assert.equal(portStarts.length, 1);
+    assert.equal(portStarts[0].serverUrl, 'https://fast-gpu.trycloudflare.com');
+    assert.equal(portStarts[0].voice, 'Binh');
+
+    const scaleExportMsg = messages.find((m) => m.action === 'vieneu_set_worker_mode' && m.mode === 'export');
+    assert.ok(scaleExportMsg);
+    assert.equal(scaleExportMsg.serverUrl, 'https://fast-gpu.trycloudflare.com');
+    assert.equal(scaleExportMsg.workers, 12);
+    assert.equal(scaleExportMsg.gpuTier, 'A100');
+
+    const scaleListenMsg = messages.find((m) => m.action === 'vieneu_set_worker_mode' && m.mode === 'listen');
+    assert.ok(scaleListenMsg);
+    assert.equal(scaleListenMsg.serverUrl, 'https://fast-gpu.trycloudflare.com');
+    assert.equal(createdAnchorClicks.length, 1);
+});

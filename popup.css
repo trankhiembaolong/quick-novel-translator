@@ -803,8 +803,43 @@ textarea {
 
 .badge.online {
     background: var(--success-bg);
-    color: var(--success-text);
-    border-color: var(--success-border);
+    color: var(--success-text, var(--success));
+    border-color: var(--success-border, transparent);
+}
+
+/* Google Colab GPU Export Panel */
+.colab-box {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: rgba(99, 102, 241, 0.06);
+}
+
+.colab-box .muted {
+    font-size: 11.5px;
+}
+
+.colab-box .muted.error {
+    color: var(--danger);
+}
+
+.colab-box .muted.success {
+    color: var(--success);
+}
+
+.pill-tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--primary-soft);
+    color: var(--primary);
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
 }
 
 /* Settings Accordion */

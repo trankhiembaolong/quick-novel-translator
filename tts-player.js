@@ -7,8 +7,33 @@
     const EXPORT_SAMPLE_RATE = 24000;
     const EXPORT_MAX_CHUNK_CHARS = 210;
     const EXPORT_CONCURRENCY = 3;
+    const COLAB_TIER_CONFIG = {
+        T4: { tier: 'T4', workers: 6, maxChunkChars: 300 },
+        L4: { tier: 'L4', workers: 8, maxChunkChars: 320 },
+        A100: { tier: 'A100', workers: 12, maxChunkChars: 350 },
+        auto: { tier: 'auto', workers: 6, maxChunkChars: 300, maxAutoWorkers: 12 }
+    };
     const DEFAULT_DOWNLOAD_MINUTES = 30;
     const MAX_EXPORT_CHAPTERS = 30;
+
+    function getColabGpuExportConfig(tier = 'T4', healthData = null) {
+        const raw = String(tier || 'T4').trim().toUpperCase();
+        const key = raw === 'AUTO' ? 'auto' : (COLAB_TIER_CONFIG[raw] ? raw : 'T4');
+        const base = COLAB_TIER_CONFIG[key];
+        let workers = base.workers;
+        if (healthData && typeof healthData === 'object') {
+            const reported = Number(healthData.export_max_streams || healthData.max_streams || healthData.workers);
+            if (Number.isFinite(reported) && reported >= 1) {
+                const cap = key === 'auto' ? (base.maxAutoWorkers || 12) : base.workers;
+                workers = Math.max(1, Math.min(cap, Math.floor(reported)));
+            }
+        }
+        return {
+            tier: base.tier,
+            workers,
+            maxChunkChars: base.maxChunkChars
+        };
+    }
     const MAX_CHUNK_CHARS = 240;
     const FIRST_CHUNK_PREROLL_SEC = 0.04;
     const CONTINUATION_PREROLL_SEC = 0.015;
@@ -779,7 +804,9 @@
         encodeWavFromInt16Chunks,
         extractCleanTranslatedLines,
         appendPackedSegment,
-        packSegmentsForExport
+        packSegmentsForExport,
+        COLAB_TIER_CONFIG,
+        getColabGpuExportConfig
     };
     global.splitLongTextForTTS = splitLongTextForTTS;
     global.cleanTextForSpeech = cleanTextForSpeech;
@@ -1167,6 +1194,10 @@
         autoplayUnblockedAt: 0,
         autoplayResumeBound: false,
         downloadMinutes: DEFAULT_DOWNLOAD_MINUTES,
+        downloadSource: 'current', // 'current' | 'colab_gpu'
+        colabServerUrl: '',
+        colabVoice: '',
+        colabGpuTier: 'T4',
         iconMode: 'auto', // 'auto' | 'local' | 'off'
         iconStyle: 'tagged', // 'tagged' | 'natural'
         iconLearnedCache: {},
@@ -1180,6 +1211,12 @@
         active: false,
         runId: 0,
         leaseId: null,
+        useColabGpu: false,
+        effectiveEngine: 'ws_default',
+        effectiveServerUrl: '',
+        effectiveVoice: '',
+        targetWorkers: EXPORT_CONCURRENCY,
+        maxChunkChars: EXPORT_MAX_CHUNK_CHARS,
         aborted: false,
         savePartialRequested: false,
         targetMinutes: DEFAULT_DOWNLOAD_MINUTES,
@@ -1685,6 +1722,7 @@
         }
 
         const dlSelect = el.querySelector('[data-act="dl-minutes"]');
+        const dlSourceBtn = el.querySelector('[data-act="dl-source-toggle"]');
         const dlBtn = el.querySelector('[data-act="download"]');
         const dlIdleRow = el.querySelector('[data-role="dl-idle-row"]');
         const dlActiveBox = el.querySelector('[data-role="dl-active-box"]');
@@ -1722,6 +1760,15 @@
         }
         if (dlIdleRow) dlIdleRow.hidden = exportState.active;
         if (dlActiveBox) dlActiveBox.hidden = !exportState.active;
+        if (dlSourceBtn) {
+            const hasColab = Boolean((state.colabServerUrl || '').trim());
+            const isColab = state.downloadSource === 'colab_gpu';
+            dlSourceBtn.hidden = !hasColab && !isColab;
+            dlSourceBtn.classList.toggle('active', isColab);
+            dlSourceBtn.textContent = isColab ? '⚡ Colab' : '🖥 Local';
+            dlSourceBtn.title = isColab ? 'Đang dùng Google Colab GPU để tải WAV' : 'Chuyển nhanh sang Google Colab GPU';
+            dlSourceBtn.disabled = exportState.active;
+        }
         if (dlBtn) {
             dlBtn.disabled = exportState.active;
             dlBtn.textContent = tTts('btn_tts_download', '⬇ Tải Audio (WAV)');
@@ -1796,6 +1843,7 @@
                         <option value="90">90p</option>
                         <option value="120">120p</option>
                     </select>
+                    <button type="button" class="stv-tts-pill" data-act="dl-source-toggle" hidden>🖥 Local</button>
                     <button type="button" class="stv-tts-btn stv-tts-dl-btn" data-act="download">⬇ Tải WAV</button>
                     <button type="button" class="stv-tts-btn stv-tts-dl-next" data-act="dl-goto-next" hidden>↪ Chương kế</button>
                 </div>
@@ -1838,6 +1886,17 @@
             else if (act === 'slower') changeSpeed(-0.1);
             else if (act === 'faster') changeSpeed(0.1);
             else if (act === 'autonext') toggleAutoNext();
+            else if (act === 'dl-source-toggle') {
+                state.downloadSource = state.downloadSource === 'colab_gpu' ? 'current' : 'colab_gpu';
+                if (isExtensionAlive()) {
+                    chrome.runtime.sendMessage({
+                        action: 'set_runtime_setting',
+                        key: 'ttsDownloadSource',
+                        value: state.downloadSource
+                    }, () => { void chrome.runtime.lastError; });
+                }
+                updatePlayerUI();
+            }
             else if (act === 'download') void startTTSDownload({ downloadMinutes: state.downloadMinutes });
             else if (act === 'dl-save-now') requestSavePartialDownload();
             else if (act === 'dl-cancel') cancelTTSDownload();
@@ -3704,6 +3763,13 @@
         const parsedDlMins = parseInt(options.downloadMinutes !== undefined ? options.downloadMinutes : config.ttsDownloadMinutes, 10);
         state.downloadMinutes = Number.isFinite(parsedDlMins) ? Math.max(1, Math.min(240, parsedDlMins)) : DEFAULT_DOWNLOAD_MINUTES;
 
+        const dlSourceCand = options.downloadSource !== undefined ? options.downloadSource : config.ttsDownloadSource;
+        state.downloadSource = dlSourceCand === 'colab_gpu' ? 'colab_gpu' : 'current';
+        state.colabServerUrl = (options.colabServerUrl !== undefined ? options.colabServerUrl : (config.ttsColabUrl || '')).trim().replace(/\/+$/, '');
+        state.colabVoice = (options.colabVoice !== undefined ? options.colabVoice : (config.ttsColabVoice || '')).trim();
+        const gpuTierCand = String(options.colabGpuTier !== undefined ? options.colabGpuTier : (config.ttsColabGpu || 'T4')).trim();
+        state.colabGpuTier = ['T4', 'L4', 'A100', 'auto'].includes(gpuTierCand) ? gpuTierCand : 'T4';
+
         const modeCand = options.iconMode !== undefined ? options.iconMode : config.ttsIconMode;
         state.iconMode = ['auto', 'local', 'off'].includes(modeCand) ? modeCand : 'auto';
         const styleCand = options.iconStyle !== undefined ? options.iconStyle : config.ttsIconStyle;
@@ -3804,14 +3870,69 @@
     }
 
     async function ensureMultiStreamVieNeuReady(leaseId) {
-        if (state.engine !== 'vieneu' || !isExtensionAlive()) {
+        const activeExportEngine = exportState.useColabGpu ? 'vieneu' : state.engine;
+        const targetServerUrl = exportState.useColabGpu ? exportState.effectiveServerUrl : state.serverUrl;
+        if (activeExportEngine !== 'vieneu' || !isExtensionAlive()) {
             return EXPORT_CONCURRENCY;
         }
+
+        if (exportState.useColabGpu) {
+            const health = await new Promise((resolve) => {
+                chrome.runtime.sendMessage({
+                    action: 'vieneu_check_health',
+                    serverUrl: targetServerUrl,
+                    apiKey: state.apiKey,
+                    isColab: true
+                }, (resp) => {
+                    if (chrome.runtime.lastError || !resp || !resp.ok) {
+                        resolve(null);
+                        return;
+                    }
+                    resolve(resp.data || {});
+                });
+            });
+            const colabCfg = getColabGpuExportConfig(state.colabGpuTier, health);
+            exportState.targetWorkers = colabCfg.workers;
+            exportState.maxChunkChars = colabCfg.maxChunkChars;
+            const gpuLabel = (health && health.gpu_name) ? health.gpu_name : colabCfg.tier;
+            updatePlayerUI(
+                tTts('tts_dl_scaling_colab', `Đang kết nối Colab GPU (${gpuLabel} · ${colabCfg.workers} luồng song song)...`)
+                    .replace('{gpu}', String(gpuLabel))
+                    .replace('{workers}', String(colabCfg.workers))
+            );
+            const scaled = await new Promise((resolve) => {
+                chrome.runtime.sendMessage({
+                    action: 'vieneu_set_worker_mode',
+                    serverUrl: targetServerUrl,
+                    apiKey: state.apiKey,
+                    mode: 'export',
+                    leaseId,
+                    workers: colabCfg.workers,
+                    gpuTier: colabCfg.tier
+                }, (resp) => {
+                    if (chrome.runtime.lastError || !resp || !resp.ok) {
+                        resolve(null);
+                        return;
+                    }
+                    resolve(resp.data || {});
+                });
+            });
+            if (scaled) {
+                const streams = Number(scaled.max_streams || scaled.active_workers || colabCfg.workers);
+                return Math.max(1, Math.min(12, streams));
+            }
+            if (health) {
+                const curStreams = Number(health.export_max_streams || health.max_streams || colabCfg.workers);
+                return Math.max(1, Math.min(12, curStreams));
+            }
+            return colabCfg.workers;
+        }
+
         updatePlayerUI(tTts('tts_dl_scaling_workers', 'Đang bật 3 worker VieNeu để tải nhanh hơn...'));
         const scaled = await new Promise((resolve) => {
             chrome.runtime.sendMessage({
                 action: 'vieneu_set_worker_mode',
-                serverUrl: state.serverUrl,
+                serverUrl: targetServerUrl,
                 apiKey: state.apiKey,
                 mode: 'export',
                 leaseId,
@@ -3832,7 +3953,7 @@
         const health = await new Promise((resolve) => {
             chrome.runtime.sendMessage({
                 action: 'vieneu_check_health',
-                serverUrl: state.serverUrl
+                serverUrl: targetServerUrl
             }, (resp) => {
                 if (chrome.runtime.lastError || !resp || !resp.ok) {
                     resolve(null);
@@ -3847,14 +3968,16 @@
     }
 
     function releaseExportWorkers(leaseId) {
-        if (!leaseId || state.engine !== 'vieneu' || !isExtensionAlive()) return;
+        const activeExportEngine = exportState.useColabGpu ? 'vieneu' : (exportState.effectiveEngine || state.engine);
+        const targetServerUrl = exportState.useColabGpu ? exportState.effectiveServerUrl : state.serverUrl;
+        if (!leaseId || activeExportEngine !== 'vieneu' || !isExtensionAlive()) return;
         if (exportState.leaseId === leaseId) {
             exportState.leaseId = null;
         }
         try {
             chrome.runtime.sendMessage({
                 action: 'vieneu_set_worker_mode',
-                serverUrl: state.serverUrl,
+                serverUrl: targetServerUrl,
                 apiKey: state.apiKey,
                 mode: 'listen',
                 leaseId
@@ -4030,7 +4153,8 @@
                 }
             };
 
-            if (state.engine === 'ws_default') {
+            const activeExportEngine = exportState.useColabGpu ? 'vieneu' : state.engine;
+            if (activeExportEngine === 'ws_default') {
                 const wsUrl = (state.wsEndpoint || '').trim();
                 const isOffline = (typeof navigator !== 'undefined' && navigator.onLine === false);
                 if (!wsUrl || !/^wss?:\/\//i.test(wsUrl) || typeof global.WebSocket !== 'function' || isOffline) {
@@ -4235,12 +4359,17 @@
             });
 
             try {
-                const sampling = { ...getSamplingParams(state.stabilityProfile), max_chars: 360 };
+                const targetServerUrl = exportState.useColabGpu ? exportState.effectiveServerUrl : state.serverUrl;
+                const targetVoice = exportState.useColabGpu ? exportState.effectiveVoice : state.voice;
+                const maxChars = exportState.useColabGpu
+                    ? Math.min(512, Math.max(360, (exportState.maxChunkChars || 300) + 60))
+                    : 360;
+                const sampling = { ...getSamplingParams(state.stabilityProfile), max_chars: maxChars };
                 port.postMessage({
                     type: 'start',
                     text: formatTtsInputText(segText),
-                    voice: state.voice,
-                    serverUrl: state.serverUrl,
+                    voice: targetVoice,
+                    serverUrl: targetServerUrl,
                     apiKey: state.apiKey,
                     sampleRate: EXPORT_SAMPLE_RATE,
                     sampling
@@ -4291,16 +4420,44 @@
             exportState.targetMinutes = Math.max(1, Math.min(240, Number(options.downloadMinutes || state.downloadMinutes) || DEFAULT_DOWNLOAD_MINUTES));
             state.downloadMinutes = exportState.targetMinutes;
 
+            const requestedSource = options.downloadSource || state.downloadSource || 'current';
+            const resolvedColabUrl = (options.colabServerUrl !== undefined ? options.colabServerUrl : state.colabServerUrl || '').trim().replace(/\/+$/, '');
+            const resolvedColabVoice = (options.colabVoice !== undefined ? options.colabVoice : state.colabVoice || '').trim();
+            const resolvedColabTier = options.colabGpuTier || state.colabGpuTier || 'T4';
+
             ensurePlayerUI();
             bindAltClickJump();
             bindTranslationProgress();
 
-            if (state.engine === 'webspeech') {
-                exportState.active = false;
-                const msg = tTts('tts_dl_webspeech_unsupported', 'Web Speech API không hỗ trợ xuất file WAV. Hãy chọn WebSocket TTS hoặc VieNeu.');
-                updatePlayerUI(msg, true);
-                notifyTtsToast(msg, 'warning');
-                return { ok: false, error: 'webspeech_unsupported' };
+            if (requestedSource === 'colab_gpu') {
+                if (!resolvedColabUrl || !/^https?:\/\//i.test(resolvedColabUrl)) {
+                    exportState.active = false;
+                    const colabErrMsg = tTts('tts_colab_err_url_missing', 'Hãy dán link Google Colab Tunnel (https://....trycloudflare.com) trước khi tải.');
+                    updatePlayerUI(colabErrMsg, true);
+                    notifyTtsToast(colabErrMsg, 'warning');
+                    return { ok: false, error: 'colab_url_missing' };
+                }
+                const colabCfg = getColabGpuExportConfig(resolvedColabTier);
+                exportState.useColabGpu = true;
+                exportState.effectiveEngine = 'vieneu';
+                exportState.effectiveServerUrl = resolvedColabUrl;
+                exportState.effectiveVoice = resolvedColabVoice;
+                exportState.targetWorkers = Number(options.colabWorkers) || colabCfg.workers;
+                exportState.maxChunkChars = Number(options.colabMaxChunkChars) || colabCfg.maxChunkChars;
+            } else {
+                exportState.useColabGpu = false;
+                exportState.effectiveEngine = state.engine;
+                exportState.effectiveServerUrl = state.serverUrl;
+                exportState.effectiveVoice = state.voice;
+                exportState.targetWorkers = EXPORT_CONCURRENCY;
+                exportState.maxChunkChars = EXPORT_MAX_CHUNK_CHARS;
+                if (state.engine === 'webspeech') {
+                    exportState.active = false;
+                    const msg = tTts('tts_dl_webspeech_unsupported', 'Web Speech API không hỗ trợ xuất file WAV. Hãy chọn WebSocket TTS hoặc VieNeu.');
+                    updatePlayerUI(msg, true);
+                    notifyTtsToast(msg, 'warning');
+                    return { ok: false, error: 'webspeech_unsupported' };
+                }
             }
 
             updatePlayerUI(tTts('tts_dl_starting', `Đang chuẩn bị tạo audio (${exportState.targetMinutes} phút)...`).replace('{minutes}', String(exportState.targetMinutes)));
@@ -4332,18 +4489,18 @@
                 : null;
             state.nextChapterUrl = nextUrl;
 
+            const effectiveConcurrency = await ensureMultiStreamVieNeuReady(exportLeaseId);
+            if (exportState.runId !== myRunId || exportState.aborted) {
+                throw new Error('EXPORT_ABORTED');
+            }
+
             const startSliceIdx = (!options.startFromBeginning && resumeIdx > 0 && resumeIdx < collected.segments.length)
                 ? resumeIdx
                 : 0;
             const exportIconOpts = getActiveIconOptions();
-            let chapterSegments = packSegmentsForExport(collected.segments.slice(startSliceIdx), EXPORT_MAX_CHUNK_CHARS, exportIconOpts);
+            let chapterSegments = packSegmentsForExport(collected.segments.slice(startSliceIdx), exportState.maxChunkChars, exportIconOpts);
             if (chapterSegments.length === 0) {
                 chapterSegments = collected.segments.slice(startSliceIdx);
-            }
-
-            const effectiveConcurrency = await ensureMultiStreamVieNeuReady(exportLeaseId);
-            if (exportState.runId !== myRunId || exportState.aborted) {
-                throw new Error('EXPORT_ABORTED');
             }
 
             const pcmInt16Chunks = [];
@@ -4489,7 +4646,7 @@
                     const lines = state.wasTranslated
                         ? extractCleanTranslatedLines(nextData.fullText)
                         : (Array.isArray(nextData.origChunks) ? nextData.origChunks : []);
-                    const nextSegs = packSegmentsForExport(lines, EXPORT_MAX_CHUNK_CHARS, exportIconOpts);
+                    const nextSegs = packSegmentsForExport(lines, exportState.maxChunkChars, exportIconOpts);
                     if (nextSegs.length === 0) {
                         earlyStopReason = 'Chương tiếp theo không có nội dung hợp lệ sau khi trích xuất/dịch.';
                         break;
@@ -4556,6 +4713,12 @@
             if (exportState.runId === myRunId) {
                 exportState.active = false;
                 exportState.leaseId = null;
+                exportState.useColabGpu = false;
+                exportState.effectiveEngine = 'ws_default';
+                exportState.effectiveServerUrl = '';
+                exportState.effectiveVoice = '';
+                exportState.targetWorkers = EXPORT_CONCURRENCY;
+                exportState.maxChunkChars = EXPORT_MAX_CHUNK_CHARS;
                 exportState.waitingTranslation = false;
                 exportState.fetchingNext = false;
                 exportState.abortRejects.clear();
@@ -4677,6 +4840,8 @@
             nextChapterUrl: state.nextChapterUrl,
             preloadState: state.preloadState,
             downloadMinutes: state.downloadMinutes,
+            downloadSource: state.downloadSource,
+            colabGpuTier: state.colabGpuTier,
             iconMode: state.iconMode,
             iconStyle: state.iconStyle,
             exportActive: exportState.active,

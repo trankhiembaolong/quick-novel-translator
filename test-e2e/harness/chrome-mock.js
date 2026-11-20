@@ -130,6 +130,8 @@ export function createChromeMock(options = {}) {
     // 2. Runtime IPC Ports and Messaging
     const messageListeners = new Set();
     const connectListeners = new Set();
+    const installedListeners = new Set();
+    const startupListeners = new Set();
 
     class MockPort {
         constructor(name, peer = null) {
@@ -193,6 +195,16 @@ export function createChromeMock(options = {}) {
         onConnect: {
             addListener(cb) { connectListeners.add(cb); },
             removeListener(cb) { connectListeners.delete(cb); }
+        },
+
+        onInstalled: {
+            addListener(cb) { installedListeners.add(cb); },
+            removeListener(cb) { installedListeners.delete(cb); }
+        },
+
+        onStartup: {
+            addListener(cb) { startupListeners.add(cb); },
+            removeListener(cb) { startupListeners.delete(cb); }
         },
 
         sendMessage(msg, callback) {
@@ -345,6 +357,8 @@ export function createChromeMock(options = {}) {
     // 4. Permissions API (Site-by-Site)
     const grantedPermissions = new Set(options.initialPermissions || ['storage', 'activeTab', 'scripting']);
     const grantedOrigins = new Set(options.initialOrigins || []);
+    const permissionAddedListeners = new Set();
+    const permissionRemovedListeners = new Set();
 
     const permissions = {
         async contains({ permissions: perms = [], origins = [] } = {}) {
@@ -368,12 +382,20 @@ export function createChromeMock(options = {}) {
             if (options.denyPermissions) return false;
             perms.forEach(p => grantedPermissions.add(p));
             origins.forEach(o => grantedOrigins.add(o));
+            const payload = { permissions: [...perms], origins: [...origins] };
+            for (const listener of permissionAddedListeners) {
+                try { listener(payload); } catch (e) { console.error(e); }
+            }
             return true;
         },
 
         async remove({ permissions: perms = [], origins = [] } = {}) {
             perms.forEach(p => grantedPermissions.delete(p));
             origins.forEach(o => grantedOrigins.delete(o));
+            const payload = { permissions: [...perms], origins: [...origins] };
+            for (const listener of permissionRemovedListeners) {
+                try { listener(payload); } catch (e) { console.error(e); }
+            }
             return true;
         },
 
@@ -382,6 +404,47 @@ export function createChromeMock(options = {}) {
                 permissions: Array.from(grantedPermissions),
                 origins: Array.from(grantedOrigins)
             };
+        },
+
+        onAdded: {
+            addListener(cb) { permissionAddedListeners.add(cb); },
+            removeListener(cb) { permissionAddedListeners.delete(cb); }
+        },
+
+        onRemoved: {
+            addListener(cb) { permissionRemovedListeners.add(cb); },
+            removeListener(cb) { permissionRemovedListeners.delete(cb); }
+        }
+    };
+
+    // 5. DeclarativeNetRequest API
+    const VALID_DNR_RESOURCE_TYPES = new Set([
+        'main_frame', 'sub_frame', 'stylesheet', 'script', 'image', 'font',
+        'object', 'xmlhttprequest', 'ping', 'csp_report', 'media',
+        'websocket', 'webtransport', 'webbundle', 'other'
+    ]);
+    const dynamicRules = new Map();
+
+    const declarativeNetRequest = {
+        async updateDynamicRules({ addRules = [], removeRuleIds = [] } = {}) {
+            for (const id of removeRuleIds) {
+                dynamicRules.delete(id);
+            }
+            for (const rule of addRules) {
+                const resTypes = rule?.condition?.resourceTypes;
+                if (Array.isArray(resTypes)) {
+                    for (const rt of resTypes) {
+                        if (!VALID_DNR_RESOURCE_TYPES.has(rt)) {
+                            throw new Error(`Invalid declarativeNetRequest resourceType: ${rt}`);
+                        }
+                    }
+                }
+                dynamicRules.set(rule.id, structuredClone(rule));
+            }
+        },
+
+        async getDynamicRules() {
+            return Array.from(dynamicRules.values()).map((r) => structuredClone(r));
         }
     };
 
@@ -390,6 +453,7 @@ export function createChromeMock(options = {}) {
         runtime,
         tabs,
         scripting,
-        permissions
+        permissions,
+        declarativeNetRequest
     };
 }

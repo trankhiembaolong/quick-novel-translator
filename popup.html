@@ -115,6 +115,35 @@
             <div class="card">
                 <h3 class="card-title" data-i18n="tts_download_title">Tải Audio nghe offline (WAV)</h3>
                 <div class="field">
+                    <label class="field-label" for="tts-download-source" data-i18n="tts_download_source_label">Nguồn tạo Audio khi tải</label>
+                    <select id="tts-download-source">
+                        <option value="current" data-i18n="tts_download_source_current">Theo Engine đang chọn ở trên</option>
+                        <option value="colab_gpu" data-i18n="tts_download_source_colab">⚡ VieNeu · Google Colab GPU (Siêu tốc)</option>
+                    </select>
+                </div>
+                <div id="tts-colab-panel" class="colab-box" hidden>
+                    <div class="site-row">
+                        <span id="tts-colab-badge" class="badge">
+                            <span class="dot"></span>
+                            <span id="tts-colab-status-label" data-i18n="tts_colab_badge_offline">Colab: Chưa kết nối</span>
+                        </span>
+                        <span id="tts-colab-gpu-pill" class="pill-tag">T4 · 6x</span>
+                    </div>
+                    <div class="btn-row">
+                        <button id="btn-tts-colab-open" class="btn btn-primary btn-sm" type="button" data-i18n="tts_colab_btn_open">🚀 Mở Colab GPU</button>
+                        <button id="btn-tts-colab-copy" class="btn btn-secondary btn-sm" type="button" data-i18n="tts_colab_btn_copy">📋 Copy lệnh Colab</button>
+                    </div>
+                    <div class="input-with-btn">
+                        <input type="text" id="tts-colab-url" autocomplete="off" data-i18n-attr="placeholder:tts_colab_url_ph" placeholder="Dán link https://xxxx.trycloudflare.com...">
+                        <button id="btn-tts-colab-paste" class="btn btn-secondary btn-sm" type="button" data-i18n="tts_colab_btn_paste">📋 Dán</button>
+                    </div>
+                    <div class="field">
+                        <label class="field-label" for="tts-colab-voice" data-i18n="tts_colab_voice_label">Giọng đọc VieNeu (Colab)</label>
+                        <select id="tts-colab-voice"></select>
+                    </div>
+                    <p id="tts-colab-hint" class="muted" data-i18n="tts_colab_step_hint">B1: Bấm Mở Colab &amp; chạy nút ▶ · B2: Bấm Dán link rồi Tải Audio.</p>
+                </div>
+                <div class="field">
                     <label class="field-label" for="tts-download-minutes" data-i18n="tts_download_minutes_label">Thời lượng tối thiểu (phút)</label>
                     <div class="input-with-btn">
                         <input type="number" id="tts-download-minutes" name="ttsDownloadMinutes" min="5" max="240" step="5" value="30" inputmode="numeric" aria-describedby="tts-download-hint" style="flex: 0 0 90px;">
@@ -281,6 +310,13 @@
                     <div class="field">
                         <label class="field-label" for="api-endpoint" data-i18n="settings_endpoint_label">API Endpoint URL</label>
                         <input type="text" id="api-endpoint" placeholder="https://openrouter.ai/api/v1/chat/completions">
+                        <div id="api-perm-row" class="site-row" hidden style="margin-top: 6px;">
+                            <span id="api-perm-badge" class="badge">
+                                <span class="dot"></span>
+                                <span id="api-perm-text" data-i18n="api_access_needed">Chưa cấp quyền API</span>
+                            </span>
+                            <button id="btn-grant-api-host" class="btn btn-secondary btn-sm" type="button" hidden data-i18n="btn_grant_api_host">Cấp quyền API</button>
+                        </div>
                     </div>
                     <div class="field">
                         <label class="field-label" for="api-key" data-i18n="settings_apikey_label">API Key</label>
@@ -376,6 +412,15 @@
                     <div class="field">
                         <label class="field-label" for="tts-apikey" data-i18n="settings_vieneu_key_label">VieNeu API Key</label>
                         <input type="password" id="tts-apikey">
+                    </div>
+                    <div class="field">
+                        <label class="field-label" for="tts-colab-gpu" data-i18n="settings_colab_gpu_label">Loại GPU Google Colab (khi tải Audio)</label>
+                        <select id="tts-colab-gpu">
+                            <option value="T4" data-i18n="optColabGpuT4">NVIDIA T4 (15GB · Mặc định Free/Pro · 6 luồng)</option>
+                            <option value="L4" data-i18n="optColabGpuL4">NVIDIA L4 (22.5GB · Colab Pro · 8 luồng)</option>
+                            <option value="A100" data-i18n="optColabGpuA100">NVIDIA A100 (40/80GB · Colab Pro+ · 12 luồng)</option>
+                            <option value="auto" data-i18n="optColabGpuAuto">Tự động theo VRAM trên Colab (Auto-scale)</option>
+                        </select>
                     </div>
                     <label class="checkbox-row">
                         <input type="checkbox" id="tts-autoplay">

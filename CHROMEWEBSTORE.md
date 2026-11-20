@@ -1,6 +1,6 @@
 # Chrome Web Store Listing — Quick Novel Translator
 
-> Last Updated: 2026-11-19
+> Last Updated: 2026-11-20
 
 ## Store Listing
 
@@ -68,6 +68,7 @@ Vietnamese (also supports English UI)
 | `storage` | permissions | Stores the user's API key, translation model settings, reading typography preferences, custom novel glossaries, and per-site saved text selectors locally on the device. |
 | `activeTab` | permissions | Grants temporary access to the currently active novel tab when the user explicitly triggers translation, content area selection, or text-to-speech playback. |
 | `scripting` | permissions | Injects the chapter text extractor, in-page translation renderer, floating reader toolbar, and audio player only when the user requests translation or playback on a permitted page. |
+| `declarativeNetRequestWithHostAccess` | permissions | Removes the browser `Origin` request header solely on extension-initiated AI API requests to user-permitted endpoints so third-party OpenAI-compatible AI gateways do not reject browser-originated requests with HTTP 403. |
 | `nativeMessaging` | optional_permissions | Requested only when the user clicks "Start Server" or "Test Native Host" for the optional local VieNeu-TTS Windows companion (`com.stv.vieneu_host`). Not required for translation, Web Speech TTS, online TTS, or manually started local VieNeu servers. |
 | `https://openrouter.ai/*` | host_permissions | Connects directly to the default OpenRouter AI service to fetch available models and stream chapter translations configured by the user. |
 | `*://*/*` | optional_host_permissions | Requested per website only upon explicit user click so the extension can read chapter text and preload the next chapter on whichever web novel site the user chooses to read. |

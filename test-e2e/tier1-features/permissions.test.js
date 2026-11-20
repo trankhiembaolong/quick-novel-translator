@@ -5,7 +5,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { setupSandbox, teardownSandbox } from '../harness/index.js';
+import { setupSandbox, teardownSandbox, TranslationBroker } from '../harness/index.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -34,6 +34,10 @@ describe('Feature 1: MV3 Site-by-Site Permissions & Host Access', () => {
         assert.ok(manifest.permissions.includes('activeTab'), 'Permissions must include activeTab');
         assert.ok(manifest.permissions.includes('scripting'), 'Permissions must include scripting');
         assert.ok(manifest.permissions.includes('storage'), 'Permissions must include storage');
+        assert.ok(
+            manifest.permissions.includes('declarativeNetRequestWithHostAccess'),
+            'Permissions must include declarativeNetRequestWithHostAccess'
+        );
     });
 
     it('T1.2: chrome.permissions.contains checks origin permission status accurately', async () => {
@@ -104,5 +108,81 @@ describe('Feature 1: MV3 Site-by-Site Permissions & Host Access', () => {
         assert.ok(resourceUrl.startsWith('chrome-extension://'), 'Must resolve to chrome-extension scheme');
         assert.ok(resourceUrl.includes('tts-worklet.js'), 'Must contain resource file name');
         assert.strictEqual(resourceUrl.includes('//tts-worklet.js'), false, 'Must not have duplicate slashes');
+    });
+
+    it('T1.7: getApiEndpointOriginInfo extracts originPattern without port and anchored urlFilter', () => {
+        const vilaoInfo = TranslationBroker.getApiEndpointOriginInfo('https://api.vilao.ai/v1/chat/completions');
+        assert.deepStrictEqual(vilaoInfo, {
+            origin: 'https://api.vilao.ai',
+            host: 'api.vilao.ai',
+            hostname: 'api.vilao.ai',
+            originPattern: 'https://api.vilao.ai/*',
+            urlFilter: '|https://api.vilao.ai/'
+        });
+
+        const localInfo = TranslationBroker.getApiEndpointOriginInfo('http://127.0.0.1:11434/v1/chat/completions');
+        assert.deepStrictEqual(localInfo, {
+            origin: 'http://127.0.0.1:11434',
+            host: '127.0.0.1:11434',
+            hostname: '127.0.0.1',
+            originPattern: 'http://127.0.0.1/*',
+            urlFilter: '|http://127.0.0.1:11434/'
+        });
+
+        assert.strictEqual(TranslationBroker.getApiEndpointOriginInfo('ws://localhost:8080'), null);
+        assert.strictEqual(TranslationBroker.getApiEndpointOriginInfo('not-a-url'), null);
+    });
+
+    it('T1.8: syncApiOriginStripRule manages Origin-stripping DNR rule based on API host permission', async () => {
+        const endpoint = 'https://api.vilao.ai/v1/chat/completions';
+
+        // 1. Ungranted: rule must NOT be active
+        const resUngranted = await TranslationBroker.syncApiOriginStripRule(endpoint, { force: true });
+        assert.strictEqual(resUngranted.ok, true);
+        assert.strictEqual(resUngranted.active, false);
+        assert.strictEqual(resUngranted.hasPermission, false);
+        assert.deepStrictEqual(await chrome.declarativeNetRequest.getDynamicRules(), []);
+
+        // 2. Grant host permission -> rule 1001 installed with valid Chromium resourceTypes
+        await chrome.permissions.request({ origins: ['https://api.vilao.ai/*'] });
+        const resGranted = await TranslationBroker.syncApiOriginStripRule(endpoint, { force: true });
+        assert.strictEqual(resGranted.ok, true);
+        assert.strictEqual(resGranted.active, true);
+        assert.strictEqual(resGranted.hasPermission, true);
+
+        const rules = await chrome.declarativeNetRequest.getDynamicRules();
+        assert.strictEqual(rules.length, 1);
+        assert.deepStrictEqual(rules[0], {
+            id: TranslationBroker.API_ORIGIN_STRIP_RULE_ID,
+            priority: 1,
+            action: {
+                type: 'modifyHeaders',
+                requestHeaders: [{ header: 'origin', operation: 'remove' }]
+            },
+            condition: {
+                urlFilter: '|https://api.vilao.ai/',
+                resourceTypes: ['xmlhttprequest', 'other'],
+                initiatorDomains: [chrome.runtime.id]
+            }
+        });
+
+        // 3. Custom port endpoint matches host pattern without port and keeps port in urlFilter
+        await chrome.permissions.request({ origins: ['http://127.0.0.1/*'] });
+        const resPort = await TranslationBroker.syncApiOriginStripRule('http://127.0.0.1:11434/v1/chat/completions', { force: true });
+        assert.strictEqual(resPort.ok, true);
+        assert.strictEqual(resPort.active, true);
+        const portRules = await chrome.declarativeNetRequest.getDynamicRules();
+        assert.strictEqual(portRules.length, 1);
+        assert.strictEqual(portRules[0].condition.urlFilter, '|http://127.0.0.1:11434/');
+
+        // 4. Revoking permission triggers permissions.onRemoved -> dynamic rule removed
+        await chrome.storage.local.set({ endpoint });
+        await chrome.permissions.request({ origins: ['https://api.vilao.ai/*'] });
+        await TranslationBroker.syncApiOriginStripRule(endpoint, { force: true });
+        assert.strictEqual((await chrome.declarativeNetRequest.getDynamicRules()).length, 1);
+
+        await chrome.permissions.remove({ origins: ['https://api.vilao.ai/*'] });
+        await new Promise((r) => setTimeout(r, 10));
+        assert.deepStrictEqual(await chrome.declarativeNetRequest.getDynamicRules(), []);
     });
 });

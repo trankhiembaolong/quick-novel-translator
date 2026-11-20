@@ -33,11 +33,17 @@
         ttsAutoNext: true,
         ttsPreloadSec: 60,
         ttsDownloadMinutes: 30,
+        ttsDownloadSource: 'current',
+        ttsColabUrl: '',
+        ttsColabVoice: '',
+        ttsColabGpu: 'T4',
         ttsIconMode: 'auto',
         ttsIconStyle: 'tagged',
         stvDebugLog: false,
         stv_theme: 'dark'
     };
+
+    const COLAB_NOTEBOOK_URL = 'https://colab.research.google.com/github/trankhiembaolong/quick-novel-translator/blob/main/colab/VieNeu_Colab_GPU.ipynb';
 
     const DEFAULT_MODEL_PRESETS = [
         { id: 'stepfun/step-3.5-flash', provider: 'stepfun', modelName: 'step-3.5-flash', ownedBy: '', displayName: '' },
@@ -54,6 +60,9 @@
         activeHost: null,
         hasSitePerm: false,
         savedSelector: null,
+        apiEndpointHost: null,
+        apiEndpointOriginPattern: null,
+        hasApiEndpointPerm: false,
         profiles: { Default: [] },
         activeProfile: 'Default',
         searchQuery: '',
@@ -69,6 +78,9 @@
         iconSearchQuery: '',
         iconSearchTimer: null,
         vieneuRunning: false,
+        colabOnline: false,
+        colabGpuName: '',
+        colabWorkers: 6,
         fetchedModels: [],
         modelsEndpoint: '',
         isFetchingModels: false,
@@ -168,9 +180,11 @@
             if (settingsLocale) settingsLocale.value = locale;
         }
         renderSitePermissionUI();
+        renderApiEndpointPermissionUI();
         renderGlossaryList();
         renderIconLibraryList();
         updateVieNeuBadgeUI(state.vieneuRunning);
+        updateColabStatusUI();
         if (state.modelDropdownOpen) {
             renderModelDropdown();
         }
@@ -199,6 +213,9 @@
             syncTtsPlaybackUI();
             if ($('tts-engine-select')?.value === 'vieneu') {
                 checkVieNeuHealth();
+            }
+            if ($('tts-download-source')?.value === 'colab_gpu' && $('tts-colab-url')?.value.trim()) {
+                void checkColabHealth({ requestPerm: false, silent: true });
             }
         }
     }
@@ -292,6 +309,125 @@
         }
     }
 
+    function parseApiEndpointOrigin(rawUrl) {
+        try {
+            const parsed = new URL(String(rawUrl || '').trim());
+            if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || !parsed.hostname) {
+                return null;
+            }
+            return {
+                host: parsed.host,
+                origin: parsed.origin,
+                originPattern: `${parsed.protocol}//${parsed.hostname}/*`
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function renderApiEndpointPermissionUI() {
+        const row = $('api-perm-row');
+        const badge = $('api-perm-badge');
+        const textEl = $('api-perm-text');
+        const grantBtn = $('btn-grant-api-host');
+        if (!row || !badge || !textEl || !grantBtn) return;
+
+        if (!state.apiEndpointHost || !state.apiEndpointOriginPattern) {
+            row.hidden = true;
+            return;
+        }
+
+        row.hidden = false;
+        badge.classList.remove('granted', 'needed');
+        if (state.hasApiEndpointPerm) {
+            badge.classList.add('granted');
+            textEl.textContent = t('api_access_granted', { host: state.apiEndpointHost });
+            grantBtn.hidden = true;
+        } else {
+            badge.classList.add('needed');
+            textEl.textContent = t('api_access_needed', { host: state.apiEndpointHost });
+            grantBtn.hidden = false;
+        }
+    }
+
+    async function refreshApiEndpointPermission(rawEndpoint = null) {
+        const endpoint = String(rawEndpoint ?? $('api-endpoint')?.value ?? '').trim();
+        const info = parseApiEndpointOrigin(endpoint);
+        state.apiEndpointHost = info ? info.host : null;
+        state.apiEndpointOriginPattern = info ? info.originPattern : null;
+        state.hasApiEndpointPerm = false;
+
+        if (info && chrome.permissions && typeof chrome.permissions.contains === 'function') {
+            try {
+                state.hasApiEndpointPerm = Boolean(await chrome.permissions.contains({
+                    origins: [info.originPattern]
+                }));
+            } catch (_) {
+                state.hasApiEndpointPerm = false;
+            }
+        }
+        renderApiEndpointPermissionUI();
+        return state.hasApiEndpointPerm;
+    }
+
+    async function ensureApiEndpointPermission(rawEndpoint = null, { promptIfMissing = true } = {}) {
+        const endpoint = String(rawEndpoint ?? $('api-endpoint')?.value ?? '').trim();
+        const info = parseApiEndpointOrigin(endpoint);
+        if (!info) {
+            state.apiEndpointHost = null;
+            state.apiEndpointOriginPattern = null;
+            state.hasApiEndpointPerm = false;
+            renderApiEndpointPermissionUI();
+            return false;
+        }
+
+        state.apiEndpointHost = info.host;
+        state.apiEndpointOriginPattern = info.originPattern;
+
+        let alreadyGranted = false;
+        if (chrome.permissions && typeof chrome.permissions.contains === 'function') {
+            try {
+                alreadyGranted = Boolean(await chrome.permissions.contains({
+                    origins: [info.originPattern]
+                }));
+            } catch (_) {
+                alreadyGranted = false;
+            }
+        }
+
+        if (alreadyGranted) {
+            state.hasApiEndpointPerm = true;
+            renderApiEndpointPermissionUI();
+            try {
+                await chrome.runtime.sendMessage({ action: 'sync_api_dnr_rules', endpoint });
+            } catch (_) {}
+            return true;
+        }
+
+        if (!promptIfMissing) {
+            state.hasApiEndpointPerm = false;
+            renderApiEndpointPermissionUI();
+            return false;
+        }
+
+        let granted = false;
+        if (chrome.permissions && typeof chrome.permissions.request === 'function') {
+            try {
+                granted = Boolean(await chrome.permissions.request({
+                    origins: [info.originPattern]
+                }));
+            } catch (_) {
+                granted = false;
+            }
+        }
+        state.hasApiEndpointPerm = granted;
+        renderApiEndpointPermissionUI();
+        try {
+            await chrome.runtime.sendMessage({ action: 'sync_api_dnr_rules', endpoint });
+        } catch (_) {}
+        return granted;
+    }
+
     // -------------------------------------------------------------------------
     // Settings Load / Save & Onboarding
     // -------------------------------------------------------------------------
@@ -330,6 +466,12 @@
         $('tts-speed-range').value = cfg.ttsSpeed ?? 1.0;
         $('tts-speed-label-val').textContent = `${Number(cfg.ttsSpeed ?? 1.0).toFixed(1)}x`;
         $('tts-download-minutes').value = cfg.ttsDownloadMinutes ?? DEFAULT_SETTINGS.ttsDownloadMinutes;
+        const dlSource = cfg.ttsDownloadSource === 'colab_gpu' ? 'colab_gpu' : 'current';
+        $('tts-download-source').value = dlSource;
+        $('tts-colab-url').value = cfg.ttsColabUrl || '';
+        const colabGpuVal = ['T4', 'L4', 'A100', 'auto'].includes(cfg.ttsColabGpu) ? cfg.ttsColabGpu : DEFAULT_SETTINGS.ttsColabGpu;
+        $('tts-colab-gpu').value = colabGpuVal;
+        populateColabVoiceSelect([], cfg.ttsColabVoice || '');
 
         $('tts-ws-endpoint').value = cfg.ttsWsEndpoint || DEFAULT_SETTINGS.ttsWsEndpoint;
         $('tts-ws-voice').value = cfg.ttsWsVoice || DEFAULT_SETTINGS.ttsWsVoice;
@@ -348,8 +490,10 @@
         $('settings-debug-log').checked = !!cfg.stvDebugLog;
 
         toggleVieNeuCard(activeEngine);
+        toggleColabPanel(dlSource);
         populateVoiceQuickSelect(activeEngine, activeEngine === 'vieneu' ? (cfg.ttsVoice || '') : (cfg.ttsWsVoice || DEFAULT_SETTINGS.ttsWsVoice));
         syncTtsPlaybackUI();
+        await refreshApiEndpointPermission(cfg.endpoint || DEFAULT_SETTINGS.endpoint);
         $('onboarding-card').hidden = !!(cfg.apikey && cfg.apikey.trim());
     }
 
@@ -412,6 +556,7 @@
         const aiUrl = $('api-endpoint').value.trim();
         const wsUrl = $('tts-ws-endpoint').value.trim();
         const vieneuUrl = $('tts-endpoint').value.trim();
+        const colabUrl = $('tts-colab-url').value.trim();
 
         if (!UrlValidator.isValidUrl(aiUrl, ['http:', 'https:'])) {
             return { ok: false, message: `API Endpoint không hợp lệ: ${aiUrl || '(trống)'}` };
@@ -421,6 +566,9 @@
         }
         if (vieneuUrl && !UrlValidator.isValidUrl(vieneuUrl, ['http:', 'https:'])) {
             return { ok: false, message: `VieNeu URL không hợp lệ: ${vieneuUrl}` };
+        }
+        if (colabUrl && !UrlValidator.isValidUrl(colabUrl, ['http:', 'https:'])) {
+            return { ok: false, message: `Colab Tunnel URL không hợp lệ: ${colabUrl}` };
         }
         return { ok: true };
     }
@@ -462,7 +610,7 @@
         }
     }
 
-    async function saveAllSettings() {
+    async function saveAllSettings({ requestHostPermission = false } = {}) {
         const statusEl = $('save-status');
         const showStatus = (message, ok = true) => {
             if (!statusEl) return;
@@ -511,6 +659,10 @@
                 ttsPreloadSec: Math.min(300, Math.max(5, Number($('tts-preload-sec').value) || DEFAULT_SETTINGS.ttsPreloadSec)),
                 ttsPreloadSeconds: Math.min(300, Math.max(5, Number($('tts-preload-sec').value) || DEFAULT_SETTINGS.ttsPreloadSec)),
                 ttsDownloadMinutes: Math.min(240, Math.max(1, Number($('tts-download-minutes').value) || DEFAULT_SETTINGS.ttsDownloadMinutes)),
+                ttsDownloadSource: $('tts-download-source').value === 'colab_gpu' ? 'colab_gpu' : 'current',
+                ttsColabUrl: $('tts-colab-url').value.trim().replace(/\/+$/, ''),
+                ttsColabVoice: $('tts-colab-voice').value.trim(),
+                ttsColabGpu: $('tts-colab-gpu').value || DEFAULT_SETTINGS.ttsColabGpu,
                 ttsIconMode: $('tts-icon-mode').value || DEFAULT_SETTINGS.ttsIconMode,
                 ttsIconStyle: $('tts-icon-style').value || DEFAULT_SETTINGS.ttsIconStyle,
                 stvDebugLog: $('settings-debug-log').checked
@@ -529,10 +681,20 @@
                 populateVoiceQuickSelect(payload.ttsEngine, wsVoiceVal);
             }
             $('onboarding-card').hidden = !!apiKeyVal;
+            await refreshApiEndpointPermission(payload.endpoint);
+            if (requestHostPermission && state.apiEndpointOriginPattern && !state.hasApiEndpointPerm) {
+                await ensureApiEndpointPermission(payload.endpoint, { promptIfMissing: true });
+            }
+            try {
+                await chrome.runtime.sendMessage({ action: 'sync_api_dnr_rules', endpoint: payload.endpoint });
+            } catch (_) {}
             await applyReaderSettingsToActiveTab();
-            showStatus(t('settings_saved'));
+            const savedMsg = (requestHostPermission && state.apiEndpointOriginPattern && !state.hasApiEndpointPerm)
+                ? t('settings_saved_need_api_perm')
+                : t('settings_saved');
+            showStatus(savedMsg);
             setTimeout(() => {
-                if (statusEl && statusEl.textContent === t('settings_saved')) {
+                if (statusEl && statusEl.textContent === savedMsg) {
                     statusEl.textContent = '';
                     statusEl.hidden = true;
                 }
@@ -999,6 +1161,13 @@
             statusEl.textContent = t('model_fetching');
         }
 
+        if (endpoint) {
+            const info = parseApiEndpointOrigin(endpoint);
+            if (info && (!state.hasApiEndpointPerm || state.apiEndpointOriginPattern !== info.originPattern)) {
+                await ensureApiEndpointPermission(endpoint, { promptIfMissing: true });
+            }
+        }
+
         try {
             const res = await chrome.runtime.sendMessage({
                 action: 'fetch_ai_models',
@@ -1083,6 +1252,13 @@
             return;
         }
 
+        const storedEndpointCfg = await chrome.storage.local.get(['endpoint']);
+        const activeEndpoint = String(storedEndpointCfg?.endpoint || $('api-endpoint')?.value || DEFAULT_SETTINGS.endpoint).trim();
+        const apiInfo = parseApiEndpointOrigin(activeEndpoint);
+        if (apiInfo && (!state.hasApiEndpointPerm || state.apiEndpointOriginPattern !== apiInfo.originPattern)) {
+            await ensureApiEndpointPermission(activeEndpoint, { promptIfMissing: true });
+        }
+
         statusEl.textContent = t('status_translating');
         await chrome.storage.local.set({ model: $('main-model').value.trim() || DEFAULT_SETTINGS.model });
         try {
@@ -1127,11 +1303,17 @@
             'ttsEngine', 'ttsWsEndpoint', 'ttsWsVoice', 'ttsWsFallback', 'ttsWsAutoFallback',
             'ttsEndpoint', 'ttsBackend', 'ttsStability', 'ttsStabilityProfile', 'ttsVoice',
             'ttsSpeed', 'ttsAutoNext', 'ttsAutoNextChapter', 'ttsPreloadSec', 'ttsPreloadSeconds',
-            'ttsDownloadMinutes', 'ttsIconMode', 'ttsIconStyle'
+            'ttsDownloadMinutes', 'ttsDownloadSource', 'ttsColabUrl', 'ttsColabVoice', 'ttsColabGpu',
+            'ttsIconMode', 'ttsIconStyle'
         ]);
 
         const engine = $('tts-engine-select').value || stored.ttsEngine || 'ws_default';
         const quickVoice = $('tts-voice-quick').value.trim();
+        const downloadSource = $('tts-download-source')?.value || stored.ttsDownloadSource || 'current';
+        const colabServerUrl = ($('tts-colab-url')?.value || stored.ttsColabUrl || '').trim().replace(/\/+$/, '');
+        const colabVoice = ($('tts-colab-voice')?.value || stored.ttsColabVoice || '').trim();
+        const colabGpuTier = $('tts-colab-gpu')?.value || stored.ttsColabGpu || DEFAULT_SETTINGS.ttsColabGpu;
+        const colabProfile = getColabGpuProfile(colabGpuTier);
         return {
             engine,
             wsEndpoint: stored.ttsWsEndpoint || DEFAULT_SETTINGS.ttsWsEndpoint,
@@ -1147,6 +1329,12 @@
             autoNextChapter: (stored.ttsAutoNextChapter ?? stored.ttsAutoNext) !== false,
             preloadLeadSec: stored.ttsPreloadSeconds ?? stored.ttsPreloadSec ?? DEFAULT_SETTINGS.ttsPreloadSec,
             downloadMinutes: Number($('tts-download-minutes').value) || stored.ttsDownloadMinutes || DEFAULT_SETTINGS.ttsDownloadMinutes,
+            downloadSource: downloadSource === 'colab_gpu' ? 'colab_gpu' : 'current',
+            colabServerUrl,
+            colabVoice,
+            colabGpuTier: colabProfile.tier,
+            colabWorkers: colabProfile.workers,
+            colabMaxChunkChars: colabProfile.maxChunkChars,
             iconMode: $('tts-icon-mode')?.value || stored.ttsIconMode || DEFAULT_SETTINGS.ttsIconMode,
             iconStyle: $('tts-icon-style')?.value || stored.ttsIconStyle || DEFAULT_SETTINGS.ttsIconStyle,
             ...extra
@@ -1203,7 +1391,34 @@
         await chrome.storage.local.set({ ttsDownloadMinutes: minutes });
 
         const opts = await loadTtsExecutionOptions({ downloadMinutes: minutes });
-        if (opts.engine === 'webspeech') {
+        if (opts.downloadSource === 'colab_gpu') {
+            const colabUrl = (opts.colabServerUrl || '').trim().replace(/\/+$/, '');
+            if (!colabUrl || !UrlValidator || !UrlValidator.isValidUrl(colabUrl, ['http:', 'https:'])) {
+                const msg = t('tts_colab_err_url_missing');
+                statusEl.textContent = msg;
+                statusEl.classList.add('error');
+                setColabHint(msg, 'error');
+                return;
+            }
+            const permOk = await ensureColabTunnelPermission(colabUrl, { promptIfMissing: true });
+            if (!permOk) {
+                const msg = t('tts_colab_perm_needed');
+                statusEl.textContent = msg;
+                statusEl.classList.add('error');
+                setColabHint(msg, 'error');
+                return;
+            }
+            if (!state.colabOnline) {
+                const okColab = await checkColabHealth({ requestPerm: false, silent: false });
+                if (!okColab) {
+                    statusEl.textContent = t('tts_colab_err_connect_fail', { url: colabUrl });
+                    statusEl.classList.add('error');
+                    return;
+                }
+            }
+            opts.colabServerUrl = colabUrl;
+            opts.colabVoice = ($('tts-colab-voice')?.value || opts.colabVoice || '').trim();
+        } else if (opts.engine === 'webspeech') {
             statusEl.textContent = t('tts_dl_webspeech_unsupported');
             statusEl.classList.add('error');
             return;
@@ -1417,6 +1632,347 @@
             // Fallback below if tabs.create is unavailable
         }
         window.open(url, '_blank', 'noopener');
+    }
+
+    // -------------------------------------------------------------------------
+    // Google Colab GPU Export Helpers
+    // -------------------------------------------------------------------------
+    function getColabGpuProfile(tier) {
+        const normalized = String(tier || 'T4').trim().toUpperCase();
+        if (normalized === 'A100') {
+            return { tier: 'A100', workers: 12, maxChunkChars: 350, label: 'A100 · 12x' };
+        }
+        if (normalized === 'L4') {
+            return { tier: 'L4', workers: 8, maxChunkChars: 320, label: 'L4 · 8x' };
+        }
+        if (normalized === 'AUTO') {
+            return { tier: 'auto', workers: 6, maxChunkChars: 300, label: 'Auto GPU' };
+        }
+        return { tier: 'T4', workers: 6, maxChunkChars: 300, label: 'T4 · 6x' };
+    }
+
+    function toggleColabPanel(source) {
+        const panel = $('tts-colab-panel');
+        if (panel) panel.hidden = source !== 'colab_gpu';
+        updateColabStatusUI();
+    }
+
+    function setColabHint(text, tone = '') {
+        const hintEl = $('tts-colab-hint');
+        if (!hintEl) return;
+        hintEl.classList.remove('error', 'success');
+        if (tone === 'error') hintEl.classList.add('error');
+        else if (tone === 'success') hintEl.classList.add('success');
+        hintEl.textContent = text || t('tts_colab_step_hint');
+    }
+
+    function updateColabStatusUI() {
+        const badge = $('tts-colab-badge');
+        const label = $('tts-colab-status-label');
+        const pill = $('tts-colab-gpu-pill');
+        const profile = getColabGpuProfile($('tts-colab-gpu')?.value || DEFAULT_SETTINGS.ttsColabGpu);
+
+        if (badge) {
+            badge.classList.toggle('online', !!state.colabOnline);
+            badge.classList.toggle('granted', !!state.colabOnline);
+        }
+        if (label) {
+            label.textContent = state.colabOnline
+                ? t('tts_colab_badge_online', {
+                    gpu: state.colabGpuName || profile.tier,
+                    workers: state.colabWorkers || profile.workers
+                })
+                : t('tts_colab_badge_offline');
+        }
+        if (pill) {
+            pill.textContent = state.colabOnline && state.colabGpuName
+                ? `${state.colabWorkers || profile.workers}x`
+                : profile.label;
+        }
+    }
+
+    function getColabWildcardPattern(rawUrl) {
+        try {
+            const parsed = new URL(String(rawUrl || '').trim());
+            if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || !parsed.hostname) {
+                return null;
+            }
+            const host = parsed.hostname.toLowerCase();
+            if (host.endsWith('.trycloudflare.com')) {
+                return 'https://*.trycloudflare.com/*';
+            }
+            if (host.endsWith('.ngrok-free.app')) {
+                return 'https://*.ngrok-free.app/*';
+            }
+            if (host.endsWith('.ngrok.app')) {
+                return 'https://*.ngrok.app/*';
+            }
+            return `${parsed.protocol}//${parsed.hostname}/*`;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    async function ensureColabTunnelPermission(rawUrl, { promptIfMissing = true } = {}) {
+        const info = parseApiEndpointOrigin(rawUrl);
+        const wildcard = getColabWildcardPattern(rawUrl);
+        if (!info || !wildcard) return false;
+        if (!chrome.permissions || typeof chrome.permissions.contains !== 'function') {
+            return true;
+        }
+
+        let granted = false;
+        try {
+            granted = Boolean(await chrome.permissions.contains({ origins: [info.originPattern] }))
+                || Boolean(await chrome.permissions.contains({ origins: [wildcard] }));
+        } catch (_) {
+            granted = false;
+        }
+
+        if (!granted && promptIfMissing && typeof chrome.permissions.request === 'function') {
+            try {
+                granted = Boolean(await chrome.permissions.request({ origins: [wildcard] }));
+            } catch (_) {
+                granted = false;
+            }
+        }
+
+        if (granted) {
+            try {
+                await chrome.runtime.sendMessage({ action: 'sync_api_dnr_rules', colabUrl: rawUrl });
+            } catch (_) {}
+        }
+        return granted;
+    }
+
+    function populateColabVoiceSelect(voices, selectedVoice = '') {
+        const select = $('tts-colab-voice');
+        if (!select) return;
+        const previous = selectedVoice || select.value || '';
+        select.textContent = '';
+        if (Array.isArray(voices) && voices.length > 0) {
+            voices.forEach((voice) => {
+                const id = typeof voice === 'string' ? voice : (voice.id || voice.name || voice.voice || '');
+                if (!id) return;
+                const opt = document.createElement('option');
+                opt.value = id;
+                opt.textContent = typeof voice === 'string' ? voice : (voice.name || voice.label || id);
+                select.appendChild(opt);
+            });
+        }
+        if (!select.options.length) {
+            const fallback = document.createElement('option');
+            fallback.value = previous || '';
+            fallback.textContent = previous || 'VieNeu (mặc định)';
+            select.appendChild(fallback);
+        }
+        select.value = Array.from(select.options).some((o) => o.value === previous)
+            ? previous
+            : select.options[0].value;
+    }
+
+    async function loadColabVoices(serverUrl) {
+        const select = $('tts-colab-voice');
+        if (!select) return;
+        const apiKey = ($('tts-apikey') && $('tts-apikey').value.trim()) || '';
+        const stored = await chrome.storage.local.get(['ttsColabVoice']);
+        const preferred = select.value || stored.ttsColabVoice || '';
+        try {
+            const res = await chrome.runtime.sendMessage({
+                action: 'vieneu_get_voices',
+                serverUrl,
+                apiKey,
+                isColab: true
+            });
+            if (!res || !res.ok || !Array.isArray(res.voices)) {
+                throw new Error(res?.error || 'Failed to load Colab voices');
+            }
+            populateColabVoiceSelect(res.voices, preferred);
+            await chrome.storage.local.set({ ttsColabVoice: select.value });
+        } catch (_) {
+            populateColabVoiceSelect([], preferred);
+        }
+    }
+
+    async function checkColabHealth({ requestPerm = false, silent = false } = {}) {
+        const input = $('tts-colab-url');
+        const url = (input ? input.value.trim() : '').replace(/\/+$/, '');
+        if (!url || !UrlValidator || !UrlValidator.isValidUrl(url, ['http:', 'https:'])) {
+            state.colabOnline = false;
+            state.colabGpuName = '';
+            updateColabStatusUI();
+            if (!silent) setColabHint(t('tts_colab_err_url_missing'), 'error');
+            return false;
+        }
+
+        if (requestPerm) {
+            const permOk = await ensureColabTunnelPermission(url, { promptIfMissing: true });
+            if (!permOk) {
+                state.colabOnline = false;
+                updateColabStatusUI();
+                if (!silent) setColabHint(t('tts_colab_perm_needed'), 'error');
+                return false;
+            }
+        }
+
+        const label = $('tts-colab-status-label');
+        if (label) label.textContent = t('tts_colab_badge_checking');
+
+        try {
+            const apiKey = ($('tts-apikey') && $('tts-apikey').value.trim()) || '';
+            const res = await chrome.runtime.sendMessage({
+                action: 'vieneu_check_health',
+                serverUrl: url,
+                apiKey,
+                isColab: true
+            });
+            if (!res || !res.ok) {
+                throw new Error(res?.error || 'Unreachable');
+            }
+            const profile = getColabGpuProfile($('tts-colab-gpu')?.value || DEFAULT_SETTINGS.ttsColabGpu);
+            state.colabOnline = true;
+            state.colabGpuName = String(res.data?.gpu_name || res.data?.gpu_tier || profile.tier);
+            const reportedWorkers = Number(res.data?.export_max_streams || res.data?.max_streams || profile.workers);
+            state.colabWorkers = Number.isFinite(reportedWorkers) && reportedWorkers >= 1
+                ? reportedWorkers
+                : profile.workers;
+            updateColabStatusUI();
+            setColabHint(t('tts_colab_step_hint'));
+            await chrome.storage.local.set({ ttsColabUrl: url });
+            await loadColabVoices(url);
+            return true;
+        } catch (_) {
+            state.colabOnline = false;
+            state.colabGpuName = '';
+            updateColabStatusUI();
+            if (!silent) setColabHint(t('tts_colab_err_connect_fail', { url }), 'error');
+            return false;
+        }
+    }
+
+    function extractUrlFromClipboardText(text) {
+        const match = String(text || '').match(/https?:\/\/[^\s"'<>]+/i);
+        if (!match) return '';
+        return match[0].replace(/[),.;!?/]+$/, '');
+    }
+
+    async function copyTextToClipboard(text) {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            await navigator.clipboard.writeText(text);
+            return;
+        }
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.setAttribute('readonly', '');
+        area.style.cssText = 'position:fixed;top:-9999px;opacity:0';
+        document.body.appendChild(area);
+        area.select();
+        try {
+            document.execCommand('copy');
+        } finally {
+            area.remove();
+        }
+    }
+
+    function buildColabOneClickScript(tier = 'T4') {
+        const safeTier = ['T4', 'L4', 'A100', 'auto'].includes(tier) ? tier : 'T4';
+        return [
+            `# STV VieNeu-TTS Colab GPU Server (${safeTier})`,
+            'import os, re, sys, time, json, shutil, subprocess, urllib.request',
+            'from IPython.display import HTML, clear_output, display',
+            'subprocess.run("apt-get update -qq && apt-get install -y -qq espeak-ng > /dev/null 2>&1", shell=True, check=True)',
+            'if not shutil.which("cloudflared"):',
+            '    subprocess.run("curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared", shell=True, check=True)',
+            'repo_dir = "/content/vieneu-tts"',
+            'if not os.path.isdir(repo_dir):',
+            '    subprocess.run(["git", "clone", "--depth", "1", "https://github.com/pnnbao97/VieNeu-TTS.git", repo_dir], check=True)',
+            'subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", repo_dir, "onnxruntime-gpu", "fastapi", "uvicorn", "huggingface_hub", "tokenizers"], check=True)',
+            'runner_path = os.path.join(repo_dir, "vieneu_colab_runner.py")',
+            'try:',
+            '    urllib.request.urlretrieve("https://raw.githubusercontent.com/trankhiembaolong/quick-novel-translator/main/colab/vieneu_colab_runner.py", runner_path)',
+            'except Exception:',
+            '    runner_path = ""',
+            `env = {**os.environ, "HOST": "127.0.0.1", "PORT": "8000", "VIENEU_COLAB_GPU_TIER": "${safeTier}", "VIENEU_WATERMARK": "0", "PYTHONUNBUFFERED": "1"}`,
+            'server_log = open("/content/vieneu_server.log", "w", encoding="utf-8")',
+            'cmd = [sys.executable, runner_path] if (runner_path and os.path.exists(runner_path)) else [sys.executable, "-m", "apps.openai_speech"]',
+            'server_proc = subprocess.Popen(cmd, cwd=repo_dir, env=env, stdout=server_log, stderr=subprocess.STDOUT)',
+            'health = {}',
+            'for _ in range(300):',
+            '    if server_proc.poll() is not None:',
+            '        raise RuntimeError(open("/content/vieneu_server.log").read()[-2000:])',
+            '    try:',
+            '        with urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=2) as r:',
+            '            if r.status == 200:',
+            '                health = json.loads(r.read().decode("utf-8"))',
+            '                break',
+            '    except Exception:',
+            '        pass',
+            '    time.sleep(2)',
+            'tunnel_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://127.0.0.1:8000", "--no-autoupdate"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)',
+            'tunnel_url = ""',
+            'for _ in range(300):',
+            '    line = tunnel_proc.stdout.readline()',
+            '    m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", line or "")',
+            '    if m:',
+            '        tunnel_url = m.group(0)',
+            '        break',
+            'clear_output(wait=True)',
+            'display(HTML(f"<div style=\'padding:14px;border:2px solid #10b981;border-radius:12px;background:#ecfdf5;color:#064e3b;font-family:sans-serif\'><b>🟢 {health.get(\\"gpu_name\\", \\"Colab GPU\\")} ready ({health.get(\\"export_max_streams\\", 6)} workers)</b><br><input id=\'stv-u\' readonly value=\'{tunnel_url}\' style=\'width:72%;padding:8px;margin-top:8px\'><button onclick=\\"navigator.clipboard.writeText(document.getElementById(\'stv-u\').value);this.innerText=\'✓ Copied!\'\\" style=\'padding:9px 14px;margin-left:8px;background:#10b981;color:#fff;border:0;border-radius:6px;cursor:pointer\'>📋 Copy Link</button></div>"))',
+            'while server_proc.poll() is None and tunnel_proc.poll() is None:',
+            '    time.sleep(5)'
+        ].join('\n');
+    }
+
+    async function copyColabOneClickScript() {
+        const tier = $('tts-colab-gpu')?.value || DEFAULT_SETTINGS.ttsColabGpu;
+        const script = buildColabOneClickScript(tier);
+        const btn = $('btn-tts-colab-copy');
+        try {
+            await copyTextToClipboard(script);
+            if (btn) {
+                btn.textContent = t('tts_colab_btn_copied');
+                setTimeout(() => {
+                    if (btn) btn.textContent = t('tts_colab_btn_copy');
+                }, 2000);
+            }
+        } catch (_) {
+            setColabHint(t('setup_copy_btn_tip_fail'), 'error');
+        }
+    }
+
+    async function openColabNotebook() {
+        try {
+            await copyColabOneClickScript();
+        } catch (_) {}
+        try {
+            if (chrome.tabs && typeof chrome.tabs.create === 'function') {
+                await chrome.tabs.create({ url: COLAB_NOTEBOOK_URL });
+                return;
+            }
+        } catch (_) {}
+        window.open(COLAB_NOTEBOOK_URL, '_blank', 'noopener');
+    }
+
+    async function handleColabPasteClick() {
+        const input = $('tts-colab-url');
+        let clipText = '';
+        try {
+            if (navigator.clipboard && typeof navigator.clipboard.readText === 'function') {
+                clipText = await navigator.clipboard.readText();
+            }
+        } catch (_) {
+            clipText = '';
+        }
+        const extracted = extractUrlFromClipboardText(clipText);
+        if (!extracted || !UrlValidator || !UrlValidator.isValidUrl(extracted, ['http:', 'https:'])) {
+            setColabHint(t('tts_colab_clipboard_empty'), 'error');
+            if (input) input.focus();
+            return;
+        }
+        if (input) input.value = extracted;
+        state.colabOnline = false;
+        await chrome.storage.local.set({ ttsColabUrl: extracted });
+        await checkColabHealth({ requestPerm: true, silent: false });
     }
 
     // -------------------------------------------------------------------------
@@ -2452,6 +3008,48 @@
             await chrome.storage.local.set({ ttsDownloadMinutes: mins });
         });
         $('btn-tts-download').addEventListener('click', handleTtsDownload);
+        $('tts-download-source').addEventListener('change', async (e) => {
+            const source = e.target.value === 'colab_gpu' ? 'colab_gpu' : 'current';
+            toggleColabPanel(source);
+            await chrome.storage.local.set({ ttsDownloadSource: source });
+            if (source === 'colab_gpu' && $('tts-colab-url').value.trim()) {
+                await checkColabHealth({ requestPerm: false, silent: true });
+            }
+        });
+        $('btn-tts-colab-open').addEventListener('click', openColabNotebook);
+        $('btn-tts-colab-copy').addEventListener('click', copyColabOneClickScript);
+        $('btn-tts-colab-paste').addEventListener('click', handleColabPasteClick);
+        $('tts-colab-url').addEventListener('change', async (e) => {
+            const clean = e.target.value.trim().replace(/\/+$/, '');
+            e.target.value = clean;
+            state.colabOnline = false;
+            await chrome.storage.local.set({ ttsColabUrl: clean });
+            if (clean) {
+                await checkColabHealth({ requestPerm: true, silent: false });
+            } else {
+                updateColabStatusUI();
+                setColabHint(t('tts_colab_step_hint'));
+            }
+        });
+        $('tts-colab-url').addEventListener('paste', () => {
+            setTimeout(() => {
+                const clean = ($('tts-colab-url')?.value || '').trim().replace(/\/+$/, '');
+                if (clean && UrlValidator?.isValidUrl(clean, ['http:', 'https:'])) {
+                    $('tts-colab-url').value = clean;
+                    state.colabOnline = false;
+                    void chrome.storage.local.set({ ttsColabUrl: clean });
+                    void checkColabHealth({ requestPerm: true, silent: false });
+                }
+            }, 0);
+        });
+        $('tts-colab-voice').addEventListener('change', async (e) => {
+            await chrome.storage.local.set({ ttsColabVoice: e.target.value.trim() });
+        });
+        $('tts-colab-gpu').addEventListener('change', async (e) => {
+            const tier = ['T4', 'L4', 'A100', 'auto'].includes(e.target.value) ? e.target.value : 'T4';
+            await chrome.storage.local.set({ ttsColabGpu: tier });
+            updateColabStatusUI();
+        });
         $('btn-tts-server-toggle').addEventListener('click', toggleVieNeuServer);
         $('btn-vieneu-install-guide').addEventListener('click', showVieNeuGuide);
 
@@ -2682,7 +3280,28 @@
                 $('api-shortcut').value = parts.join('+');
             }
         });
-        $('btn-save').addEventListener('click', () => { void saveAllSettings(); });
+        $('btn-save').addEventListener('click', () => { void saveAllSettings({ requestHostPermission: true }); });
+        $('api-endpoint').addEventListener('input', () => { void refreshApiEndpointPermission(); });
+        $('api-endpoint').addEventListener('change', () => { void refreshApiEndpointPermission(); });
+        $('btn-grant-api-host').addEventListener('click', () => {
+            const endpoint = $('api-endpoint')?.value.trim() || DEFAULT_SETTINGS.endpoint;
+            const info = parseApiEndpointOrigin(endpoint);
+            if (!info || !chrome.permissions || typeof chrome.permissions.request !== 'function') return;
+            state.apiEndpointHost = info.host;
+            state.apiEndpointOriginPattern = info.originPattern;
+            chrome.permissions.request({ origins: [info.originPattern] })
+                .then(async (granted) => {
+                    state.hasApiEndpointPerm = Boolean(granted);
+                    renderApiEndpointPermissionUI();
+                    try {
+                        await chrome.runtime.sendMessage({ action: 'sync_api_dnr_rules', endpoint });
+                    } catch (_) {}
+                })
+                .catch(() => {
+                    state.hasApiEndpointPerm = false;
+                    renderApiEndpointPermissionUI();
+                });
+        });
         ['tts-ws-fallback', 'tts-autoplay', 'tts-autonext', 'tts-icon-mode', 'tts-icon-style', 'settings-debug-log'].forEach((id) => {
             const ctrl = $(id);
             if (ctrl) ctrl.addEventListener('change', () => { void saveAllSettings(); });

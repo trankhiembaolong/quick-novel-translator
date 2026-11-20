@@ -504,4 +504,74 @@ describe('Feature 3: Background Translation Broker & Secret Isolation', () => {
         assert.ok(res.meta.itemKeys.includes('permission'));
         assert.ok(res.meta.itemKeys.includes('owned_by'));
     });
+
+    it('T1.19: decorates HTTP 403 and SSE FORBIDDEN errors with API host permission hint until granted and synced', async () => {
+        const customEndpoint = 'https://api.vilao.ai/v1/chat/completions';
+        await chrome.storage.local.set({ endpoint: customEndpoint, model: 'jpt/gpt-6.2-sol' });
+
+        const runStreamExpectError = (runId) => new Promise((resolve, reject) => {
+            const port = chrome.runtime.connect({ name: 'stv-translate-stream' });
+            const timer = setTimeout(() => reject(new Error('Timed out waiting for stream error')), 2000);
+            port.onMessage.addListener((msg) => {
+                if (msg.type === 'error') {
+                    clearTimeout(timer);
+                    resolve(msg);
+                }
+            });
+            port.postMessage({
+                action: 'start_translation',
+                runId,
+                textChunks: ['测试'],
+                glossaryProfile: 'Default'
+            });
+        });
+
+        // 1. HTTP 403 without host permission -> actionable hint shown
+        sandbox.network.addRoute('/chat/completions', () => new Response(JSON.stringify({
+            error: {
+                code: 'FORBIDDEN',
+                message: 'You do not have permission to perform this action.',
+                type: 'permission_error'
+            }
+        }), { status: 403, headers: { 'Content-Type': 'application/json' } }));
+
+        const errHttp403 = await runStreamExpectError('run-403-http');
+        assert.strictEqual(errHttp403.code, 403);
+        assert.ok(errHttp403.error.includes('You do not have permission to perform this action.'));
+        assert.ok(errHttp403.error.includes('Cấp quyền API'));
+        assert.ok(errHttp403.error.includes('api.vilao.ai'));
+
+        // 2. SSE FORBIDDEN error without host permission -> actionable hint shown
+        sandbox.network.addRoute('/chat/completions', () => createSseResponse([
+            'data: {"error":{"code":"FORBIDDEN","message":"You do not have permission to perform this action.","type":"permission_error"}}'
+        ]));
+
+        const errSse = await runStreamExpectError('run-403-sse');
+        assert.ok(errSse.error.includes('You do not have permission to perform this action.'));
+        assert.ok(errSse.error.includes('Cấp quyền API'));
+        assert.ok(errSse.error.includes('api.vilao.ai'));
+
+        // 3. Grant permission and trigger sync_api_dnr_rules -> rule active & 403 does not falsely ask to grant permission
+        await chrome.permissions.request({ origins: ['https://api.vilao.ai/*'] });
+        const syncRes = await chrome.runtime.sendMessage({
+            action: 'sync_api_dnr_rules',
+            endpoint: customEndpoint
+        });
+        assert.strictEqual(syncRes.ok, true);
+        assert.strictEqual(syncRes.active, true);
+        assert.strictEqual((await chrome.declarativeNetRequest.getDynamicRules()).length, 1);
+
+        sandbox.network.addRoute('/chat/completions', () => new Response(JSON.stringify({
+            error: {
+                code: 'FORBIDDEN',
+                message: 'You do not have permission to perform this action.',
+                type: 'permission_error'
+            }
+        }), { status: 403, headers: { 'Content-Type': 'application/json' } }));
+
+        const errAfterGrant = await runStreamExpectError('run-403-granted');
+        assert.strictEqual(errAfterGrant.code, 403);
+        assert.strictEqual(errAfterGrant.error, 'You do not have permission to perform this action.');
+        assert.strictEqual(errAfterGrant.error.includes('Cấp quyền API'), false);
+    });
 });

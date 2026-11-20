@@ -10,6 +10,215 @@ const DEFAULT_PROMPT = 'Dịch toàn bộ nội dung sau sang tiếng Việt chu
 const TTS_ICON_CACHE_KEY = 'stv_tts_icon_cache';
 const TTS_CUSTOM_ICONS_KEY = 'stv_tts_custom_icons';
 const TTS_ICON_CACHE_MAX = 500;
+const API_ORIGIN_STRIP_RULE_ID = 1001;
+const COLAB_ORIGIN_STRIP_RULE_ID = 1002;
+let lastSyncedApiDnrKey = null;
+let lastSyncedColabDnrKey = null;
+
+function getApiEndpointOriginInfo(rawEndpoint) {
+    try {
+        const parsed = new URL(String(rawEndpoint || '').trim());
+        if ((parsed.protocol !== 'http:' && parsed.protocol !== 'https:') || !parsed.hostname) {
+            return null;
+        }
+        return {
+            origin: parsed.origin,
+            host: parsed.host,
+            hostname: parsed.hostname,
+            originPattern: `${parsed.protocol}//${parsed.hostname}/*`,
+            urlFilter: `|${parsed.origin}/`
+        };
+    } catch {
+        return null;
+    }
+}
+
+async function hasApiEndpointHostPermission(rawEndpoint) {
+    const info = getApiEndpointOriginInfo(rawEndpoint);
+    if (!info) return false;
+    if (typeof chrome === 'undefined' || !chrome.permissions || typeof chrome.permissions.contains !== 'function') {
+        return false;
+    }
+    try {
+        return Boolean(await chrome.permissions.contains({ origins: [info.originPattern] }));
+    } catch {
+        return false;
+    }
+}
+
+async function syncApiOriginStripRule(rawEndpoint = null, { force = false } = {}) {
+    if (
+        typeof chrome === 'undefined' ||
+        !chrome.declarativeNetRequest ||
+        typeof chrome.declarativeNetRequest.updateDynamicRules !== 'function'
+    ) {
+        return { ok: false, unsupported: true, active: false };
+    }
+
+    try {
+        let resolvedEndpoint = rawEndpoint;
+        if (resolvedEndpoint == null) {
+            const stored = (chrome.storage && chrome.storage.local)
+                ? await chrome.storage.local.get(['endpoint'])
+                : {};
+            resolvedEndpoint = stored?.endpoint || DEFAULT_ENDPOINT;
+        }
+
+        const info = getApiEndpointOriginInfo(resolvedEndpoint);
+        if (!info) {
+            if (force || lastSyncedApiDnrKey !== 'none') {
+                await chrome.declarativeNetRequest.updateDynamicRules({
+                    removeRuleIds: [API_ORIGIN_STRIP_RULE_ID],
+                    addRules: []
+                });
+            }
+            lastSyncedApiDnrKey = 'none';
+            return { ok: true, active: false, origin: '', originPattern: '', hasPermission: false };
+        }
+
+        const hasPermission = await hasApiEndpointHostPermission(resolvedEndpoint);
+        const cacheKey = `${hasPermission ? '1' : '0'}|${info.urlFilter}`;
+        if (!force && lastSyncedApiDnrKey === cacheKey) {
+            return {
+                ok: true,
+                active: hasPermission,
+                origin: info.origin,
+                originPattern: info.originPattern,
+                urlFilter: info.urlFilter,
+                hasPermission,
+                cached: true
+            };
+        }
+
+        if (hasPermission) {
+            const condition = {
+                urlFilter: info.urlFilter,
+                resourceTypes: ['xmlhttprequest', 'other']
+            };
+            const extId = typeof chrome.runtime?.id === 'string' ? chrome.runtime.id.trim().toLowerCase() : '';
+            if (extId && /^[a-z0-9.-]+$/.test(extId)) {
+                condition.initiatorDomains = [extId];
+            }
+            await chrome.declarativeNetRequest.updateDynamicRules({
+                removeRuleIds: [API_ORIGIN_STRIP_RULE_ID],
+                addRules: [{
+                    id: API_ORIGIN_STRIP_RULE_ID,
+                    priority: 1,
+                    action: {
+                        type: 'modifyHeaders',
+                        requestHeaders: [
+                            { header: 'origin', operation: 'remove' }
+                        ]
+                    },
+                    condition
+                }]
+            });
+        } else {
+            await chrome.declarativeNetRequest.updateDynamicRules({
+                removeRuleIds: [API_ORIGIN_STRIP_RULE_ID],
+                addRules: []
+            });
+        }
+
+        lastSyncedApiDnrKey = cacheKey;
+        return {
+            ok: true,
+            active: hasPermission,
+            origin: info.origin,
+            originPattern: info.originPattern,
+            urlFilter: info.urlFilter,
+            hasPermission
+        };
+    } catch (err) {
+        console.warn('[STV Background] syncApiOriginStripRule failed:', err);
+        return { ok: false, active: false, error: err?.message || String(err) };
+    }
+}
+
+async function syncColabOriginStripRule(rawColabUrl = null, { force = false } = {}) {
+    if (
+        typeof chrome === 'undefined' ||
+        !chrome.declarativeNetRequest ||
+        typeof chrome.declarativeNetRequest.updateDynamicRules !== 'function'
+    ) {
+        return { ok: false, unsupported: true, active: false };
+    }
+
+    try {
+        let resolvedUrl = rawColabUrl;
+        if (resolvedUrl == null) {
+            const stored = (chrome.storage && chrome.storage.local)
+                ? await chrome.storage.local.get(['ttsColabUrl'])
+                : {};
+            resolvedUrl = stored?.ttsColabUrl || '';
+        }
+
+        const info = getApiEndpointOriginInfo(resolvedUrl);
+        if (!info) {
+            if (force || lastSyncedColabDnrKey !== 'none') {
+                await chrome.declarativeNetRequest.updateDynamicRules({
+                    removeRuleIds: [COLAB_ORIGIN_STRIP_RULE_ID],
+                    addRules: []
+                });
+            }
+            lastSyncedColabDnrKey = 'none';
+            return { ok: true, active: false, origin: '', originPattern: '', hasPermission: false };
+        }
+
+        const hasPermission = await hasApiEndpointHostPermission(resolvedUrl);
+        const cacheKey = `${hasPermission ? '1' : '0'}|${info.urlFilter}`;
+        if (!force && lastSyncedColabDnrKey === cacheKey) {
+            return { ok: true, active: hasPermission, origin: info.origin, hasPermission, cached: true };
+        }
+
+        if (hasPermission) {
+            const condition = {
+                urlFilter: info.urlFilter,
+                resourceTypes: ['xmlhttprequest', 'other']
+            };
+            const extId = typeof chrome.runtime?.id === 'string' ? chrome.runtime.id.trim().toLowerCase() : '';
+            if (extId && /^[a-z0-9.-]+$/.test(extId)) {
+                condition.initiatorDomains = [extId];
+            }
+            await chrome.declarativeNetRequest.updateDynamicRules({
+                removeRuleIds: [COLAB_ORIGIN_STRIP_RULE_ID],
+                addRules: [{
+                    id: COLAB_ORIGIN_STRIP_RULE_ID,
+                    priority: 1,
+                    action: {
+                        type: 'modifyHeaders',
+                        requestHeaders: [
+                            { header: 'origin', operation: 'remove' }
+                        ]
+                    },
+                    condition
+                }]
+            });
+        } else {
+            await chrome.declarativeNetRequest.updateDynamicRules({
+                removeRuleIds: [COLAB_ORIGIN_STRIP_RULE_ID],
+                addRules: []
+            });
+        }
+
+        lastSyncedColabDnrKey = cacheKey;
+        return { ok: true, active: hasPermission, origin: info.origin, hasPermission };
+    } catch (err) {
+        console.warn('[STV Background] syncColabOriginStripRule failed:', err);
+        return { ok: false, active: false, error: err?.message || String(err) };
+    }
+}
+
+async function decorateForbiddenOriginError(rawMsg, status, endpoint) {
+    const msg = String(rawMsg || '');
+    if (msg.includes('Cấp quyền API')) return msg;
+    const isForbidden = status === 403 || /\bFORBIDDEN\b|permission_error|do not have permission/i.test(msg);
+    if (!isForbidden) return rawMsg;
+    const hasPerm = await hasApiEndpointHostPermission(endpoint);
+    if (hasPerm) return rawMsg;
+    const targetHost = getApiEndpointOriginInfo(endpoint)?.host || endpoint;
+    return `${msg} — Hãy mở Popup → Cài đặt → bấm "Cấp quyền API" (hoặc "Lưu cấu hình") để cấp quyền cho ${targetHost}.`;
+}
 
 function mergeTtsIconCache(existingCache, updates, lang = 'vi') {
     const describer = globalThis.STV_IconDescriber || null;
@@ -79,6 +288,7 @@ async function initSecretIsolation() {
 
 // Run immediately upon worker startup
 initSecretIsolation();
+void syncApiOriginStripRule(null, { force: true });
 
 // Ensure access level and default configuration on install/update
 if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onInstalled) {
@@ -93,6 +303,29 @@ if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onInstalle
         if (Object.keys(defaults).length > 0) {
             await chrome.storage.local.set(defaults);
         }
+        await syncApiOriginStripRule(null, { force: true });
+    });
+}
+
+if (typeof chrome !== 'undefined') {
+    chrome.runtime?.onStartup?.addListener(() => {
+        void syncApiOriginStripRule(null, { force: true });
+    });
+    chrome.storage?.onChanged?.addListener((changes, areaName) => {
+        if (areaName === 'local' && changes?.endpoint) {
+            void syncApiOriginStripRule(changes.endpoint.newValue || DEFAULT_ENDPOINT, { force: true });
+        }
+        if (areaName === 'local' && changes?.ttsColabUrl) {
+            void syncColabOriginStripRule(changes.ttsColabUrl.newValue || '', { force: true });
+        }
+    });
+    chrome.permissions?.onAdded?.addListener(() => {
+        void syncApiOriginStripRule(null, { force: true });
+        void syncColabOriginStripRule(null, { force: true });
+    });
+    chrome.permissions?.onRemoved?.addListener(() => {
+        void syncApiOriginStripRule(null, { force: true });
+        void syncColabOriginStripRule(null, { force: true });
     });
 }
 
@@ -401,6 +634,7 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
     preloadedChapters.set(preloadId, entry);
 
     (async () => {
+        let activeEndpoint = '';
         try {
             const htmlRes = await fetch(targetUrl, {
                 method: 'GET',
@@ -478,6 +712,7 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
                 throw new Error('Không có API Key để dịch trước chương sau');
             }
             const endpoint = config.endpoint || DEFAULT_ENDPOINT;
+            activeEndpoint = endpoint;
             const validator = globalThis.STV_UrlValidator || globalThis;
             if (typeof validator.isValidUrl === 'function' && !validator.isValidUrl(endpoint)) {
                 throw new Error('API Endpoint URL không hợp lệ');
@@ -510,6 +745,8 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
                 console.log("=== [Preload] SYSTEM PROMPT ===\n\n" + finalSystemPrompt);
             }
 
+            await syncApiOriginStripRule(endpoint);
+
             const aiRes = await fetch(endpoint, {
                 method: 'POST',
                 headers: {
@@ -532,7 +769,12 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
                 if (aiRes.status === 402) {
                     throw new Error("API OpenRouter báo lỗi 402 Limit (Hết tiền hoặc hết credit).");
                 }
-                throw new Error(`Phiên dịch thất bại do HTTP Status: ${aiRes.status}`);
+                let errMsg = `Phiên dịch thất bại do HTTP Status: ${aiRes.status}`;
+                try {
+                    const errJson = await aiRes.json();
+                    if (errJson?.error?.message) errMsg = errJson.error.message;
+                } catch {}
+                throw new Error(await decorateForbiddenOriginError(errMsg, aiRes.status, endpoint));
             }
 
             const reader = aiRes.body.getReader();
@@ -646,8 +888,12 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
                 entry.status = 'aborted';
                 return;
             }
+            let errMsg = err?.message || String(err);
+            if (activeEndpoint) {
+                errMsg = await decorateForbiddenOriginError(errMsg, 0, activeEndpoint);
+            }
             entry.status = 'error';
-            entry.error = err?.message || String(err);
+            entry.error = errMsg;
             broadcastPreloadEvent(entry, { type: 'error', error: entry.error });
         }
     })();
@@ -669,8 +915,21 @@ function parsePortFromUrl(url) {
     }
 }
 
+function isRemoteTunnelUrl(url) {
+    try {
+        const parsed = new URL(String(url || '').trim());
+        const host = parsed.hostname.toLowerCase();
+        return parsed.protocol === 'https:' && host !== 'localhost' && host !== '127.0.0.1' && host !== '::1';
+    } catch {
+        return false;
+    }
+}
+
 function buildAuthHeaders(apiKey, extra = {}) {
-    const headers = { ...extra };
+    const headers = {
+        'ngrok-skip-browser-warning': 'true',
+        ...extra
+    };
     if (apiKey && apiKey.trim()) {
         headers['Authorization'] = `Bearer ${apiKey.trim()}`;
     }
@@ -1343,7 +1602,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return true;
     }
     if (request.action === 'set_runtime_setting' && request.key) {
-        const allowed = new Set(['ttsAutoNextChapter', 'ttsSpeed', 'stv_locale', 'ttsDownloadMinutes', 'ttsIconMode', 'ttsIconStyle']);
+        const allowed = new Set([
+            'ttsAutoNextChapter', 'ttsSpeed', 'stv_locale', 'ttsDownloadMinutes',
+            'ttsDownloadSource', 'ttsColabUrl', 'ttsColabVoice', 'ttsColabGpu',
+            'ttsIconMode', 'ttsIconStyle'
+        ]);
         if (!allowed.has(request.key)) {
             sendResponse({ ok: false, error: 'Setting không được phép' });
             return false;
@@ -1357,6 +1620,20 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         chrome.storage.local.get(['shortcut'], (data) => {
             sendResponse({ shortcut: data.shortcut || 'Ctrl+Q' });
         });
+        return true;
+    }
+
+    if (request.action === 'sync_api_dnr_rules') {
+        Promise.all([
+            request.endpoint !== undefined || request.colabUrl === undefined
+                ? syncApiOriginStripRule(request.endpoint ?? null, { force: true })
+                : Promise.resolve({ ok: true, skipped: true }),
+            request.colabUrl !== undefined
+                ? syncColabOriginStripRule(request.colabUrl, { force: true })
+                : syncColabOriginStripRule(null, { force: true })
+        ])
+            .then(([apiRes, colabRes]) => sendResponse({ ...apiRes, colab: colabRes }))
+            .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
         return true;
     }
 
@@ -1411,7 +1688,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (request.action === 'vieneu_check_health') {
         const serverUrl = normalizeServerUrl(request.serverUrl);
-        fetchWithTimeout(`${serverUrl}/health`, { method: 'GET' }, 2500)
+        const timeoutMs = (request.isColab || isRemoteTunnelUrl(serverUrl)) ? 6000 : 2500;
+        const headers = buildAuthHeaders(request.apiKey);
+        fetchWithTimeout(`${serverUrl}/health`, { method: 'GET', headers }, timeoutMs)
             .then(async (res) => {
                 if (!res.ok) {
                     const txt = await res.text().catch(() => '');
@@ -1433,7 +1712,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const body = { mode };
         if (request.leaseId) body.lease_id = String(request.leaseId);
         if (mode === 'export' && Number.isFinite(Number(request.workers))) {
-            body.workers = Math.max(1, Math.min(4, Math.floor(Number(request.workers))));
+            body.workers = Math.max(1, Math.min(12, Math.floor(Number(request.workers))));
+        }
+        if (request.gpuTier) {
+            body.gpu_tier = String(request.gpuTier);
         }
         if (Number.isFinite(Number(request.ttlSec))) {
             body.ttl_sec = Math.max(10, Math.min(600, Number(request.ttlSec)));
@@ -1472,8 +1754,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     if (request.action === 'vieneu_get_voices') {
         const serverUrl = normalizeServerUrl(request.serverUrl);
+        const timeoutMs = (request.isColab || isRemoteTunnelUrl(serverUrl)) ? 8000 : 4000;
         const headers = buildAuthHeaders(request.apiKey);
-        fetchWithTimeout(`${serverUrl}/v1/voices`, { method: 'GET', headers }, 4000)
+        fetchWithTimeout(`${serverUrl}/v1/voices`, { method: 'GET', headers }, timeoutMs)
             .then(async (res) => {
                 if (!res.ok) {
                     const errBody = await res.json().catch(() => null);
@@ -1621,6 +1904,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             'ttsEngine', 'ttsWsEndpoint', 'ttsWsVoice', 'ttsWsFallback', 'ttsWsAutoFallback',
             'ttsEndpoint', 'ttsVoice', 'ttsApiKey', 'ttsSpeed', 'ttsStability', 'ttsStabilityProfile',
             'ttsAutoNext', 'ttsAutoNextChapter', 'ttsPreloadSec', 'ttsPreloadSeconds', 'ttsDownloadMinutes',
+            'ttsDownloadSource', 'ttsColabUrl', 'ttsColabVoice', 'ttsColabGpu',
             'ttsIconMode', 'ttsIconStyle', TTS_ICON_CACHE_KEY, TTS_CUSTOM_ICONS_KEY,
             'stv_locale', 'stvDebugLog'
         ], (data) => {
@@ -1698,6 +1982,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                 sendResponse({ ok: false, error: 'Không tạo được URL /models từ Endpoint hiện tại.' });
                 return;
             }
+
+            await syncApiOriginStripRule(rawEndpoint);
 
             const headers = buildAuthHeaders(resolvedApiKey, { 'Accept': 'application/json' });
             const res = await fetchWithTimeout(modelsUrl, { method: 'GET', headers }, 12000);
@@ -1809,6 +2095,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
 
             const { systemPrompt, userMessage } = describer.buildAiIconPrompt(normalizedItems, { style, lang });
+            await syncApiOriginStripRule(endpoint);
             const res = await fetchWithTimeout(endpoint, {
                 method: 'POST',
                 headers: {
@@ -1941,6 +2228,8 @@ async function handleRetranslateLine(request) {
             singlePrompt += `\nBắt buộc tuân thủ các thuật ngữ sau:\n${glossaryPrompt}`;
         }
 
+        await syncApiOriginStripRule(endpoint);
+
         const response = await fetch(endpoint, {
             method: 'POST',
             headers: {
@@ -1971,6 +2260,7 @@ async function handleRetranslateLine(request) {
                     if (errJson?.error?.message) errMsg = errJson.error.message;
                 } catch {}
             }
+            errMsg = await decorateForbiddenOriginError(errMsg, response.status, endpoint);
             return { ok: false, error: errMsg };
         }
 
@@ -2028,6 +2318,7 @@ function handleStreamConnection(port) {
 
         const controller = new AbortController();
         activeRuns.set(runId, controller);
+        let activeEndpoint = '';
 
         try {
             const config = await chrome.storage.local.get([
@@ -2047,6 +2338,7 @@ function handleStreamConnection(port) {
             }
 
             const endpoint = config.endpoint || DEFAULT_ENDPOINT;
+            activeEndpoint = endpoint;
             const validator = globalThis.STV_UrlValidator || globalThis;
             if (typeof validator.isValidUrl === 'function' && !validator.isValidUrl(endpoint)) {
                 safePortPost(port, {
@@ -2121,6 +2413,8 @@ function handleStreamConnection(port) {
                 });
             }
 
+            await syncApiOriginStripRule(endpoint);
+
             const response = await fetch(endpoint, {
                 method: 'POST',
                 headers: {
@@ -2153,6 +2447,7 @@ function handleStreamConnection(port) {
                         if (errJson?.error?.message) errorMsg = errJson.error.message;
                     } catch {}
                 }
+                errorMsg = await decorateForbiddenOriginError(errorMsg, response.status, endpoint);
                 safePortPost(port, {
                     type: 'error',
                     runId,
@@ -2258,10 +2553,14 @@ function handleStreamConnection(port) {
             if (err.name === 'AbortError' || controller.signal.aborted) {
                 return;
             }
+            let errMsg = err?.message || String(err);
+            if (activeEndpoint) {
+                errMsg = await decorateForbiddenOriginError(errMsg, 0, activeEndpoint);
+            }
             safePortPost(port, {
                 type: 'error',
                 runId,
-                error: err?.message || String(err),
+                error: errMsg,
                 code: 0
             });
         } finally {
@@ -2721,6 +3020,10 @@ if (typeof chrome !== 'undefined' && chrome.commands && chrome.commands.onComman
 }
 
 globalThis.STV_TranslationBroker = {
+    API_ORIGIN_STRIP_RULE_ID,
+    getApiEndpointOriginInfo,
+    hasApiEndpointHostPermission,
+    syncApiOriginStripRule,
     handleStreamConnection,
     handleRetranslateLine,
     deriveModelsEndpointUrl,
