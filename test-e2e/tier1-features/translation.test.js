@@ -28,6 +28,7 @@ describe('Feature 3: Background Translation Broker & Secret Isolation', () => {
                 accessLevel: 'TRUSTED_CONTEXTS'
             }
         });
+        globalThis.STV_TranslationBroker.resetLlmReasoningModeCache();
     });
 
     afterEach(() => {
@@ -573,5 +574,200 @@ describe('Feature 3: Background Translation Broker & Secret Isolation', () => {
         assert.strictEqual(errAfterGrant.code, 403);
         assert.strictEqual(errAfterGrant.error, 'You do not have permission to perform this action.');
         assert.strictEqual(errAfterGrant.error.includes('Cấp quyền API'), false);
+    });
+
+    const runTranslateStreamText = (runId, textChunks = ['测试']) => new Promise((resolve, reject) => {
+        const port = chrome.runtime.connect({ name: 'stv-translate-stream' });
+        const timer = setTimeout(() => reject(new Error(`Timed out waiting for ${runId}`)), 2000);
+        let acc = '';
+        port.onMessage.addListener((msg) => {
+            if (msg.type === 'delta' && typeof msg.delta === 'string') {
+                acc += msg.delta;
+            } else if (msg.type === 'done') {
+                clearTimeout(timer);
+                resolve(acc);
+            } else if (msg.type === 'error') {
+                clearTimeout(timer);
+                reject(new Error(msg.error));
+            }
+        });
+        port.postMessage({
+            action: 'start_translation',
+            runId,
+            textChunks,
+            glossaryProfile: 'Default'
+        });
+    });
+
+    it('T1.18a: OpenRouter translation stream and single-line retranslation send reasoning.enabled=false without reasoning_effort', async () => {
+        globalThis.STV_TranslationBroker.resetLlmReasoningModeCache();
+        const capturedBodies = [];
+
+        sandbox.network.addRoute('/chat/completions', async (_url, options) => {
+            capturedBodies.push(JSON.parse(options.body));
+            return createSseResponse([{ content: 'Đại đạo vô tình.' }]);
+        });
+
+        await runTranslateStreamText('run-or-disable', ['大道无情']);
+
+        assert.strictEqual(capturedBodies.length, 1);
+        assert.deepStrictEqual(capturedBodies[0].reasoning, { enabled: false });
+        assert.strictEqual('reasoning_effort' in capturedBodies[0], false);
+
+        sandbox.network.addRoute('/chat/completions', async (_url, options) => {
+            capturedBodies.push(JSON.parse(options.body));
+            return new Response(JSON.stringify({
+                choices: [{ message: { content: 'Nghịch thiên cải mệnh' } }]
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        });
+
+        const reRes = await chrome.runtime.sendMessage({
+            action: 'stv_retranslate_line',
+            origText: '逆天改命',
+            lineIndex: 0,
+            glossaryProfile: 'Default'
+        });
+        assert.strictEqual(reRes.ok, true);
+        assert.strictEqual(capturedBodies.length, 2);
+        assert.deepStrictEqual(capturedBodies[1].reasoning, { enabled: false });
+        assert.strictEqual('reasoning_effort' in capturedBodies[1], false);
+    });
+
+    it('T1.18b: Non-OpenRouter OpenAI-compatible endpoint sends reasoning_effort=none without reasoning', async () => {
+        globalThis.STV_TranslationBroker.resetLlmReasoningModeCache();
+        const capturedBodies = [];
+
+        await chrome.storage.local.set({
+            endpoint: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
+            model: 'gemini-2.5-flash'
+        });
+
+        sandbox.network.addRoute('/chat/completions', async (_url, options) => {
+            capturedBodies.push(JSON.parse(options.body));
+            return createSseResponse([{ content: 'Vân Vận gật đầu.' }]);
+        });
+
+        await runTranslateStreamText('run-gemini-none', ['云韵点了点头']);
+
+        assert.strictEqual(capturedBodies.length, 1);
+        assert.strictEqual(capturedBodies[0].reasoning_effort, 'none');
+        assert.strictEqual('reasoning' in capturedBodies[0], false);
+    });
+
+    it('T1.18c: HTTP 400 rejecting reasoning_effort retries with omitted reasoning and caches omit across subsequent calls', async () => {
+        globalThis.STV_TranslationBroker.resetLlmReasoningModeCache();
+        await chrome.storage.local.set({
+            endpoint: 'https://api.example.test/v1/chat/completions',
+            model: 'custom/legacy-non-reasoning'
+        });
+
+        const sentModes = [];
+        sandbox.network.addRoute('/chat/completions', async (_url, options) => {
+            const body = JSON.parse(options.body);
+            sentModes.push({ reasoning: body.reasoning, reasoning_effort: body.reasoning_effort });
+            if ('reasoning_effort' in body || 'reasoning' in body) {
+                return new Response(JSON.stringify({
+                    error: { message: "Unsupported parameter: 'reasoning_effort'" }
+                }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+            }
+            return createSseResponse([{ content: 'Dịch thành công.' }]);
+        });
+
+        const out1 = await runTranslateStreamText('run-omit-1', ['测试文本']);
+        assert.strictEqual(out1, 'Dịch thành công.');
+        assert.strictEqual(sentModes.length, 2);
+        assert.strictEqual(sentModes[0].reasoning_effort, 'none');
+        assert.strictEqual(sentModes[1].reasoning_effort, undefined);
+
+        const out2 = await runTranslateStreamText('run-omit-2', ['测试文本']);
+        assert.strictEqual(out2, 'Dịch thành công.');
+        assert.strictEqual(sentModes.length, 3, 'Cached omit mode must avoid re-sending unsupported reasoning parameter');
+        assert.strictEqual(sentModes[2].reasoning_effort, undefined);
+    });
+
+    it('T1.18d: Mandatory-reasoning OpenRouter model falls back disable -> low -> omit and caches mode', async () => {
+        globalThis.STV_TranslationBroker.resetLlmReasoningModeCache();
+        await chrome.storage.local.set({
+            endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+            model: 'deepseek/deepseek-r1-mandatory'
+        });
+
+        const sentEfforts = [];
+        sandbox.network.addRoute('/chat/completions', async (_url, options) => {
+            const body = JSON.parse(options.body);
+            sentEfforts.push(body.reasoning);
+            if (body.reasoning && body.reasoning.enabled === false) {
+                return new Response(JSON.stringify({
+                    error: { message: 'Reasoning is mandatory for this endpoint and cannot be disabled' }
+                }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+            }
+            return createSseResponse([{ content: 'Dịch với low reasoning.' }]);
+        });
+
+        const res1 = await runTranslateStreamText('run-mandatory-1', ['测试']);
+        assert.strictEqual(res1, 'Dịch với low reasoning.');
+        assert.strictEqual(sentEfforts.length, 2);
+        assert.deepStrictEqual(sentEfforts[0], { enabled: false });
+        assert.deepStrictEqual(sentEfforts[1], { effort: 'low' });
+
+        const res2 = await runTranslateStreamText('run-mandatory-2', ['测试']);
+        assert.strictEqual(res2, 'Dịch với low reasoning.');
+        assert.strictEqual(sentEfforts.length, 3, 'Cached low mode must be used directly on second call');
+        assert.deepStrictEqual(sentEfforts[2], { effort: 'low' });
+
+        // Second model where both disable AND low return 400 -> transitions low -> omit
+        await chrome.storage.local.set({ model: 'strict/unsupported-low' });
+        const step3Modes = [];
+        sandbox.network.addRoute('/chat/completions', async (_url, options) => {
+            const body = JSON.parse(options.body);
+            step3Modes.push(body.reasoning);
+            if (body.reasoning && body.reasoning.enabled === false) {
+                return new Response(JSON.stringify({
+                    error: { message: 'Reasoning cannot be disabled for this model' }
+                }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+            }
+            if (body.reasoning && body.reasoning.effort === 'low') {
+                return new Response(JSON.stringify({
+                    error: { message: "Invalid value for 'reasoning.effort': low" }
+                }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+            }
+            return new Response(JSON.stringify({
+                choices: [{ message: { content: 'Thành công khi omit' } }]
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        });
+
+        const reRes = await chrome.runtime.sendMessage({
+            action: 'stv_retranslate_line',
+            origText: '测试',
+            lineIndex: 1,
+            glossaryProfile: 'Default'
+        });
+        assert.strictEqual(reRes.ok, true);
+        assert.strictEqual(reRes.translatedText, 'Thành công khi omit');
+        assert.strictEqual(step3Modes.length, 3);
+        assert.deepStrictEqual(step3Modes[0], { enabled: false });
+        assert.deepStrictEqual(step3Modes[1], { effort: 'low' });
+        assert.strictEqual(step3Modes[2], undefined);
+    });
+
+    it('T1.18e: Unrelated HTTP 400 errors (Context length exceeded) are not retried and propagate verbatim', async () => {
+        globalThis.STV_TranslationBroker.resetLlmReasoningModeCache();
+        let hitCount = 0;
+        sandbox.network.addRoute('/chat/completions', () => {
+            hitCount += 1;
+            return new Response(JSON.stringify({
+                error: { message: 'Context length exceeded' }
+            }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        });
+
+        const res = await chrome.runtime.sendMessage({
+            action: 'stv_retranslate_line',
+            origText: '测试长文本',
+            lineIndex: 2,
+            glossaryProfile: 'Default'
+        });
+        assert.strictEqual(res.ok, false);
+        assert.strictEqual(res.error, 'Context length exceeded');
+        assert.strictEqual(hitCount, 1, 'Unrelated HTTP 400 must not trigger reasoning fallback retries');
     });
 });

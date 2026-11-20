@@ -778,6 +778,132 @@ function abortableDelay(ms, signal) {
     });
 }
 
+const LLM_REASONING_CACHE_MAX = 120;
+const llmReasoningModeCache = new Map(); // `${origin}|${model}` -> 'disable' | 'low' | 'omit'
+
+function resetLlmReasoningModeCache() {
+    llmReasoningModeCache.clear();
+}
+
+function isOpenRouterEndpoint(endpoint) {
+    try {
+        const host = new URL(String(endpoint || '').trim()).hostname.toLowerCase();
+        return host === 'openrouter.ai' || host.endsWith('.openrouter.ai');
+    } catch {
+        return false;
+    }
+}
+
+function getLlmReasoningCacheKey(endpoint, model) {
+    let origin = '';
+    try {
+        origin = new URL(String(endpoint || '').trim()).origin.toLowerCase();
+    } catch {
+        origin = String(endpoint || '').trim().toLowerCase();
+    }
+    return `${origin}|${String(model || '').trim().toLowerCase()}`;
+}
+
+function setLlmReasoningCacheMode(key, mode) {
+    if (!key) return;
+    llmReasoningModeCache.delete(key);
+    llmReasoningModeCache.set(key, mode);
+    if (llmReasoningModeCache.size > LLM_REASONING_CACHE_MAX) {
+        const oldestKey = llmReasoningModeCache.keys().next().value;
+        if (oldestKey !== undefined) llmReasoningModeCache.delete(oldestKey);
+    }
+}
+
+function buildLlmChatRequestBody(endpoint, basePayload = {}, reasoningMode = 'disable') {
+    const body = { ...(basePayload || {}) };
+    delete body.reasoning;
+    delete body.reasoning_effort;
+
+    if (reasoningMode === 'omit') {
+        return body;
+    }
+
+    const isOpenRouter = isOpenRouterEndpoint(endpoint);
+    if (reasoningMode === 'low') {
+        if (isOpenRouter) {
+            body.reasoning = { effort: 'low' };
+        } else {
+            body.reasoning_effort = 'low';
+        }
+        return body;
+    }
+
+    if (isOpenRouter) {
+        body.reasoning = { enabled: false };
+    } else {
+        body.reasoning_effort = 'none';
+    }
+    return body;
+}
+
+function classifyReasoningRejection(errText) {
+    const text = String(errText || '').trim();
+    if (!text) return 'omit';
+    if (/mandatory|cannot be disabled|can't be disabled|only works in thinking|thinking mode is required|must be enabled|requires reasoning|reasoning must/i.test(text)) {
+        return 'low';
+    }
+    if (/reason|think|effort|budget|unknown|unrecognized|unsupported|unexpected|extra_forbidden|additional properties|not permitted|invalid_argument|invalid value|invalid param/i.test(text)) {
+        return 'omit';
+    }
+    return null;
+}
+
+/**
+ * Dispatch an OpenAI-compatible chat completion request with reasoning disabled by default
+ * and automatic fallback (`disable -> low -> omit`) cached per `(origin, model)`.
+ */
+async function fetchLlmChatCompletion(endpoint, {
+    headers = {},
+    payload = {},
+    signal,
+    timeoutMs = 0,
+    retryRateLimit = false,
+    onRateLimit = null
+} = {}) {
+    const cacheKey = getLlmReasoningCacheKey(endpoint, payload?.model);
+    let currentMode = llmReasoningModeCache.get(cacheKey) || 'disable';
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const reqInit = {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(buildLlmChatRequestBody(endpoint, payload, currentMode))
+        };
+        let res;
+        if (retryRateLimit) {
+            res = await fetchAiWithRateLimitRetry(endpoint, reqInit, signal, onRateLimit);
+        } else if (timeoutMs > 0) {
+            res = await fetchWithTimeout(endpoint, reqInit, timeoutMs);
+        } else {
+            res = await fetch(endpoint, signal ? { ...reqInit, signal } : reqInit);
+        }
+
+        if (res.ok || (res.status !== 400 && res.status !== 422) || currentMode === 'omit') {
+            return res;
+        }
+
+        let errText = '';
+        try {
+            errText = typeof res.clone === 'function' ? await res.clone().text() : '';
+        } catch {}
+        const rejection = classifyReasoningRejection(errText);
+        if (!rejection) {
+            return res;
+        }
+
+        const nextMode = currentMode === 'disable'
+            ? (rejection === 'low' ? 'low' : 'omit')
+            : 'omit';
+        setLlmReasoningCacheMode(cacheKey, nextMode);
+        currentMode = nextMode;
+    }
+}
+
 async function fetchAiWithRateLimitRetry(endpoint, fetchInit, signal, onRateLimit) {
     const retryableStatuses = new Set([429, 502, 503, 529]);
     const backoffs = [2000, 5000];
@@ -924,13 +1050,12 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate', options = {}) 
 
             await syncApiOriginStripRule(endpoint);
 
-            const aiRes = await fetchAiWithRateLimitRetry(endpoint, {
-                method: 'POST',
+            const aiRes = await fetchLlmChatCompletion(endpoint, {
                 headers: {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${apikey}`
                 },
-                body: JSON.stringify({
+                payload: {
                     model,
                     temperature: 0.5,
                     stream: true,
@@ -938,9 +1063,12 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate', options = {}) 
                         { role: 'system', content: finalSystemPrompt },
                         { role: 'user', content: userMessage }
                     ]
-                })
-            }, entry.abortController.signal, () => {
-                entry.rateLimited = true;
+                },
+                signal: entry.abortController.signal,
+                retryRateLimit: true,
+                onRateLimit: () => {
+                    entry.rateLimited = true;
+                }
             });
 
             if (!aiRes.ok) {
@@ -2191,13 +2319,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
             try {
                 const model = config.model || DEFAULT_MODEL;
-                const aiRes = await fetch(endpoint, {
-                    method: 'POST',
+                const aiRes = await fetchLlmChatCompletion(endpoint, {
                     headers: {
                         'Content-Type': 'application/json',
                         'Authorization': `Bearer ${apikey}`
                     },
-                    body: JSON.stringify({
+                    payload: {
                         model,
                         temperature: 0.2,
                         stream: false,
@@ -2205,7 +2332,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                             { role: 'system', content: finalSystemPrompt },
                             { role: 'user', content: userMessage }
                         ]
-                    }),
+                    },
                     signal: controller.signal
                 });
 
@@ -2542,15 +2669,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
             const { systemPrompt, userMessage } = describer.buildAiIconPrompt(normalizedItems, { style, lang });
             await syncApiOriginStripRule(endpoint);
-            const res = await fetchWithTimeout(endpoint, {
-                method: 'POST',
+            const res = await fetchLlmChatCompletion(endpoint, {
                 headers: {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${apikey}`,
                     'HTTP-Referer': 'https://github.com/stv-extension',
                     'X-Title': 'Quick Novel Translator'
                 },
-                body: JSON.stringify({
+                payload: {
                     model,
                     temperature: 0.2,
                     stream: false,
@@ -2558,8 +2684,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
                         { role: 'system', content: systemPrompt },
                         { role: 'user', content: userMessage }
                     ]
-                })
-            }, 6000);
+                },
+                timeoutMs: 6000
+            });
 
             if (!res.ok) {
                 sendResponse({ ok: false, status: res.status, error: `HTTP ${res.status}` });
@@ -2676,22 +2803,21 @@ async function handleRetranslateLine(request) {
 
         await syncApiOriginStripRule(endpoint);
 
-        const response = await fetch(endpoint, {
-            method: 'POST',
+        const response = await fetchLlmChatCompletion(endpoint, {
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${apikey}`,
                 'HTTP-Referer': 'https://github.com/stv-extension',
                 'X-Title': 'Quick Novel Translator'
             },
-            body: JSON.stringify({
+            payload: {
                 model,
                 temperature: 0.2,
                 messages: [
                     { role: 'system', content: singlePrompt },
                     { role: 'user', content: origText }
                 ]
-            })
+            }
         });
 
         if (!response.ok) {
@@ -2861,15 +2987,14 @@ function handleStreamConnection(port) {
 
             await syncApiOriginStripRule(endpoint);
 
-            const response = await fetch(endpoint, {
-                method: 'POST',
+            const response = await fetchLlmChatCompletion(endpoint, {
                 headers: {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${apikey}`,
                     'HTTP-Referer': 'https://github.com/stv-extension',
                     'X-Title': 'Quick Novel Translator'
                 },
-                body: JSON.stringify({
+                payload: {
                     model,
                     temperature: msg.options?.temperature ?? 0.5,
                     stream: true,
@@ -2877,7 +3002,7 @@ function handleStreamConnection(port) {
                         { role: 'system', content: finalSystemPrompt },
                         { role: 'user', content: userMessage }
                     ]
-                }),
+                },
                 signal: controller.signal
             });
 
@@ -3824,5 +3949,8 @@ globalThis.STV_TranslationBroker = {
     handleStreamConnection,
     handleRetranslateLine,
     deriveModelsEndpointUrl,
-    normalizeFetchedModels
+    normalizeFetchedModels,
+    buildLlmChatRequestBody,
+    fetchLlmChatCompletion,
+    resetLlmReasoningModeCache
 };
