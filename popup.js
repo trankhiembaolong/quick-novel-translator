@@ -37,11 +37,19 @@
         ttsColabUrl: '',
         ttsColabVoice: '',
         ttsColabGpu: 'T4',
+        ttsExportTranslateConcurrency: 3,
         ttsIconMode: 'auto',
         ttsIconStyle: 'tagged',
         stvDebugLog: false,
         stv_theme: 'dark'
     };
+
+    function normalizeExportTranslateConcurrency(raw) {
+        const parsed = Math.floor(Number(raw));
+        return Number.isFinite(parsed)
+            ? Math.max(1, Math.min(6, parsed))
+            : DEFAULT_SETTINGS.ttsExportTranslateConcurrency;
+    }
 
     const COLAB_NOTEBOOK_URL = 'https://colab.research.google.com/github/trankhiembaolong/quick-novel-translator/blob/main/colab/VieNeu_Colab_GPU.ipynb';
 
@@ -472,6 +480,7 @@
         $('tts-colab-url').value = cfg.ttsColabUrl || '';
         const colabGpuVal = ['T4', 'L4', 'A100', 'auto'].includes(cfg.ttsColabGpu) ? cfg.ttsColabGpu : DEFAULT_SETTINGS.ttsColabGpu;
         $('tts-colab-gpu').value = colabGpuVal;
+        $('tts-export-translate-concurrency').value = String(normalizeExportTranslateConcurrency(cfg.ttsExportTranslateConcurrency));
         populateColabVoiceSelect([], cfg.ttsColabVoice || '');
 
         $('tts-ws-endpoint').value = cfg.ttsWsEndpoint || DEFAULT_SETTINGS.ttsWsEndpoint;
@@ -664,6 +673,7 @@
                 ttsColabUrl: $('tts-colab-url').value.trim().replace(/\/+$/, ''),
                 ttsColabVoice: $('tts-colab-voice').value.trim(),
                 ttsColabGpu: $('tts-colab-gpu').value || DEFAULT_SETTINGS.ttsColabGpu,
+                ttsExportTranslateConcurrency: normalizeExportTranslateConcurrency($('tts-export-translate-concurrency')?.value),
                 ttsIconMode: $('tts-icon-mode').value || DEFAULT_SETTINGS.ttsIconMode,
                 ttsIconStyle: $('tts-icon-style').value || DEFAULT_SETTINGS.ttsIconStyle,
                 stvDebugLog: $('settings-debug-log').checked
@@ -1305,6 +1315,7 @@
             'ttsEndpoint', 'ttsBackend', 'ttsStability', 'ttsStabilityProfile', 'ttsVoice',
             'ttsSpeed', 'ttsAutoNext', 'ttsAutoNextChapter', 'ttsPreloadSec', 'ttsPreloadSeconds',
             'ttsDownloadMinutes', 'ttsDownloadSource', 'ttsColabUrl', 'ttsColabVoice', 'ttsColabGpu',
+            'ttsExportTranslateConcurrency',
             'ttsIconMode', 'ttsIconStyle'
         ]);
 
@@ -1315,6 +1326,9 @@
         const colabVoice = ($('tts-colab-voice')?.value || stored.ttsColabVoice || '').trim();
         const colabGpuTier = $('tts-colab-gpu')?.value || stored.ttsColabGpu || DEFAULT_SETTINGS.ttsColabGpu;
         const colabProfile = getColabGpuProfile(colabGpuTier);
+        const exportTranslateConcurrency = normalizeExportTranslateConcurrency(
+            $('tts-export-translate-concurrency')?.value ?? stored.ttsExportTranslateConcurrency
+        );
         return {
             engine,
             wsEndpoint: stored.ttsWsEndpoint || DEFAULT_SETTINGS.ttsWsEndpoint,
@@ -1336,6 +1350,7 @@
             colabGpuTier: colabProfile.tier,
             colabWorkers: colabProfile.workers,
             colabMaxChunkChars: colabProfile.maxChunkChars,
+            exportTranslateConcurrency,
             iconMode: $('tts-icon-mode')?.value || stored.ttsIconMode || DEFAULT_SETTINGS.ttsIconMode,
             iconStyle: $('tts-icon-style')?.value || stored.ttsIconStyle || DEFAULT_SETTINGS.ttsIconStyle,
             ...extra
@@ -3016,6 +3031,11 @@
             const mins = Math.min(240, Math.max(1, parseInt(e.target.value, 10) || DEFAULT_SETTINGS.ttsDownloadMinutes));
             e.target.value = mins;
             await chrome.storage.local.set({ ttsDownloadMinutes: mins });
+        });
+        $('tts-export-translate-concurrency').addEventListener('change', async (e) => {
+            const conc = normalizeExportTranslateConcurrency(e.target.value);
+            e.target.value = String(conc);
+            await chrome.storage.local.set({ ttsExportTranslateConcurrency: conc });
         });
         $('btn-tts-download').addEventListener('click', handleTtsDownload);
         $('tts-download-source').addEventListener('change', async (e) => {

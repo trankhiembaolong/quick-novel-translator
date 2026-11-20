@@ -15,6 +15,11 @@
     };
     const DEFAULT_DOWNLOAD_MINUTES = 30;
     const MAX_EXPORT_CHAPTERS = 30;
+    const DEFAULT_EXPORT_TRANSLATE_CONCURRENCY = 3;
+    const EXPORT_WAVE_MAX_CHAPTERS = 6;
+    const EXPORT_WAVE_MAX_RAW_CHARS = 18000;
+    const EXPORT_PROBE_BUFFER_RATIO = 1.05;
+    const EXPORT_PROBE_DELAY_MS = 120;
 
     function getColabGpuExportConfig(tier = 'T4', healthData = null) {
         const raw = String(tier || 'T4').trim().toUpperCase();
@@ -878,6 +883,58 @@
         return foreignChars >= 12 || (foreignChars / totalChars) >= 0.15;
     }
 
+    const HANZI_DURATION_RE = /[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]/g;
+    const KANA_HANGUL_DURATION_RE = /[\u3040-\u30FF\uAC00-\uD7AF]/g;
+
+    /**
+     * Estimate spoken duration in seconds from raw (CJK/Kana/Hangul) or translated chunks,
+     * applying CJK->Vietnamese character expansion and optional measured Chapter-1 calibration.
+     */
+    function estimateRawChapterDurationSec(chunks, speed = 1.0, calibration = null) {
+        const list = Array.isArray(chunks) ? chunks : [chunks];
+        let hanziChars = 0;
+        let kanaHangulChars = 0;
+        let otherChars = 0;
+
+        for (const item of list) {
+            const text = typeof item === 'string'
+                ? item
+                : (item && typeof item.text === 'string' ? item.text : '');
+            if (!text) continue;
+            const compact = text.replace(/\s+/g, '');
+            if (!compact) continue;
+            const hanMatches = compact.match(HANZI_DURATION_RE);
+            const hCount = hanMatches ? hanMatches.length : 0;
+            const khMatches = compact.match(KANA_HANGUL_DURATION_RE);
+            const khCount = khMatches ? khMatches.length : 0;
+            hanziChars += hCount;
+            kanaHangulChars += khCount;
+            otherChars += Math.max(0, compact.length - hCount - khCount);
+        }
+
+        const estViChars = hanziChars * 4.3 + kanaHangulChars * 3.0 + otherChars;
+        const defaultRate = 14 * Math.max(0.5, Number(speed) || 1.0);
+        const calRate = Number(calibration?.measuredViCharsPerSec);
+        const charsPerSec = Number.isFinite(calRate) && calRate > 0
+            ? Math.max(6, Math.min(35, calRate))
+            : defaultRate;
+        return estViChars / charsPerSec;
+    }
+
+    function calibrateExportSpeakingRate(actualSec, segments) {
+        const sec = Number(actualSec);
+        if (!Number.isFinite(sec) || sec <= 1) return null;
+        let viChars = 0;
+        if (Array.isArray(segments)) {
+            for (const seg of segments) {
+                const txt = seg && typeof seg.text === 'string' ? seg.text : '';
+                if (txt) viChars += txt.replace(/\s+/g, '').length;
+            }
+        }
+        if (viChars < 40) return null;
+        return Math.max(6, Math.min(35, viChars / sec));
+    }
+
     // Export DSP helpers for testing and external consumption
     global.STV_TTSHelpers = {
         cleanTextForSpeech,
@@ -893,6 +950,7 @@
         appendPackedSegment,
         packSegmentsForExport,
         containsForeignCjkText,
+        estimateRawChapterDurationSec,
         COLAB_TIER_CONFIG,
         getColabGpuExportConfig,
         COLAB_BATCH_SIZE_BY_TIER,
@@ -1295,6 +1353,7 @@
         aiIconsUnavailable: false,
         liveIconDebounceTimer: null,
         hasTranslationApiKey: false,
+        exportTranslateConcurrency: DEFAULT_EXPORT_TRANSLATE_CONCURRENCY,
         debugLog: false
     };
 
@@ -1302,6 +1361,7 @@
         active: false,
         runId: 0,
         leaseId: null,
+        exportSessionId: '',
         useColabGpu: false,
         useBatchApi: false,
         useBatchOpus: false,
@@ -1317,6 +1377,10 @@
         accumulatedSec: 0,
         chaptersCompleted: 0,
         currentChapter: 0,
+        plannedChapters: 1,
+        translatedChapters: 1,
+        probingChapters: false,
+        preExtractingGlossary: false,
         segIndex: 0,
         segTotal: 0,
         fetchingNext: false,
@@ -1324,7 +1388,7 @@
         nextOpenUrl: null,
         activePorts: new Set(),
         activeSockets: new Set(),
-        activePreloadPort: null,
+        activePreloadPorts: new Set(),
         abortRejects: new Set()
     };
 
@@ -1787,10 +1851,26 @@
                 if (exportState.waitingTranslation) {
                     statusEl.textContent = tTts('tts_dl_waiting_translation', 'Đang đợi chương hiện tại dịch xong để tải audio...');
                 } else if (exportState.fetchingNext) {
-                    statusEl.textContent = tTts('tts_dl_fetching_next', `Đã tạo ${curMin}/${exportState.targetMinutes}p · Đang tải & dịch chương ${exportState.currentChapter}...`)
+                    if (exportState.preExtractingGlossary) {
+                        statusEl.textContent = tTts('tts_dl_pre_extract_glossary', `Đã tạo ${curMin}/${exportState.targetMinutes}p · Đang trích từ điển & dịch chương ${exportState.currentChapter}...`)
+                            .replace('{current}', curMin)
+                            .replace('{target}', String(exportState.targetMinutes))
+                            .replace('{chap}', String(exportState.currentChapter));
+                    } else {
+                        statusEl.textContent = tTts('tts_dl_fetching_next', `Đã tạo ${curMin}/${exportState.targetMinutes}p · Đang tải & dịch chương ${exportState.currentChapter}...`)
+                            .replace('{current}', curMin)
+                            .replace('{target}', String(exportState.targetMinutes))
+                            .replace('{chap}', String(exportState.currentChapter));
+                    }
+                } else if (exportState.plannedChapters > 1) {
+                    statusEl.textContent = tTts('tts_dl_progress_parallel', `Đang tạo: ${curMin}/${exportState.targetMinutes}p · Chương ${exportState.currentChapter}/${exportState.plannedChapters} (${exportState.segIndex}/${exportState.segTotal}) · Dịch: ${exportState.translatedChapters}/${exportState.plannedChapters}`)
                         .replace('{current}', curMin)
                         .replace('{target}', String(exportState.targetMinutes))
-                        .replace('{chap}', String(exportState.currentChapter));
+                        .replace('{chap}', String(exportState.currentChapter))
+                        .replace('{planned}', String(exportState.plannedChapters))
+                        .replace('{seg}', String(exportState.segIndex))
+                        .replace('{totalSeg}', String(exportState.segTotal))
+                        .replace('{translated}', String(exportState.translatedChapters));
                 } else {
                     statusEl.textContent = tTts('tts_dl_progress', `Đang tạo: ${curMin}/${exportState.targetMinutes} phút · Chương ${exportState.currentChapter} (${exportState.segIndex}/${exportState.segTotal})`)
                         .replace('{current}', curMin)
@@ -2476,6 +2556,7 @@
                             if (!msg || state.preloadWatchPort !== watchPort || !state.preloadTriggered || state.runId !== capturedRun) {
                                 return;
                             }
+                            if (msg.type === 'keepalive') return;
                             if (msg.type === 'error') {
                                 streamErrored = true;
                                 state.preloadState = 'error';
@@ -3880,6 +3961,13 @@
         state.hasTranslationApiKey = options.hasTranslationApiKey !== undefined
             ? Boolean(options.hasTranslationApiKey)
             : Boolean(config.hasTranslationApiKey);
+        const rawConc = options.exportTranslateConcurrency !== undefined
+            ? options.exportTranslateConcurrency
+            : config.ttsExportTranslateConcurrency;
+        const parsedConc = Math.floor(Number(rawConc));
+        state.exportTranslateConcurrency = Number.isFinite(parsedConc)
+            ? Math.max(1, Math.min(6, parsedConc))
+            : DEFAULT_EXPORT_TRANSLATE_CONCURRENCY;
 
         return config;
     }
@@ -3894,9 +3982,18 @@
             try { ws.close(); } catch {}
         }
         exportState.activeSockets.clear();
-        if (exportState.activePreloadPort) {
-            try { exportState.activePreloadPort.disconnect(); } catch {}
-            exportState.activePreloadPort = null;
+        for (const port of Array.from(exportState.activePreloadPorts)) {
+            try { port.disconnect(); } catch {}
+        }
+        exportState.activePreloadPorts.clear();
+        if (exportState.exportSessionId && isExtensionAlive()) {
+            try {
+                chrome.runtime.sendMessage({
+                    action: 'cancel_export_prefetches',
+                    exportSessionId: exportState.exportSessionId,
+                    keepReady: true
+                }, () => { void chrome?.runtime?.lastError; });
+            } catch {}
         }
         const rejects = Array.from(exportState.abortRejects);
         exportState.abortRejects.clear();
@@ -4226,8 +4323,37 @@
         return { ok: true };
     }
 
-    function fetchAndTranslateChapterForExport(targetUrl, mode, exportRunId) {
+    function abortableExportDelay(ms, exportRunId) {
+        if (!ms || ms <= 0) return Promise.resolve();
+        if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+            return Promise.reject(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+        }
         return new Promise((resolve, reject) => {
+            const cleanup = () => {
+                clearTimeout(timer);
+                exportState.abortRejects.delete(abortHandler);
+            };
+            const abortHandler = (err) => {
+                cleanup();
+                reject(err);
+            };
+            const timer = setTimeout(() => {
+                cleanup();
+                resolve();
+            }, ms);
+            if (typeof timer.unref === 'function') timer.unref();
+            exportState.abortRejects.add(abortHandler);
+        });
+    }
+
+    async function fetchAndTranslateChapterForExport(targetUrl, mode, exportRunId, opts = {}) {
+        const {
+            preserveOtherPreloads = false,
+            exportSessionId = '',
+            maxDisconnectRetries = 2
+        } = opts || {};
+
+        const connectAndWaitOnce = () => new Promise((resolve, reject) => {
             if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
                 reject(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
                 return;
@@ -4235,7 +4361,9 @@
             chrome.runtime.sendMessage({
                 action: 'start_chapter_preload',
                 url: targetUrl,
-                mode
+                mode,
+                preserveOtherPreloads,
+                exportSessionId
             }, (resp) => {
                 if (chrome.runtime.lastError || !resp || !resp.ok) {
                     reject(new Error(resp?.error || chrome.runtime.lastError?.message || 'Preload failed'));
@@ -4253,15 +4381,13 @@
                     reject(err);
                     return;
                 }
-                exportState.activePreloadPort = port;
+                exportState.activePreloadPorts.add(port);
                 let settled = false;
                 let accFullText = '';
 
                 const cleanup = () => {
                     clearTimeout(timer);
-                    if (exportState.activePreloadPort === port) {
-                        exportState.activePreloadPort = null;
-                    }
+                    exportState.activePreloadPorts.delete(port);
                     exportState.abortRejects.delete(abortHandler);
                     try { port.disconnect(); } catch {}
                 };
@@ -4273,7 +4399,8 @@
                     resolve({
                         fullText: msg.fullText !== undefined ? msg.fullText : accFullText,
                         origChunks: Array.isArray(msg.origChunks) ? msg.origChunks : [],
-                        nextUrl: msg.nextUrl || null
+                        nextUrl: msg.nextUrl || null,
+                        rateLimited: Boolean(msg.rateLimited)
                     });
                 };
 
@@ -4290,9 +4417,11 @@
                 const timer = setTimeout(() => {
                     finishErr(new Error('Timeout tải/dịch chương tiếp theo'));
                 }, 180000);
+                if (typeof timer.unref === 'function') timer.unref();
 
                 port.onMessage.addListener((msg) => {
                     if (!msg || settled) return;
+                    if (msg.type === 'keepalive') return;
                     if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
                         finishErr(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
                         return;
@@ -4305,14 +4434,18 @@
                         if (msg.fullText !== undefined && msg.done) accFullText = msg.fullText;
                         if (msg.done) finishOk(msg);
                     } else if (msg.type === 'error') {
-                        finishErr(new Error(msg.error || 'Preload failed'));
+                        const err = new Error(msg.error || 'Preload failed');
+                        err.rateLimited = Boolean(msg.rateLimited);
+                        finishErr(err);
                     }
                 });
 
                 port.onDisconnect.addListener(() => {
                     void chrome?.runtime?.lastError;
                     if (!settled) {
-                        finishErr(new Error('Mất kết nối background khi tải chương tiếp theo'));
+                        const discErr = new Error('Mất kết nối background khi tải chương tiếp theo');
+                        discErr.disconnectRetryable = true;
+                        finishErr(discErr);
                     }
                 });
 
@@ -4323,6 +4456,427 @@
                 }
             });
         });
+
+        for (let attempt = 0; attempt <= maxDisconnectRetries; attempt++) {
+            if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+                throw new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED');
+            }
+            try {
+                return await connectAndWaitOnce();
+            } catch (err) {
+                const canRetry = Boolean(
+                    err?.disconnectRetryable &&
+                    attempt < maxDisconnectRetries &&
+                    !exportState.aborted &&
+                    !exportState.savePartialRequested &&
+                    exportState.runId === exportRunId
+                );
+                if (!canRetry) throw err;
+                const retryDelayMs = attempt === 0 ? 400 : 1000;
+                ttsLog(`stv-preload-stream disconnected, retrying (${attempt + 1}/${maxDisconnectRetries}) in ${retryDelayMs}ms`);
+                await abortableExportDelay(retryDelayMs, exportRunId);
+            }
+        }
+    }
+
+    /**
+     * Coordinate 3 overlapping stages for multi-chapter export:
+     * 1) Sequential raw probing by estimated duration (in capped waves),
+     * 2) Wave-level glossary pre-extraction before parallel translation,
+     * 3) Adaptive parallel translation worker pool feeding sequential GPU synthesis.
+     */
+    function createExportChapterPipeline({
+        initialNextUrl,
+        ch1EstSec = 0,
+        targetSeconds,
+        preloadMode,
+        speed,
+        exportRunId,
+        exportSessionId,
+        initialConcurrency = DEFAULT_EXPORT_TRANSLATE_CONCURRENCY
+    }) {
+        let stopped = false;
+        let cursorUrl = initialNextUrl || null;
+        let currentConcurrency = Math.max(1, Math.min(6, Math.floor(Number(initialConcurrency) || DEFAULT_EXPORT_TRANSLATE_CONCURRENCY)));
+        let calibration = null;
+        let renderedCompletedSec = 0;
+        let currentRenderingEstSec = Math.max(0, Number(ch1EstSec) || 0);
+        let consumedCount = 0;
+        let probeTerminalError = null;
+        let pumpPromise = null;
+        let pumpDirty = false;
+        const slots = [];
+        const structureWaiters = new Set();
+
+        const isAborted = () => Boolean(
+            stopped ||
+            exportState.aborted ||
+            exportState.savePartialRequested ||
+            exportState.runId !== exportRunId
+        );
+
+        const notifyStructure = () => {
+            for (const fn of Array.from(structureWaiters)) {
+                try { fn(); } catch {}
+            }
+        };
+
+        const createSlot = (fields) => {
+            let resolveFn, rejectFn;
+            const promise = new Promise((res, rej) => {
+                resolveFn = res;
+                rejectFn = rej;
+            });
+            promise.catch(() => {});
+            return {
+                ...fields,
+                translationState: 'probed',
+                data: null,
+                error: null,
+                promise,
+                resolve: resolveFn,
+                reject: rejectFn
+            };
+        };
+
+        const getProjectedSec = () => {
+            let remaining = 0;
+            for (let i = consumedCount; i < slots.length; i++) {
+                remaining += Math.max(0, Number(slots[i].estSec) || 0);
+            }
+            return renderedCompletedSec + currentRenderingEstSec + remaining;
+        };
+
+        const needsMoreChapters = () => {
+            if (isAborted() || probeTerminalError) return false;
+            if (!cursorUrl) return false;
+            if (1 + slots.length >= MAX_EXPORT_CHAPTERS) return false;
+            return getProjectedSec() < targetSeconds * EXPORT_PROBE_BUFFER_RATIO;
+        };
+
+        const stepDownConcurrency = () => {
+            if (currentConcurrency > 1) {
+                currentConcurrency -= 1;
+                ttsLog(`Stepping down parallel export translation concurrency to ${currentConcurrency}`);
+            }
+        };
+
+        const probeOneChapter = (url) => new Promise((resolve) => {
+            if (!isExtensionAlive()) {
+                resolve({ ok: false, error: 'Extension context unavailable' });
+                return;
+            }
+            try {
+                chrome.runtime.sendMessage({
+                    action: 'probe_chapter_raw',
+                    url,
+                    exportSessionId
+                }, (resp) => {
+                    if (chrome.runtime.lastError) {
+                        resolve({ ok: false, error: chrome.runtime.lastError.message || 'probe_chapter_raw failed' });
+                        return;
+                    }
+                    resolve(resp || { ok: false });
+                });
+            } catch (err) {
+                resolve({ ok: false, error: err?.message || String(err) });
+            }
+        });
+
+        const probeNextWave = async () => {
+            const waveSlots = [];
+            let waveRawChars = 0;
+            while (
+                !isAborted() &&
+                cursorUrl &&
+                waveSlots.length < EXPORT_WAVE_MAX_CHAPTERS &&
+                waveRawChars < EXPORT_WAVE_MAX_RAW_CHARS &&
+                (1 + slots.length) < MAX_EXPORT_CHAPTERS &&
+                getProjectedSec() < targetSeconds * EXPORT_PROBE_BUFFER_RATIO
+            ) {
+                if (waveSlots.length > 0) {
+                    await abortableExportDelay(EXPORT_PROBE_DELAY_MS, exportRunId);
+                    if (isAborted()) break;
+                }
+                const target = cursorUrl;
+                const resp = await probeOneChapter(target);
+                if (isAborted()) break;
+
+                if (!resp || !resp.ok || !Array.isArray(resp.origChunks) || resp.origChunks.length === 0) {
+                    const fallbackSlot = createSlot({
+                        chapterNumber: 2 + slots.length,
+                        url: target,
+                        origChunks: null,
+                        rawChars: 0,
+                        estSec: Math.max(60, Number(ch1EstSec) || 240),
+                        nextUrl: null,
+                        probeSupported: false,
+                        alreadyReady: false,
+                        alreadyTranslating: false
+                    });
+                    slots.push(fallbackSlot);
+                    waveSlots.push(fallbackSlot);
+                    cursorUrl = null;
+                    exportState.plannedChapters = 1 + slots.length;
+                    updatePlayerUI();
+                    notifyStructure();
+                    break;
+                }
+
+                const estSec = estimateRawChapterDurationSec(resp.origChunks, speed, calibration);
+                const rawChars = resp.origChunks.join('\n').length;
+                const slot = createSlot({
+                    chapterNumber: 2 + slots.length,
+                    url: target,
+                    origChunks: resp.origChunks,
+                    rawChars,
+                    estSec,
+                    nextUrl: resp.nextUrl || null,
+                    probeSupported: true,
+                    alreadyReady: Boolean(resp.alreadyReady),
+                    alreadyTranslating: Boolean(resp.alreadyTranslating)
+                });
+                slots.push(slot);
+                waveSlots.push(slot);
+                waveRawChars += rawChars;
+                cursorUrl = resp.nextUrl || null;
+                exportState.plannedChapters = 1 + slots.length;
+                updatePlayerUI();
+                notifyStructure();
+            }
+            return waveSlots;
+        };
+
+        const runWavePreExtractGlossary = async (waveSlots) => {
+            const unready = waveSlots.filter((s) =>
+                s.probeSupported &&
+                !s.alreadyReady &&
+                !s.alreadyTranslating &&
+                Array.isArray(s.origChunks) &&
+                s.origChunks.length > 0
+            );
+            if (preloadMode !== 'translate' || unready.length < 2 || isAborted() || !isExtensionAlive()) {
+                return;
+            }
+            exportState.preExtractingGlossary = true;
+            updatePlayerUI();
+            try {
+                const res = await new Promise((resolve) => {
+                    try {
+                        chrome.runtime.sendMessage({
+                            action: 'pre_extract_export_glossary',
+                            chapters: unready.map((s) => ({
+                                chapterNumber: s.chapterNumber,
+                                origChunks: s.origChunks
+                            })),
+                            exportSessionId,
+                            timeoutMs: 25000
+                        }, (resp) => {
+                            if (chrome.runtime.lastError) {
+                                resolve({ ok: false, error: chrome.runtime.lastError.message || 'pre_extract_export_glossary failed' });
+                                return;
+                            }
+                            resolve(resp || { ok: false });
+                        });
+                    } catch (err) {
+                        resolve({ ok: false, error: err?.message || String(err) });
+                    }
+                });
+                if (res && res.rateLimited) {
+                    stepDownConcurrency();
+                }
+                if (res && !res.ok) {
+                    ttsLog('Wave pre-extract glossary skipped/failed:', res.error);
+                }
+            } finally {
+                exportState.preExtractingGlossary = false;
+                updatePlayerUI();
+            }
+        };
+
+        const translateWaveSlots = async (waveSlots) => {
+            let queueIdx = 0;
+            const workerTotal = Math.min(currentConcurrency, waveSlots.length);
+
+            const runWorker = async (workerIdx) => {
+                while (!isAborted()) {
+                    if (workerIdx >= currentConcurrency) return;
+                    if (renderedCompletedSec >= targetSeconds) return;
+                    const slot = waveSlots[queueIdx++];
+                    if (!slot) return;
+                    if (
+                        slot.translationState === 'ready' ||
+                        slot.translationState === 'error' ||
+                        slot.translationState === 'cancelled'
+                    ) {
+                        continue;
+                    }
+
+                    slot.translationState = 'translating';
+                    try {
+                        const data = await fetchAndTranslateChapterForExport(slot.url, preloadMode, exportRunId, {
+                            preserveOtherPreloads: true,
+                            exportSessionId
+                        });
+                        slot.data = data;
+                        slot.origChunks = null;
+                        slot.translationState = 'ready';
+                        if (data && data.rateLimited) {
+                            stepDownConcurrency();
+                        }
+                        if (!slot.probeSupported && data?.nextUrl && !cursorUrl && !isAborted()) {
+                            slot.nextUrl = data.nextUrl;
+                            cursorUrl = data.nextUrl;
+                            pumpDirty = true;
+                        }
+                        exportState.translatedChapters = 1 + slots.filter((s) => s.translationState === 'ready').length;
+                        updatePlayerUI();
+                        slot.resolve(data);
+                    } catch (err) {
+                        if (err?.rateLimited) {
+                            stepDownConcurrency();
+                        }
+                        slot.error = err;
+                        slot.origChunks = null;
+                        slot.translationState = 'error';
+                        if (!slot.probeSupported) {
+                            cursorUrl = null;
+                        }
+                        slot.reject(err);
+                    }
+                }
+            };
+
+            await Promise.all(Array.from({ length: workerTotal }, (_, idx) => runWorker(idx)));
+        };
+
+        const maybePump = () => {
+            if (isAborted() || !needsMoreChapters()) return;
+            if (pumpPromise) {
+                pumpDirty = true;
+                return;
+            }
+            pumpPromise = (async () => {
+                try {
+                    do {
+                        pumpDirty = false;
+                        if (!needsMoreChapters()) break;
+
+                        exportState.probingChapters = true;
+                        const waveSlots = await probeNextWave();
+                        exportState.probingChapters = false;
+
+                        if (isAborted() || waveSlots.length === 0) break;
+
+                        await runWavePreExtractGlossary(waveSlots);
+                        if (isAborted()) break;
+
+                        await translateWaveSlots(waveSlots);
+                    } while (!isAborted() && (pumpDirty || needsMoreChapters()));
+                } catch (err) {
+                    if (!isAborted() && err?.message !== 'EXPORT_ABORTED' && err?.message !== 'EXPORT_SAVE_PARTIAL') {
+                        probeTerminalError = err;
+                    }
+                } finally {
+                    exportState.probingChapters = false;
+                    exportState.preExtractingGlossary = false;
+                    pumpPromise = null;
+                    notifyStructure();
+                }
+            })();
+        };
+
+        const stop = (keepReady = true) => {
+            if (stopped) return;
+            stopped = true;
+            exportState.probingChapters = false;
+            exportState.preExtractingGlossary = false;
+            for (const slot of slots) {
+                if (slot.translationState === 'probed' || slot.translationState === 'translating') {
+                    slot.translationState = 'cancelled';
+                    slot.origChunks = null;
+                    slot.reject(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+                }
+            }
+            notifyStructure();
+            if (exportSessionId && isExtensionAlive()) {
+                try {
+                    chrome.runtime.sendMessage({
+                        action: 'cancel_export_prefetches',
+                        exportSessionId,
+                        keepReady
+                    }, () => { void chrome?.runtime?.lastError; });
+                } catch {}
+            }
+        };
+
+        const updateCalibration = (actualAccSec, _chaptersCompleted, measuredViCharsPerSec) => {
+            renderedCompletedSec = Math.max(0, Number(actualAccSec) || 0);
+            currentRenderingEstSec = 0;
+
+            const calRate = Number(measuredViCharsPerSec);
+            if (Number.isFinite(calRate) && calRate > 0) {
+                calibration = { measuredViCharsPerSec: calRate };
+                for (let i = consumedCount; i < slots.length; i++) {
+                    const slot = slots[i];
+                    if (slot.probeSupported && Array.isArray(slot.origChunks) && slot.origChunks.length > 0) {
+                        slot.estSec = estimateRawChapterDurationSec(slot.origChunks, speed, calibration);
+                    }
+                }
+            }
+
+            if (renderedCompletedSec >= targetSeconds) {
+                stop(true);
+                return;
+            }
+            maybePump();
+        };
+
+        const getNextChapter = async (upcomingIdx) => {
+            while (!isAborted() && upcomingIdx >= slots.length && (cursorUrl || pumpPromise)) {
+                await new Promise((resolve) => {
+                    const cleanup = () => {
+                        structureWaiters.delete(onWake);
+                        exportState.abortRejects.delete(onWake);
+                    };
+                    const onWake = () => {
+                        cleanup();
+                        resolve();
+                    };
+                    structureWaiters.add(onWake);
+                    exportState.abortRejects.add(onWake);
+                    maybePump();
+                });
+            }
+
+            if (isAborted()) {
+                throw new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED');
+            }
+            if (upcomingIdx >= slots.length) {
+                if (probeTerminalError) throw probeTerminalError;
+                return null;
+            }
+
+            const slot = slots[upcomingIdx];
+            let data = slot.translationState === 'ready' ? slot.data : null;
+            if (!data) {
+                if (slot.translationState === 'error') throw slot.error;
+                data = await slot.promise;
+            }
+            consumedCount = Math.max(consumedCount, upcomingIdx + 1);
+            currentRenderingEstSec = Math.max(0, Number(slot.estSec) || 0);
+            slot.data = null;
+            return data;
+        };
+
+        return {
+            start() {
+                maybePump();
+            },
+            updateCalibration,
+            getNextChapter,
+            stop
+        };
     }
 
     function createExportPcmCollector() {
@@ -4845,11 +5399,16 @@
         const exportLeaseId = `exp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         exportState.active = true;
         exportState.leaseId = exportLeaseId;
+        exportState.exportSessionId = exportLeaseId;
         exportState.aborted = false;
         exportState.savePartialRequested = false;
         exportState.accumulatedSec = 0;
         exportState.chaptersCompleted = 0;
         exportState.currentChapter = 1;
+        exportState.plannedChapters = 1;
+        exportState.translatedChapters = 1;
+        exportState.probingChapters = false;
+        exportState.preExtractingGlossary = false;
         exportState.segIndex = 0;
         exportState.segTotal = 0;
         exportState.fetchingNext = false;
@@ -4857,7 +5416,7 @@
         exportState.nextOpenUrl = null;
         exportState.activePorts.clear();
         exportState.activeSockets.clear();
-        exportState.activePreloadPort = null;
+        exportState.activePreloadPorts.clear();
         exportState.abortRejects.clear();
 
         try {
@@ -4975,10 +5534,29 @@
             const interChapSilence = new Int16Array(Math.round(EXPORT_SAMPLE_RATE * 0.8));
             const targetSeconds = exportState.targetMinutes * 60;
             const preloadMode = state.wasTranslated ? 'translate' : 'tts_only';
+            const ch1EstSec = estimateSegmentsDurationSec(chapterSegments, state.speed);
+            let currentChapterNextUrl = nextUrl || null;
+            let lastCompletedNextUrl = currentChapterNextUrl;
             let earlyStopReason = '';
 
+            const pipeline = (currentChapterNextUrl && MAX_EXPORT_CHAPTERS > 1)
+                ? createExportChapterPipeline({
+                    initialNextUrl: currentChapterNextUrl,
+                    ch1EstSec,
+                    targetSeconds,
+                    preloadMode,
+                    speed: state.speed,
+                    exportRunId: myRunId,
+                    exportSessionId: exportLeaseId,
+                    initialConcurrency: state.exportTranslateConcurrency
+                })
+                : null;
+            if (pipeline && ch1EstSec < targetSeconds * EXPORT_PROBE_BUFFER_RATIO) {
+                pipeline.start();
+            }
+
             try {
-                while (chapterSegments.length > 0 && exportState.chaptersCompleted < MAX_EXPORT_CHAPTERS) {
+                while (chapterSegments && chapterSegments.length > 0 && exportState.chaptersCompleted < MAX_EXPORT_CHAPTERS) {
                     if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) break;
 
                     if (state.iconMode === 'auto') {
@@ -4987,18 +5565,11 @@
                     }
 
                     const N = chapterSegments.length;
+                    const chapStartSamples24k = totalSamples24k;
                     exportState.currentChapter = exportState.chaptersCompleted + 1;
                     exportState.segTotal = N;
                     exportState.segIndex = 0;
                     exportState.fetchingNext = false;
-
-                    // Start preloading & translating the next chapter in parallel if this chapter won't finish target duration
-                    let nextChapterPromise = null;
-                    const estChapSec = estimateSegmentsDurationSec(chapterSegments, state.speed);
-                    if (nextUrl && (exportState.accumulatedSec + estChapSec < targetSeconds * 1.15) && exportState.chaptersCompleted + 1 < MAX_EXPORT_CHAPTERS) {
-                        nextChapterPromise = fetchAndTranslateChapterForExport(nextUrl, preloadMode, myRunId)
-                            .then((data) => ({ ok: true, data }), (err) => ({ ok: false, err }));
-                    }
 
                     const results = new Array(N);
                     let nextCommitIdx = 0;
@@ -5147,51 +5718,56 @@
 
                     exportState.chaptersCompleted += 1;
                     exportState.accumulatedSec = totalSamples24k / EXPORT_SAMPLE_RATE;
+                    lastCompletedNextUrl = currentChapterNextUrl;
+
+                    const chapActualSec = (totalSamples24k - chapStartSamples24k) / EXPORT_SAMPLE_RATE;
+                    const measuredRate = calibrateExportSpeakingRate(chapActualSec, chapterSegments);
+                    chapterSegments = null;
+                    if (pipeline) {
+                        pipeline.updateCalibration(exportState.accumulatedSec, exportState.chaptersCompleted, measuredRate);
+                    }
 
                     if (exportState.accumulatedSec >= targetSeconds || exportState.chaptersCompleted >= MAX_EXPORT_CHAPTERS) {
                         break;
                     }
-                    if (!nextUrl) {
+                    if (!currentChapterNextUrl) {
                         earlyStopReason = 'Không tìm thấy link "Chương sau" cho chương kế tiếp.';
                         break;
                     }
 
+                    const upcomingIdx = exportState.chaptersCompleted - 1;
+                    exportState.fetchingNext = true;
+                    exportState.currentChapter = exportState.chaptersCompleted + 1;
+                    updatePlayerUI();
+
                     let nextData = null;
-                    if (nextChapterPromise) {
-                        exportState.fetchingNext = true;
-                        exportState.currentChapter = exportState.chaptersCompleted + 1;
-                        updatePlayerUI();
-                        const preloaded = await nextChapterPromise;
-                        if (preloaded.ok) {
-                            nextData = preloaded.data;
-                        } else {
-                            const fetchErr = preloaded.err;
-                            if (exportState.aborted || exportState.savePartialRequested || fetchErr?.message === 'EXPORT_ABORTED' || fetchErr?.message === 'EXPORT_SAVE_PARTIAL') {
-                                throw fetchErr;
-                            }
-                            earlyStopReason = fetchErr?.message || String(fetchErr || 'Lỗi tải/dịch chương kế tiếp');
-                            console.warn(`[STV TTS Export] Dừng nối chương tại chương ${exportState.chaptersCompleted}:`, earlyStopReason);
-                            break;
+                    try {
+                        nextData = pipeline
+                            ? await pipeline.getNextChapter(upcomingIdx)
+                            : await fetchAndTranslateChapterForExport(currentChapterNextUrl, preloadMode, myRunId, {
+                                preserveOtherPreloads: true,
+                                exportSessionId: exportLeaseId
+                            });
+                    } catch (fetchErr) {
+                        if (exportState.aborted || exportState.savePartialRequested || fetchErr?.message === 'EXPORT_ABORTED' || fetchErr?.message === 'EXPORT_SAVE_PARTIAL') {
+                            throw fetchErr;
                         }
-                    } else {
-                        exportState.fetchingNext = true;
-                        exportState.currentChapter = exportState.chaptersCompleted + 1;
-                        updatePlayerUI();
-                        try {
-                            nextData = await fetchAndTranslateChapterForExport(nextUrl, preloadMode, myRunId);
-                        } catch (fetchErr) {
-                            if (exportState.aborted || exportState.savePartialRequested || fetchErr?.message === 'EXPORT_ABORTED' || fetchErr?.message === 'EXPORT_SAVE_PARTIAL') {
-                                throw fetchErr;
-                            }
-                            earlyStopReason = fetchErr?.message || String(fetchErr || 'Lỗi tải/dịch chương kế tiếp');
-                            console.warn(`[STV TTS Export] Dừng nối chương tại chương ${exportState.chaptersCompleted}:`, earlyStopReason);
-                            break;
-                        }
+                        earlyStopReason = fetchErr?.message || String(fetchErr || 'Lỗi tải/dịch chương kế tiếp');
+                        console.warn(`[STV TTS Export] Dừng nối chương tại chương ${exportState.chaptersCompleted}:`, earlyStopReason);
+                        break;
+                    }
+
+                    if (!nextData) {
+                        earlyStopReason = 'Không tìm thấy link "Chương sau" cho chương kế tiếp.';
+                        break;
                     }
 
                     const lines = state.wasTranslated
                         ? extractCleanTranslatedLines(nextData.fullText)
                         : (Array.isArray(nextData.origChunks) ? nextData.origChunks : []);
+                    nextData.fullText = '';
+                    nextData.origChunks = null;
+
                     const nextSegs = packSegmentsForExport(lines, exportState.maxChunkChars, exportIconOpts);
                     if (nextSegs.length === 0) {
                         earlyStopReason = 'Chương tiếp theo không có nội dung hợp lệ sau khi trích xuất/dịch.';
@@ -5201,11 +5777,15 @@
                     pcmInt16Chunks.push(interChapSilence);
                     totalSamples24k += interChapSilence.length;
                     chapterSegments = nextSegs;
-                    nextUrl = nextData.nextUrl || null;
+                    currentChapterNextUrl = nextData.nextUrl || null;
                 }
             } catch (loopErr) {
                 if (loopErr?.message !== 'EXPORT_SAVE_PARTIAL') {
                     throw loopErr;
+                }
+            } finally {
+                if (pipeline) {
+                    pipeline.stop(true);
                 }
             }
 
@@ -5228,7 +5808,7 @@
             triggerWavFileDownload(wav.blob, filename);
 
             exportState.active = false;
-            exportState.nextOpenUrl = nextUrl || null;
+            exportState.nextOpenUrl = lastCompletedNextUrl || null;
             if (earlyStopReason && !exportState.savePartialRequested) {
                 const warnMsg = `Đã tải ${exactMinLabel}p (${savedChapters} ch.) · Dừng sớm: ${earlyStopReason}`;
                 updatePlayerUI(warnMsg, true);
@@ -5259,6 +5839,7 @@
             if (exportState.runId === myRunId) {
                 exportState.active = false;
                 exportState.leaseId = null;
+                exportState.exportSessionId = '';
                 exportState.useColabGpu = false;
                 exportState.useBatchApi = false;
                 exportState.useBatchOpus = false;
@@ -5268,8 +5849,13 @@
                 exportState.effectiveVoice = '';
                 exportState.targetWorkers = EXPORT_CONCURRENCY;
                 exportState.maxChunkChars = EXPORT_MAX_CHUNK_CHARS;
+                exportState.plannedChapters = 1;
+                exportState.translatedChapters = 1;
+                exportState.probingChapters = false;
+                exportState.preExtractingGlossary = false;
                 exportState.waitingTranslation = false;
                 exportState.fetchingNext = false;
+                exportState.activePreloadPorts.clear();
                 exportState.abortRejects.clear();
             }
         }
@@ -5391,6 +5977,7 @@
             downloadMinutes: state.downloadMinutes,
             downloadSource: state.downloadSource,
             colabGpuTier: state.colabGpuTier,
+            exportTranslateConcurrency: state.exportTranslateConcurrency,
             iconMode: state.iconMode,
             iconStyle: state.iconStyle,
             exportActive: exportState.active,

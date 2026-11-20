@@ -332,6 +332,65 @@ if (typeof chrome !== 'undefined') {
 // Quản lý preload chương tiếp theo & tự động chuyển chương
 const preloadedChapters = new Map(); // preloadId -> entry
 const pendingAutoAdvance = new Map(); // tabId -> { targetUrl, mode, preloadId, startedAt }
+const exportRawCache = new Map(); // preloadId -> { preloadId, tabId, targetUrl, exportSessionId, origChunks, nextUrl, pendingNextUrl, createdAt }
+const exportProbeControllers = new Map(); // exportSessionId -> Set<AbortController>
+const exportGlossaryControllers = new Map(); // exportSessionId -> Set<AbortController>
+const glossarySaveQueues = new Map(); // activeProfile -> Promise
+const EXPORT_RAW_CACHE_MAX = 60;
+
+function registerExportController(store, sessionId, controller) {
+    if (!sessionId || !controller) return;
+    let set = store.get(sessionId);
+    if (!set) {
+        set = new Set();
+        store.set(sessionId, set);
+    }
+    set.add(controller);
+}
+
+function unregisterExportController(store, sessionId, controller) {
+    if (!sessionId || !controller) return;
+    const set = store.get(sessionId);
+    if (!set) return;
+    set.delete(controller);
+    if (set.size === 0) store.delete(sessionId);
+}
+
+function abortExportControllerSet(store, sessionId) {
+    if (!sessionId) return;
+    const set = store.get(sessionId);
+    if (!set) return;
+    for (const ctrl of Array.from(set)) {
+        try { ctrl.abort(); } catch {}
+    }
+    set.clear();
+    store.delete(sessionId);
+}
+
+function cacheExportRawEntry(entry) {
+    if (!entry || !entry.preloadId) return;
+    exportRawCache.delete(entry.preloadId);
+    exportRawCache.set(entry.preloadId, entry);
+    const now = Date.now();
+    for (const [key, item] of Array.from(exportRawCache.entries())) {
+        if (!item || (now - (item.createdAt || 0) > PRELOAD_MAX_AGE_MS) || exportRawCache.size > EXPORT_RAW_CACHE_MAX) {
+            exportRawCache.delete(key);
+        }
+    }
+}
+
+function enqueueGlossaryProfileOp(profile, task) {
+    const profileKey = profile || 'Default';
+    const prev = glossarySaveQueues.get(profileKey) || Promise.resolve();
+    const run = prev.catch(() => {}).then(() => task(profileKey));
+    const tail = run.catch(() => {}).finally(() => {
+        if (glossarySaveQueues.get(profileKey) === tail) {
+            glossarySaveQueues.delete(profileKey);
+        }
+    });
+    glossarySaveQueues.set(profileKey, tail);
+    return run;
+}
 
 async function setPendingAutoAdvance(tabId, data) {
     pendingAutoAdvance.set(tabId, data);
@@ -548,14 +607,56 @@ async function saveGlossaryTermsFromBackground(fullText, activeProfile) {
     if (!globalThis.STV_GlossaryUtils || typeof globalThis.STV_GlossaryUtils.saveGlossaryFromFullText !== 'function') {
         return { activeProfile: activeProfile || 'Default', newTerms: {}, skippedTerms: [], updated: false, existingGlossary: null };
     }
-    const res = await globalThis.STV_GlossaryUtils.saveGlossaryFromFullText(fullText, activeProfile);
-    if (res.skippedTerms.length > 0) {
-        console.log(`[STV Background] Đã lọc bỏ ${res.skippedTerms.length} mục glossary rác/không hợp lệ:`, res.skippedTerms);
+    let profile = activeProfile;
+    if (!profile && typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        const profData = await chrome.storage.local.get(['stv_active_glossary_profile']);
+        profile = profData.stv_active_glossary_profile || 'Default';
     }
-    if (res.updated) {
-        console.log(`[STV Background] Đã cập nhật glossary tự động cho bộ từ điển "${res.activeProfile}":`, res.existingGlossary);
+    profile = profile || 'Default';
+
+    return await enqueueGlossaryProfileOp(profile, async (profKey) => {
+        const res = await globalThis.STV_GlossaryUtils.saveGlossaryFromFullText(fullText, profKey);
+        if (res.skippedTerms.length > 0) {
+            console.log(`[STV Background] Đã lọc bỏ ${res.skippedTerms.length} mục glossary rác/không hợp lệ:`, res.skippedTerms);
+        }
+        if (res.updated) {
+            console.log(`[STV Background] Đã cập nhật glossary tự động cho bộ từ điển "${res.activeProfile}":`, res.existingGlossary);
+        }
+        return res;
+    });
+}
+
+async function savePreExtractedGlossaryTerms(newTerms, skippedTerms = [], activeProfile = '') {
+    let profile = activeProfile;
+    if (!profile && typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        const profData = await chrome.storage.local.get(['stv_active_glossary_profile']);
+        profile = profData.stv_active_glossary_profile || 'Default';
     }
-    return res;
+    profile = profile || 'Default';
+
+    if (
+        !newTerms ||
+        Object.keys(newTerms).length === 0 ||
+        typeof chrome === 'undefined' ||
+        !chrome.storage ||
+        !chrome.storage.local ||
+        !globalThis.STV_GlossaryUtils ||
+        typeof globalThis.STV_GlossaryUtils.mergeGlossaryTerms !== 'function'
+    ) {
+        return { activeProfile: profile, newTerms: newTerms || {}, skippedTerms, updated: false, existingGlossary: null };
+    }
+
+    return await enqueueGlossaryProfileOp(profile, async (profKey) => {
+        const glossaryKey = `stv_glossary_profile_${profKey}`;
+        const result = await chrome.storage.local.get([glossaryKey]);
+        const existingGlossary = result[glossaryKey] || {};
+        const { merged, updated } = globalThis.STV_GlossaryUtils.mergeGlossaryTerms(existingGlossary, newTerms);
+        if (updated) {
+            await chrome.storage.local.set({ [glossaryKey]: merged });
+            console.log(`[STV Background] Pre-extracted ${Object.keys(newTerms).length} glossary terms into "${profKey}"`);
+        }
+        return { activeProfile: profKey, newTerms, skippedTerms, updated, existingGlossary: merged };
+    });
 }
 
 async function extractChunksFromPreloadedHtml(tabId, html, targetUrl, savedSelector) {
@@ -602,22 +703,135 @@ async function extractChunksViaHiddenIframe(tabId, targetUrl, savedSelector) {
     return payload;
 }
 
-function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
+/** Fetch target chapter HTML (with AJAX hidden-iframe fallback) and validate SSRF redirects. */
+async function fetchAndExtractChapterRaw(tabId, targetUrl, signal) {
+    const htmlRes = await fetch(targetUrl, {
+        method: 'GET',
+        credentials: 'include',
+        signal
+    });
+    if (htmlRes.url && htmlRes.url !== targetUrl) {
+        const validator = globalThis.STV_UrlValidator || globalThis;
+        if (typeof validator.isSafePreloadTarget === 'function') {
+            const redirectCheck = validator.isSafePreloadTarget(targetUrl, htmlRes.url);
+            if (!redirectCheck.valid) {
+                throw new Error(`Redirect bị từ chối bởi SSRF policy: ${redirectCheck.reason}`);
+            }
+        }
+    }
+    if (!htmlRes.ok) {
+        throw new Error(`Không tải được trang sau (HTTP ${htmlRes.status})`);
+    }
+    const buf = await htmlRes.arrayBuffer();
+    const html = decodeHtmlBuffer(buf, htmlRes.headers.get('content-type') || '');
+
+    let selectorKey = '';
+    try {
+        selectorKey = `stv_selector_${new URL(targetUrl).hostname}`;
+    } catch {}
+    const selData = selectorKey ? await chrome.storage.local.get([selectorKey]) : {};
+    const savedSelector = selectorKey ? (selData[selectorKey] || '') : '';
+
+    let extracted = await extractChunksFromPreloadedHtml(tabId, html, targetUrl, savedSelector);
+    if (signal?.aborted) throw new Error('AbortError');
+
+    if (!extracted || !extracted.ok || !Array.isArray(extracted.chunks) || extracted.chunks.length === 0) {
+        extracted = await extractChunksViaHiddenIframe(tabId, targetUrl, savedSelector);
+        if (signal?.aborted) throw new Error('AbortError');
+    } else if (!extracted.nextUrl && extracted.pendingNextUrl) {
+        try {
+            const iframeExtracted = await extractChunksViaHiddenIframe(tabId, targetUrl, savedSelector);
+            if (signal?.aborted) throw new Error('AbortError');
+            if (iframeExtracted && iframeExtracted.ok && Array.isArray(iframeExtracted.chunks) && iframeExtracted.chunks.length > 0) {
+                extracted = iframeExtracted;
+            }
+        } catch (iframeErr) {
+            console.warn('[STV Background] Hidden iframe fallback cho nextUrl thất bại, giữ kết quả HTML:', iframeErr);
+        }
+    }
+
+    if (!extracted || !extracted.ok || !Array.isArray(extracted.chunks) || extracted.chunks.length === 0) {
+        throw new Error(extracted?.error || extracted?.reason || 'Không trích xuất được nội dung chương tiếp theo');
+    }
+
+    return {
+        origChunks: extracted.chunks,
+        nextUrl: extracted.nextUrl || null,
+        pendingNextUrl: extracted.pendingNextUrl || null
+    };
+}
+
+function abortableDelay(ms, signal) {
+    if (!ms || ms <= 0) return Promise.resolve();
+    if (signal?.aborted) return Promise.reject(new Error('AbortError'));
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+            if (signal) signal.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+        if (typeof timer.unref === 'function') timer.unref();
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(new Error('AbortError'));
+        };
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    });
+}
+
+async function fetchAiWithRateLimitRetry(endpoint, fetchInit, signal, onRateLimit) {
+    const retryableStatuses = new Set([429, 502, 503, 529]);
+    const backoffs = [2000, 5000];
+    let lastRes = null;
+
+    for (let attempt = 0; attempt <= backoffs.length; attempt++) {
+        const res = await fetch(endpoint, { ...fetchInit, signal });
+        lastRes = res;
+        if (res.ok || !retryableStatuses.has(res.status) || attempt === backoffs.length) {
+            if (res.status === 429 || res.status === 503) {
+                if (typeof onRateLimit === 'function') onRateLimit(res.status);
+            }
+            return res;
+        }
+        if (res.status === 429 || res.status === 503) {
+            if (typeof onRateLimit === 'function') onRateLimit(res.status);
+        }
+        let waitMs = backoffs[attempt];
+        const retryAfterRaw = res.headers?.get?.('retry-after');
+        if (retryAfterRaw) {
+            const parsedSec = Number(retryAfterRaw);
+            if (Number.isFinite(parsedSec) && parsedSec > 0) {
+                waitMs = Math.min(12000, Math.max(500, Math.round(parsedSec * 1000)));
+            }
+        }
+        try { await res.body?.cancel?.(); } catch {}
+        await abortableDelay(waitMs, signal);
+    }
+    return lastRes;
+}
+
+function startPreloadWorker(tabId, targetUrl, mode = 'translate', options = {}) {
     const normalizedMode = mode === 'translate' ? 'translate' : 'tts_only';
+    const preserveOtherPreloads = Boolean(options?.preserveOtherPreloads);
+    const exportSessionId = String(options?.exportSessionId || '');
     const preloadId = makePreloadId(tabId, targetUrl);
     const existing = preloadedChapters.get(preloadId);
     if (existing && existing.mode === normalizedMode && (existing.status === 'fetching' || existing.status === 'translating' || existing.status === 'ready')) {
+        if (exportSessionId && !existing.exportSessionId) existing.exportSessionId = exportSessionId;
         return { ok: true, preloadId, status: existing.status, reused: true };
     }
 
-    cleanupTabPreloads(tabId, preloadId);
+    if (!preserveOtherPreloads) {
+        cleanupTabPreloads(tabId, preloadId);
+    }
 
     const entry = {
         preloadId,
         tabId,
         targetUrl,
         mode: normalizedMode,
+        exportSessionId,
         status: 'fetching',
+        rateLimited: false,
         origChunks: null,
         nextNextUrl: null,
         pureTextForAPI: '',
@@ -636,58 +850,20 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
     (async () => {
         let activeEndpoint = '';
         try {
-            const htmlRes = await fetch(targetUrl, {
-                method: 'GET',
-                credentials: 'include',
-                signal: entry.abortController.signal
-            });
-            if (htmlRes.url && htmlRes.url !== targetUrl) {
-                const validator = globalThis.STV_UrlValidator || globalThis;
-                if (typeof validator.isSafePreloadTarget === 'function') {
-                    const redirectCheck = validator.isSafePreloadTarget(targetUrl, htmlRes.url);
-                    if (!redirectCheck.allowed) {
-                        throw new Error(`Redirect bị từ chối bởi SSRF policy: ${redirectCheck.reason}`);
-                    }
-                }
-            }
-            if (!htmlRes.ok) {
-                throw new Error(`Không tải được trang sau (HTTP ${htmlRes.status})`);
-            }
-            const buf = await htmlRes.arrayBuffer();
-            const html = decodeHtmlBuffer(buf, htmlRes.headers.get('content-type') || '');
-
-            let selectorKey = '';
-            try {
-                selectorKey = `stv_selector_${new URL(targetUrl).hostname}`;
-            } catch {}
-            const selData = selectorKey ? await chrome.storage.local.get([selectorKey]) : {};
-            const savedSelector = selectorKey ? (selData[selectorKey] || '') : '';
-
-            let extracted = await extractChunksFromPreloadedHtml(tabId, html, targetUrl, savedSelector);
+            const cachedRaw = exportRawCache.get(preloadId);
+            const isCachedFresh = Boolean(
+                cachedRaw &&
+                Array.isArray(cachedRaw.origChunks) &&
+                cachedRaw.origChunks.length > 0 &&
+                (Date.now() - (cachedRaw.createdAt || 0) <= PRELOAD_MAX_AGE_MS)
+            );
+            const rawChapter = isCachedFresh
+                ? cachedRaw
+                : await fetchAndExtractChapterRaw(tabId, targetUrl, entry.abortController.signal);
             if (entry.abortController.signal.aborted) return;
 
-            // Nếu là trang tải nội dung hoặc link "Chương sau" (/0/, #) bằng AJAX/JS (như STV), thử nạp qua iframe ẩn cùng origin
-            if (!extracted || !extracted.ok || !Array.isArray(extracted.chunks) || extracted.chunks.length === 0) {
-                extracted = await extractChunksViaHiddenIframe(tabId, targetUrl, savedSelector);
-                if (entry.abortController.signal.aborted) return;
-            } else if (!extracted.nextUrl && extracted.pendingNextUrl) {
-                try {
-                    const iframeExtracted = await extractChunksViaHiddenIframe(tabId, targetUrl, savedSelector);
-                    if (entry.abortController.signal.aborted) return;
-                    if (iframeExtracted && iframeExtracted.ok && Array.isArray(iframeExtracted.chunks) && iframeExtracted.chunks.length > 0) {
-                        extracted = iframeExtracted;
-                    }
-                } catch (iframeErr) {
-                    console.warn('[STV Background] Hidden iframe fallback cho nextUrl thất bại, giữ kết quả HTML:', iframeErr);
-                }
-            }
-
-            if (!extracted || !extracted.ok || !Array.isArray(extracted.chunks) || extracted.chunks.length === 0) {
-                throw new Error(extracted?.error || extracted?.reason || 'Không trích xuất được nội dung chương tiếp theo');
-            }
-
-            entry.origChunks = extracted.chunks;
-            entry.nextNextUrl = extracted.nextUrl || null;
+            entry.origChunks = rawChapter.origChunks;
+            entry.nextNextUrl = rawChapter.nextUrl || null;
 
             if (normalizedMode === 'tts_only') {
                 if (entry.abortController.signal.aborted) return;
@@ -699,7 +875,8 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
                     origChunks: entry.origChunks,
                     nextUrl: entry.nextNextUrl,
                     done: true,
-                    glossarySaved: false
+                    glossarySaved: false,
+                    rateLimited: false
                 });
                 return;
             }
@@ -723,7 +900,7 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
             const glossaryData = await chrome.storage.local.get([glossaryKey]);
             const glossary = glossaryData[glossaryKey] || {};
 
-            const pureTextForAPI = extracted.chunks.join('\n');
+            const pureTextForAPI = rawChapter.origChunks.join('\n');
             const sentGlossary = (globalThis.STV_GlossaryUtils && typeof globalThis.STV_GlossaryUtils.findMatchingGlossaryTerms === 'function')
                 ? globalThis.STV_GlossaryUtils.findMatchingGlossaryTerms(pureTextForAPI, glossary)
                 : {};
@@ -747,7 +924,7 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
 
             await syncApiOriginStripRule(endpoint);
 
-            const aiRes = await fetch(endpoint, {
+            const aiRes = await fetchAiWithRateLimitRetry(endpoint, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -761,8 +938,9 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
                         { role: 'system', content: finalSystemPrompt },
                         { role: 'user', content: userMessage }
                     ]
-                }),
-                signal: entry.abortController.signal
+                })
+            }, entry.abortController.signal, () => {
+                entry.rateLimited = true;
             });
 
             if (!aiRes.ok) {
@@ -877,7 +1055,8 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
                 nextUrl: entry.nextNextUrl,
                 done: true,
                 glossarySaved: entry.glossarySaved,
-                glossaryDebug: entry.glossaryDebug || null
+                glossaryDebug: entry.glossaryDebug || null,
+                rateLimited: Boolean(entry.rateLimited)
             });
             if (entry.consumedByPage) {
                 preloadedChapters.delete(entry.preloadId);
@@ -894,7 +1073,11 @@ function startPreloadWorker(tabId, targetUrl, mode = 'translate') {
             }
             entry.status = 'error';
             entry.error = errMsg;
-            broadcastPreloadEvent(entry, { type: 'error', error: entry.error });
+            broadcastPreloadEvent(entry, {
+                type: 'error',
+                error: entry.error,
+                rateLimited: Boolean(entry.rateLimited)
+            });
         }
     })();
 
@@ -1827,22 +2010,276 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             return false;
         }
 
+        const preloadOptions = {
+            preserveOtherPreloads: Boolean(request.preserveOtherPreloads),
+            exportSessionId: String(request.exportSessionId || '')
+        };
         const preloadId = makePreloadId(tabId, resolvedUrl);
         if (!preloadedChapters.has(preloadId) && typeof chrome !== 'undefined' && chrome.storage && chrome.storage.session) {
             getOrRestorePreloadEntry(preloadId)
                 .then(() => {
-                    const result = startPreloadWorker(tabId, resolvedUrl, request.mode);
+                    const result = startPreloadWorker(tabId, resolvedUrl, request.mode, preloadOptions);
                     sendResponse(result);
                 })
                 .catch(() => {
-                    const result = startPreloadWorker(tabId, resolvedUrl, request.mode);
+                    const result = startPreloadWorker(tabId, resolvedUrl, request.mode, preloadOptions);
                     sendResponse(result);
                 });
             return true;
         }
 
-        const result = startPreloadWorker(tabId, resolvedUrl, request.mode);
+        const result = startPreloadWorker(tabId, resolvedUrl, request.mode, preloadOptions);
         sendResponse(result);
+        return false;
+    }
+
+    if (request.action === 'probe_chapter_raw' && sender.tab) {
+        const tabId = sender.tab.id;
+        const targetUrl = String(request.url || '').trim();
+        const senderUrl = sender.tab.url || '';
+        const exportSessionId = String(request.exportSessionId || '');
+
+        const validator = globalThis.STV_UrlValidator || globalThis;
+        let resolvedUrl = targetUrl;
+        if (typeof validator.isSafePreloadTarget === 'function') {
+            const check = validator.isSafePreloadTarget(senderUrl, targetUrl);
+            if (!check.valid) {
+                sendResponse({ ok: false, error: `Probe bị từ chối: ${check.reason}` });
+                return false;
+            }
+            resolvedUrl = check.resolvedUrl || targetUrl;
+        } else if (!/^https?:\/\//i.test(targetUrl)) {
+            sendResponse({ ok: false, error: 'URL chương tiếp theo không hợp lệ' });
+            return false;
+        }
+
+        const preloadId = makePreloadId(tabId, resolvedUrl);
+        const controller = new AbortController();
+        registerExportController(exportProbeControllers, exportSessionId, controller);
+
+        (async () => {
+            try {
+                const restored = await getOrRestorePreloadEntry(preloadId);
+                const existing = restored || preloadedChapters.get(preloadId);
+                if (
+                    existing &&
+                    Array.isArray(existing.origChunks) &&
+                    existing.origChunks.length > 0 &&
+                    (existing.status === 'ready' || existing.status === 'translating')
+                ) {
+                    return {
+                        ok: true,
+                        preloadId,
+                        targetUrl: resolvedUrl,
+                        origChunks: existing.origChunks,
+                        nextUrl: existing.nextNextUrl || null,
+                        alreadyReady: existing.status === 'ready',
+                        alreadyTranslating: existing.status === 'translating'
+                    };
+                }
+
+                const cachedRaw = exportRawCache.get(preloadId);
+                if (
+                    cachedRaw &&
+                    Array.isArray(cachedRaw.origChunks) &&
+                    cachedRaw.origChunks.length > 0 &&
+                    (Date.now() - (cachedRaw.createdAt || 0) <= PRELOAD_MAX_AGE_MS)
+                ) {
+                    return {
+                        ok: true,
+                        preloadId,
+                        targetUrl: resolvedUrl,
+                        origChunks: cachedRaw.origChunks,
+                        nextUrl: cachedRaw.nextUrl || null,
+                        alreadyReady: false,
+                        alreadyTranslating: false
+                    };
+                }
+
+                const raw = await fetchAndExtractChapterRaw(tabId, resolvedUrl, controller.signal);
+                cacheExportRawEntry({
+                    preloadId,
+                    tabId,
+                    targetUrl: resolvedUrl,
+                    exportSessionId,
+                    origChunks: raw.origChunks,
+                    nextUrl: raw.nextUrl || null,
+                    pendingNextUrl: raw.pendingNextUrl || null,
+                    createdAt: Date.now()
+                });
+                return {
+                    ok: true,
+                    preloadId,
+                    targetUrl: resolvedUrl,
+                    origChunks: raw.origChunks,
+                    nextUrl: raw.nextUrl || null,
+                    alreadyReady: false,
+                    alreadyTranslating: false
+                };
+            } finally {
+                unregisterExportController(exportProbeControllers, exportSessionId, controller);
+            }
+        })()
+            .then((res) => sendResponse(res))
+            .catch((err) => sendResponse({ ok: false, error: err?.message || String(err) }));
+        return true;
+    }
+
+    if (request.action === 'pre_extract_export_glossary' && sender.tab) {
+        const chapters = Array.isArray(request.chapters) ? request.chapters : [];
+        const exportSessionId = String(request.exportSessionId || '');
+        const rawTimeout = Number(request.timeoutMs);
+        const timeoutMs = Number.isFinite(rawTimeout) ? Math.max(3000, Math.min(60000, rawTimeout)) : 25000;
+
+        (async () => {
+            const config = await chrome.storage.local.get([
+                'endpoint', 'apikey', 'model', 'stv_active_glossary_profile', 'stvDebugLog'
+            ]);
+            const apikey = (config.apikey || '').trim();
+            if (!apikey || chapters.length === 0) {
+                return { ok: true, skipped: true, addedCount: 0, updated: false };
+            }
+
+            const endpoint = config.endpoint || DEFAULT_ENDPOINT;
+            const validator = globalThis.STV_UrlValidator || globalThis;
+            if (typeof validator.isValidUrl === 'function' && !validator.isValidUrl(endpoint)) {
+                return { ok: false, error: 'API Endpoint URL không hợp lệ', status: 0, rateLimited: false };
+            }
+            if (!globalThis.STV_GlossaryUtils || typeof globalThis.STV_GlossaryUtils.buildGlossaryPreExtractPromptPayload !== 'function') {
+                return { ok: true, skipped: true, addedCount: 0, updated: false };
+            }
+
+            const activeProfile = config.stv_active_glossary_profile || 'Default';
+            const glossaryKey = `stv_glossary_profile_${activeProfile}`;
+            const glossaryData = await chrome.storage.local.get([glossaryKey]);
+            const existingGlossary = glossaryData[glossaryKey] || {};
+
+            const parts = [];
+            let accChars = 0;
+            const MAX_GLOSSARY_RAW_CHARS = 22000;
+            for (let i = 0; i < chapters.length; i++) {
+                const ch = chapters[i];
+                const chunks = Array.isArray(ch?.origChunks) ? ch.origChunks : [];
+                if (chunks.length === 0) continue;
+                const chapLabel = ch?.chapterNumber ? `--- Chương ${ch.chapterNumber} ---` : `--- Chương +${i + 1} ---`;
+                const block = `${chapLabel}\n${chunks.join('\n')}`;
+                const remaining = MAX_GLOSSARY_RAW_CHARS - accChars;
+                if (remaining <= 200) break;
+                const clipped = block.length > remaining ? block.slice(0, remaining) : block;
+                parts.push(clipped);
+                accChars += clipped.length + 2;
+            }
+            const combinedRawText = parts.join('\n\n');
+            if (!combinedRawText.trim()) {
+                return { ok: true, skipped: true, addedCount: 0, updated: false };
+            }
+
+            const { finalSystemPrompt, userMessage } = globalThis.STV_GlossaryUtils.buildGlossaryPreExtractPromptPayload(
+                combinedRawText,
+                existingGlossary
+            );
+            await syncApiOriginStripRule(endpoint);
+
+            const controller = new AbortController();
+            registerExportController(exportGlossaryControllers, exportSessionId, controller);
+            let timedOut = false;
+            const timer = setTimeout(() => {
+                timedOut = true;
+                try { controller.abort(); } catch {}
+            }, timeoutMs);
+            if (typeof timer.unref === 'function') timer.unref();
+
+            try {
+                const model = config.model || DEFAULT_MODEL;
+                const aiRes = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${apikey}`
+                    },
+                    body: JSON.stringify({
+                        model,
+                        temperature: 0.2,
+                        stream: false,
+                        messages: [
+                            { role: 'system', content: finalSystemPrompt },
+                            { role: 'user', content: userMessage }
+                        ]
+                    }),
+                    signal: controller.signal
+                });
+
+                if (!aiRes.ok) {
+                    let errMsg = `HTTP ${aiRes.status}`;
+                    try {
+                        const errJson = await aiRes.json();
+                        if (errJson?.error?.message) errMsg = errJson.error.message;
+                    } catch {}
+                    return {
+                        ok: false,
+                        error: errMsg,
+                        status: aiRes.status,
+                        rateLimited: aiRes.status === 429 || aiRes.status === 503
+                    };
+                }
+
+                const json = await aiRes.json();
+                const content = json?.choices?.[0]?.message?.content || '';
+                if (config.stvDebugLog) {
+                    console.log('=== [Export Pre-Extract Glossary] ===\n' + content);
+                }
+                const parsed = globalThis.STV_GlossaryUtils.extractGlossaryTermsFromResponseText(content);
+                const newTerms = parsed?.newTerms || {};
+                const skippedTerms = parsed?.skippedTerms || [];
+                const saveRes = await savePreExtractedGlossaryTerms(newTerms, skippedTerms, activeProfile);
+                return {
+                    ok: true,
+                    addedCount: Object.keys(newTerms).length,
+                    updated: Boolean(saveRes?.updated)
+                };
+            } catch (err) {
+                if (timedOut) {
+                    return { ok: false, error: 'Pre-extract glossary timeout', status: 0, rateLimited: false, timedOut: true };
+                }
+                return { ok: false, error: err?.message || String(err), status: 0, rateLimited: false };
+            } finally {
+                clearTimeout(timer);
+                unregisterExportController(exportGlossaryControllers, exportSessionId, controller);
+            }
+        })()
+            .then((res) => sendResponse(res))
+            .catch((err) => sendResponse({ ok: false, error: err?.message || String(err), rateLimited: false }));
+        return true;
+    }
+
+    if (request.action === 'cancel_export_prefetches' && sender.tab) {
+        const tabId = sender.tab.id;
+        const exportSessionId = String(request.exportSessionId || '');
+        const keepReady = request.keepReady !== false;
+
+        abortExportControllerSet(exportProbeControllers, exportSessionId);
+        abortExportControllerSet(exportGlossaryControllers, exportSessionId);
+
+        let cancelledCount = 0;
+        for (const [id, entry] of Array.from(preloadedChapters.entries())) {
+            if (entry.tabId !== tabId) continue;
+            if (exportSessionId && entry.exportSessionId !== exportSessionId) continue;
+            if (keepReady && entry.status === 'ready') continue;
+            if (entry.abortController && !entry.abortController.signal.aborted) {
+                try { entry.abortController.abort(); } catch {}
+            }
+            entry.status = 'aborted';
+            broadcastPreloadEvent(entry, { type: 'error', error: 'Export cancelled', rateLimited: false });
+            preloadedChapters.delete(id);
+            void removePreloadEntryFromSession(id);
+            cancelledCount += 1;
+        }
+        for (const [id, item] of Array.from(exportRawCache.entries())) {
+            if (!item || item.tabId !== tabId) continue;
+            if (exportSessionId && item.exportSessionId !== exportSessionId) continue;
+            exportRawCache.delete(id);
+        }
+        sendResponse({ ok: true, cancelledCount });
         return false;
     }
 
@@ -1907,12 +2344,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             'ttsEngine', 'ttsWsEndpoint', 'ttsWsVoice', 'ttsWsFallback', 'ttsWsAutoFallback',
             'ttsEndpoint', 'ttsVoice', 'ttsApiKey', 'ttsSpeed', 'ttsStability', 'ttsStabilityProfile',
             'ttsAutoNext', 'ttsAutoNextChapter', 'ttsPreloadSec', 'ttsPreloadSeconds', 'ttsDownloadMinutes',
-            'ttsDownloadSource', 'ttsColabUrl', 'ttsColabVoice', 'ttsColabGpu',
+            'ttsDownloadSource', 'ttsColabUrl', 'ttsColabVoice', 'ttsColabGpu', 'ttsExportTranslateConcurrency',
             'ttsIconMode', 'ttsIconStyle', TTS_ICON_CACHE_KEY, TTS_CUSTOM_ICONS_KEY,
             'stv_locale', 'stvDebugLog'
         ], (data) => {
             data.hasTranslationApiKey = Boolean((data.apikey || '').trim());
             delete data.apikey;
+            const parsedConc = Math.floor(Number(data.ttsExportTranslateConcurrency));
+            data.ttsExportTranslateConcurrency = Number.isFinite(parsedConc)
+                ? Math.max(1, Math.min(6, parsedConc))
+                : 3;
             if (data.ttsWsAutoFallback === undefined) data.ttsWsAutoFallback = data.ttsWsFallback;
             if (data.ttsStabilityProfile === undefined) data.ttsStabilityProfile = data.ttsStability;
             if (data.ttsAutoNextChapter === undefined) data.ttsAutoNextChapter = data.ttsAutoNext;
@@ -2900,18 +3341,29 @@ chrome.runtime.onConnect.addListener((port) => {
     if (port.name === 'stv-preload-stream') {
         let subscribedEntry = null;
         let portDisconnected = false;
+        let keepAliveTimer = null;
+        const stopPreloadKeepAlive = () => {
+            if (keepAliveTimer !== null) {
+                clearInterval(keepAliveTimer);
+                keepAliveTimer = null;
+            }
+        };
         port.onMessage.addListener(async (msg) => {
             if (!msg || msg.type !== 'subscribe') return;
             const entry = preloadedChapters.get(msg.preloadId) || await getOrRestorePreloadEntry(msg.preloadId);
             if (portDisconnected) return;
             if (!entry) {
-                safePortPost(port, { type: 'error', error: 'Preload entry not found' });
+                safePortPost(port, { type: 'error', error: 'Preload entry not found', rateLimited: false });
                 return;
             }
             subscribedEntry = entry;
             entry.subscribers.add(port);
             if (entry.status === 'error') {
-                safePortPost(port, { type: 'error', error: entry.error || 'Preload failed' });
+                safePortPost(port, {
+                    type: 'error',
+                    error: entry.error || 'Preload failed',
+                    rateLimited: Boolean(entry.rateLimited)
+                });
             } else if (entry.status === 'ready') {
                 safePortPost(port, {
                     type: 'snapshot',
@@ -2920,15 +3372,42 @@ chrome.runtime.onConnect.addListener((port) => {
                     nextUrl: entry.nextNextUrl || null,
                     done: true,
                     glossarySaved: entry.glossarySaved,
-                    glossaryDebug: entry.glossaryDebug || null
+                    glossaryDebug: entry.glossaryDebug || null,
+                    rateLimited: Boolean(entry.rateLimited)
                 });
             } else {
                 safePortPost(port, { type: 'snapshot', fullText: entry.fullText, done: false, glossarySaved: false });
+                if (keepAliveTimer === null) {
+                    keepAliveTimer = setInterval(() => {
+                        if (
+                            portDisconnected ||
+                            !subscribedEntry ||
+                            subscribedEntry.status === 'ready' ||
+                            subscribedEntry.status === 'error' ||
+                            subscribedEntry.status === 'aborted'
+                        ) {
+                            stopPreloadKeepAlive();
+                            return;
+                        }
+                        if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getPlatformInfo === 'function') {
+                            try {
+                                chrome.runtime.getPlatformInfo(() => { void chrome?.runtime?.lastError; });
+                            } catch {}
+                        }
+                        if (!safePortPost(port, { type: 'keepalive' })) {
+                            stopPreloadKeepAlive();
+                        }
+                    }, 10000);
+                    if (keepAliveTimer && typeof keepAliveTimer.unref === 'function') {
+                        keepAliveTimer.unref();
+                    }
+                }
             }
         });
         port.onDisconnect.addListener(() => {
             void chrome?.runtime?.lastError;
             portDisconnected = true;
+            stopPreloadKeepAlive();
             if (subscribedEntry && subscribedEntry.subscribers) {
                 subscribedEntry.subscribers.delete(port);
             }

@@ -393,10 +393,13 @@ async function runColabDownloadTest({
     hasTranslationApiKey = false,
     contentBoxText = '',
     ttsColabGpu = 'A100',
+    downloadMinutes = 1,
+    ttsExportTranslateConcurrency = 3,
     healthData = { status: 'ok', gpu_name: 'NVIDIA A100', export_max_streams: 12 },
     workerModeHandler = (msg) => ({ ok: true, data: { mode: msg.mode, max_streams: msg.workers || 6, active_workers: msg.workers || 6 } }),
     batchPortHandler = null,
     onSendMessage = null,
+    onConnectPort = null,
     beforeDownload = null,
     extraSandbox = null,
     asyncDelayMs = 0
@@ -540,6 +543,7 @@ async function runColabDownloadTest({
                                 ttsColabUrl: 'https://fast-gpu.trycloudflare.com',
                                 ttsColabVoice: 'Binh',
                                 ttsColabGpu,
+                                ttsExportTranslateConcurrency,
                                 ttsIconMode: 'off'
                             }
                         });
@@ -553,6 +557,10 @@ async function runColabDownloadTest({
                 },
                 connect({ name }) {
                     const listeners = { msg: [], disc: [] };
+                    if (typeof onConnectPort === 'function') {
+                        const customPort = onConnectPort({ name, listeners });
+                        if (customPort) return customPort;
+                    }
                     return {
                         name,
                         onMessage: { addListener: (fn) => listeners.msg.push(fn) },
@@ -608,7 +616,7 @@ async function runColabDownloadTest({
     if (typeof beforeDownload === 'function') {
         await beforeDownload({ sandbox, lineEls });
     }
-    const res = await sandbox.STV_TTSController.startDownload({ downloadMinutes: 1 });
+    const res = await sandbox.STV_TTSController.startDownload({ downloadMinutes });
     return { res, sandbox, messages, portStarts, createdAnchorClicks, maxConcurrentStreams, lineEls };
 }
 
@@ -1020,4 +1028,421 @@ test('startTTSDownload stops cleanly without TTS requests when chapter is untran
     assert.equal(messages.some((m) => m.action === 'vieneu_set_worker_mode' && m.mode === 'export'), false);
     assert.equal(portStarts.length, 0, 'Must not dispatch TTS synthesis on raw foreign CJK prose');
     assert.equal(createdAnchorClicks.length, 0);
+});
+
+function loadGlossaryUtilsSandbox() {
+    const code = fs.readFileSync(path.resolve(__dirname, '..', 'glossary-utils.js'), 'utf8');
+    const sandbox = { window: undefined, globalThis: {}, console, Set, Object, Array, RegExp, String, Math };
+    sandbox.window = sandbox;
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(code, sandbox);
+    return sandbox.STV_GlossaryUtils;
+}
+
+test('glossary-utils buildGlossaryPreExtractPromptPayload and extractGlossaryTermsFromResponseText handle multi-chapter pre-extraction', () => {
+    const utils = loadGlossaryUtilsSandbox();
+    const raw = '萧炎和云韵进入落神涧寻找紫灵晶。';
+    const existing = {
+        '萧炎': { hanviet: 'Tiêu Viêm', locked: true },
+        '药老': { hanviet: 'Dược Lão', locked: false }
+    };
+
+    const payload = utils.buildGlossaryPreExtractPromptPayload(raw, existing);
+    assert.deepEqual(JSON.parse(JSON.stringify(payload.matchedGlossary)), { '萧炎': 'Tiêu Viêm' });
+    assert.ok(payload.finalSystemPrompt.includes('萧炎 = Tiêu Viêm'));
+    assert.ok(!payload.finalSystemPrompt.includes('药老 = Dược Lão'));
+    assert.ok(payload.userMessage.includes('Không dịch') || payload.userMessage.includes('không dịch'));
+
+    const extractedTagged = utils.extractGlossaryTermsFromResponseText(
+        '```text\n[GLOSSARY]\n云韵 = Vân Vận\n长老 = trưởng lão\n紫灵晶 = Tử Linh Tinh\n```'
+    );
+    assert.deepEqual(JSON.parse(JSON.stringify(extractedTagged.newTerms)), {
+        '云韵': { hanviet: 'Vân Vận', locked: false },
+        '紫灵晶': { hanviet: 'Tử Linh Tinh', locked: false }
+    });
+    assert.ok(extractedTagged.skippedTerms.some((s) => s.includes('长老')));
+
+    const extractedBare = utils.extractGlossaryTermsFromResponseText('落神涧 = Lạc Thần Giản\n弟子 = đệ tử');
+    assert.deepEqual(JSON.parse(JSON.stringify(extractedBare.newTerms)), {
+        '落神涧': { hanviet: 'Lạc Thần Giản', locked: false }
+    });
+});
+
+test('estimateRawChapterDurationSec models CJK expansion factor, speed, and Chapter-1 calibration', () => {
+    const helpers = loadTtsHelpers();
+    const hanzi100 = '萧'.repeat(100);
+    const estHanzi1x = helpers.estimateRawChapterDurationSec([hanzi100], 1.0);
+    assert.ok(Math.abs(estHanzi1x - (430 / 14)) < 0.05, `Expected ~30.71s for 100 Hanzi, got ${estHanzi1x}`);
+
+    const estHanzi15x = helpers.estimateRawChapterDurationSec([hanzi100], 1.5);
+    assert.ok(Math.abs(estHanzi15x - (430 / 21)) < 0.05, `Expected ~20.48s at 1.5x speed, got ${estHanzi15x}`);
+
+    const estCalibrated = helpers.estimateRawChapterDurationSec([hanzi100], 1.0, { measuredViCharsPerSec: 20 });
+    assert.ok(Math.abs(estCalibrated - (430 / 20)) < 0.05, `Expected 21.5s when calibrated to 20 chars/s, got ${estCalibrated}`);
+
+    const vi100 = 'a'.repeat(100);
+    const estVi = helpers.estimateRawChapterDurationSec([vi100], 1.0);
+    assert.ok(Math.abs(estVi - (100 / 14)) < 0.05, `Expected ~7.14s for 100 Vietnamese chars, got ${estVi}`);
+});
+
+function createMultiChapterPreloadHarness({
+    chaptersByUrl,
+    preloadDelayMs = 25,
+    onGlossaryPreExtract = null,
+    onSubscribePreload = null,
+    rateLimitedUrls = new Set()
+}) {
+    const eventLog = [];
+    const subscribers = new Map();
+    const completed = new Map();
+    const cancelledIds = new Set();
+    let inFlightTranslations = 0;
+    let maxConcurrentTranslations = 0;
+    let activeExportSessionId = '';
+
+    const deliver = (preloadId, payload) => {
+        const sub = subscribers.get(preloadId);
+        if (sub && !sub.closed) {
+            sub.listeners.msg.forEach((fn) => fn(payload));
+        }
+    };
+
+    return {
+        eventLog,
+        getMaxConcurrentTranslations: () => maxConcurrentTranslations,
+        onSendMessage({ msg, cb }) {
+            if (msg.action === 'probe_chapter_raw') {
+                const ch = chaptersByUrl[msg.url];
+                if (!ch) {
+                    cb({ ok: false, error: `Unknown probe url ${msg.url}` });
+                    return true;
+                }
+                eventLog.push(`probe:${ch.id}`);
+                cb({
+                    ok: true,
+                    preloadId: `tab1|${msg.url}`,
+                    targetUrl: msg.url,
+                    origChunks: ch.rawChunks,
+                    nextUrl: ch.nextUrl || null,
+                    alreadyReady: false,
+                    alreadyTranslating: false
+                });
+                return true;
+            }
+            if (msg.action === 'pre_extract_export_glossary') {
+                eventLog.push(`glossary:${msg.chapters.map((c) => c.chapterNumber).join(',')}`);
+                if (typeof onGlossaryPreExtract === 'function') {
+                    onGlossaryPreExtract(msg, cb);
+                } else {
+                    cb({ ok: true, addedCount: 2, updated: true });
+                }
+                return true;
+            }
+            if (msg.action === 'cancel_export_prefetches') {
+                eventLog.push('cancel_export_prefetches');
+                if (msg.exportSessionId) activeExportSessionId = msg.exportSessionId;
+                for (const [pid, sub] of subscribers.entries()) {
+                    if (!completed.has(pid) && !msg.keepReady === false) {
+                        cancelledIds.add(pid);
+                    }
+                    if (!completed.has(pid)) {
+                        sub.listeners.msg.forEach((fn) => fn({ type: 'error', error: 'Export cancelled', rateLimited: false }));
+                    }
+                }
+                cb({ ok: true });
+                return true;
+            }
+            if (msg.action === 'start_chapter_preload') {
+                const preloadId = `tab1|${msg.url}`;
+                const ch = chaptersByUrl[msg.url];
+                activeExportSessionId = msg.exportSessionId || activeExportSessionId;
+                cancelledIds.delete(preloadId);
+                eventLog.push(`preload_start:${ch ? ch.id : msg.url}`);
+                cb({ ok: true, preloadId, status: completed.has(preloadId) ? 'ready' : 'translating' });
+
+                if (!completed.has(preloadId)) {
+                    inFlightTranslations += 1;
+                    maxConcurrentTranslations = Math.max(maxConcurrentTranslations, inFlightTranslations);
+                    const t = setTimeout(() => {
+                        inFlightTranslations = Math.max(0, inFlightTranslations - 1);
+                        if (cancelledIds.has(preloadId)) return;
+                        eventLog.push(`preload_done:${ch ? ch.id : msg.url}`);
+                        const payload = {
+                            type: 'delta',
+                            fullText: `[TRANSLATION]\n${ch ? ch.translatedText : 'Nội dung mặc định.'}\n[GLOSSARY]\n`,
+                            origChunks: ch ? ch.rawChunks : [],
+                            nextUrl: ch ? (ch.nextUrl || null) : null,
+                            done: true,
+                            rateLimited: rateLimitedUrls.has(msg.url)
+                        };
+                        completed.set(preloadId, payload);
+                        deliver(preloadId, payload);
+                    }, preloadDelayMs);
+                    if (typeof t.unref === 'function') t.unref();
+                }
+                return true;
+            }
+            return false;
+        },
+        onConnectPort({ name, listeners }) {
+            if (name !== 'stv-preload-stream') return null;
+            const portObj = {
+                name,
+                closed: false,
+                onMessage: { addListener: (fn) => listeners.msg.push(fn) },
+                onDisconnect: { addListener: (fn) => listeners.disc.push(fn) },
+                disconnect() { this.closed = true; },
+                postMessage(msg) {
+                    if (msg && msg.type === 'subscribe') {
+                        const preloadId = msg.preloadId;
+                        const entry = { listeners, closed: false };
+                        subscribers.set(preloadId, entry);
+                        if (typeof onSubscribePreload === 'function') {
+                            const customHandled = onSubscribePreload({ preloadId, listeners, deliver, completed, eventLog });
+                            if (customHandled) return;
+                        }
+                        if (completed.has(preloadId)) {
+                            const donePayload = completed.get(preloadId);
+                            queueMicrotask(() => {
+                                if (!portObj.closed) {
+                                    listeners.msg.forEach((fn) => fn({ ...donePayload, type: 'snapshot' }));
+                                }
+                            });
+                        }
+                    }
+                }
+            };
+            return portObj;
+        }
+    };
+}
+
+test('multi-chapter WAV pipeline probes sequentially, pre-extracts glossary before wave, translates in parallel (cap 3), and exports in order', async () => {
+    const ch1Text = 'Chương một mở đầu: Tiêu Viêm bước vào cổ điện tĩnh mịch. '.repeat(4).trim(); // ~224 chars (~16s at 14 chars/s)
+    const rawHanzi = '萧炎站在大殿之外，凝视着远方的火焰山脉，心中却涌起一阵莫名的悸动。'.repeat(3); // 90 Hanzi + 9 punct (~28.3s est)
+    const longPad = 'Linh khí cuộn trào khắp kinh mạch khiến thiên địa biến sắc dữ dội suốt canh giờ dài.';
+    const chaptersByUrl = {
+        'https://example.com/ch2': { id: 'ch2', rawChunks: [rawHanzi], translatedText: `Chương 2 nội dung: ${longPad}`, nextUrl: 'https://example.com/ch3' },
+        'https://example.com/ch3': { id: 'ch3', rawChunks: [rawHanzi], translatedText: `Chương 3 nội dung: ${longPad}`, nextUrl: 'https://example.com/ch4' },
+        'https://example.com/ch4': { id: 'ch4', rawChunks: [rawHanzi], translatedText: `Chương 4 nội dung: ${longPad}`, nextUrl: 'https://example.com/ch5' },
+        'https://example.com/ch5': { id: 'ch5', rawChunks: [rawHanzi], translatedText: `Chương 5 nội dung: ${longPad}`, nextUrl: 'https://example.com/ch6' },
+        'https://example.com/ch6': { id: 'ch6', rawChunks: [rawHanzi], translatedText: `Chương 6 nội dung: ${longPad}`, nextUrl: null }
+    };
+
+    const harness = createMultiChapterPreloadHarness({ chaptersByUrl, preloadDelayMs: 25 });
+    const pcm16s = Buffer.from(new Int16Array(24000 * 16).buffer).toString('base64');
+    const pcm38s = Buffer.from(new Int16Array(24000 * 38).buffer).toString('base64');
+
+    const { res, sandbox, messages, portStarts } = await runColabDownloadTest({
+        lines: [ch1Text],
+        downloadMinutes: 2, // 120s target => Ch1 (16s) + Ch2 (38s) + Ch3 (38s) + Ch4 (38s) = 130s
+        ttsExportTranslateConcurrency: 3,
+        ttsColabGpu: 'T4',
+        healthData: { status: 'ok', gpu_name: 'Tesla T4', batch_supported: true, batch_max_size: 16, model_dtype: 'float16' },
+        onSendMessage: harness.onSendMessage,
+        onConnectPort: harness.onConnectPort,
+        extraSandbox: {
+            STV_findNextChapterUrl: (_doc, url) => (url === 'https://example.com/ch1' ? 'https://example.com/ch2' : null)
+        },
+        batchPortHandler({ msg, listeners }) {
+            const isCh1 = String(msg.inputs[0] || '').includes('Chương một mở đầu');
+            const delayMs = isCh1 ? 520 : 20;
+            const audioB64 = isCh1 ? pcm16s : pcm38s;
+            const audioSec = isCh1 ? 16 : 38;
+            const t = setTimeout(() => {
+                msg.inputs.forEach((_, idx) => {
+                    listeners.msg.forEach((fn) => fn({ type: 'item', index: idx, audio: audioB64, sampleRate: 24000 }));
+                });
+                listeners.msg.forEach((fn) => fn({ type: 'done', stats: { audioSec, wallSec: 0.1, speedup: 350, dtype: 'float16' } }));
+            }, delayMs);
+            if (typeof t.unref === 'function') t.unref();
+        }
+    });
+
+    assert.equal(res.ok, true, `Expected pipeline export ok, got: ${JSON.stringify(res)}`);
+    assert.equal(res.chapters, 4, 'Expected 4 chapters (130s) to hit 2m (120s) target');
+    assert.equal(harness.getMaxConcurrentTranslations(), 3, 'Parallel translation pool must run 3 concurrent jobs');
+
+    const lastWaveProbeIdx = Math.max(
+        harness.eventLog.indexOf('probe:ch2'),
+        harness.eventLog.indexOf('probe:ch3'),
+        harness.eventLog.indexOf('probe:ch4'),
+        harness.eventLog.indexOf('probe:ch5')
+    );
+    const glossaryIdx = harness.eventLog.indexOf('glossary:2,3,4,5');
+    const firstPreloadIdx = harness.eventLog.indexOf('preload_start:ch2');
+    assert.ok(lastWaveProbeIdx !== -1 && glossaryIdx > lastWaveProbeIdx, `Expected pre-extract glossary after probing wave: ${harness.eventLog}`);
+    assert.ok(firstPreloadIdx > glossaryIdx, `Expected parallel translations after glossary pre-extract: ${harness.eventLog}`);
+    assert.equal(harness.eventLog.includes('probe:ch6'), false, 'Should stop probing once wave projected duration covers target');
+
+    const preloadStarts = messages.filter((m) => m.action === 'start_chapter_preload');
+    assert.ok(preloadStarts.length >= 4 && preloadStarts.every((m) => m.preserveOtherPreloads === true));
+
+    const synthOrder = portStarts.filter((p) => p.portName === 'stv-tts-batch').map((p) => p.inputs[0]);
+    assert.equal(synthOrder.length, 4);
+    assert.ok(synthOrder[0].includes('Chương một mở đầu'));
+    assert.ok(synthOrder[1].includes('Chương 2 nội dung'));
+    assert.ok(synthOrder[2].includes('Chương 3 nội dung'));
+    assert.ok(synthOrder[3].includes('Chương 4 nội dung'));
+
+    assert.equal(sandbox.STV_TTSController.getState().nextOpenUrl, 'https://example.com/ch5');
+    const cancelMsg = messages.find((m) => m.action === 'cancel_export_prefetches');
+    assert.ok(cancelMsg && cancelMsg.keepReady === true);
+});
+
+test('stv-preload-stream ignores keepalive and auto-reconnects after mid-stream port disconnect', async () => {
+    const ch1Text = 'Chương một nội dung đủ dài cho bài kiểm tra. '.repeat(4).trim(); // ~180 chars (< 300)
+    const rawHanzi = '萧炎站在大殿之外，凝视着远方的火焰山脉，心中却涌起一阵莫名的悸动。'.repeat(2);
+    const chaptersByUrl = {
+        'https://example.com/ch2': {
+            id: 'ch2',
+            rawChunks: [rawHanzi],
+            translatedText: 'Chương 2 sau khi tự kết nối lại background thành công.',
+            nextUrl: 'https://example.com/ch3'
+        },
+        'https://example.com/ch3': {
+            id: 'ch3',
+            rawChunks: [rawHanzi],
+            translatedText: 'Chương 3 dự phòng.',
+            nextUrl: null
+        }
+    };
+    let ch2SubscribeCount = 0;
+    const harness = createMultiChapterPreloadHarness({
+        chaptersByUrl,
+        preloadDelayMs: 30,
+        onSubscribePreload({ preloadId, listeners, deliver, eventLog }) {
+            if (!preloadId.endsWith('/ch2')) return false;
+            ch2SubscribeCount += 1;
+            if (ch2SubscribeCount === 1) {
+                eventLog.push('ch2_first_subscribe_keepalive_then_disconnect');
+                queueMicrotask(() => {
+                    listeners.msg.forEach((fn) => fn({ type: 'keepalive' }));
+                    listeners.disc.forEach((fn) => fn());
+                });
+                return true;
+            }
+            eventLog.push('ch2_second_subscribe_keepalive_then_done');
+            const t = setTimeout(() => {
+                listeners.msg.forEach((fn) => fn({ type: 'keepalive' }));
+                deliver(preloadId, {
+                    type: 'delta',
+                    fullText: `[TRANSLATION]\n${chaptersByUrl['https://example.com/ch2'].translatedText}\n[GLOSSARY]\n`,
+                    origChunks: [rawHanzi],
+                    nextUrl: 'https://example.com/ch3',
+                    done: true,
+                    rateLimited: false
+                });
+            }, 25);
+            if (typeof t.unref === 'function') t.unref();
+            return true;
+        }
+    });
+
+    const pcm35s = Buffer.from(new Int16Array(24000 * 35).buffer).toString('base64');
+    const { res, sandbox } = await runColabDownloadTest({
+        lines: [ch1Text],
+        downloadMinutes: 1, // 60s -> Ch1 (35s) + Ch2 (35s) = 70s
+        ttsExportTranslateConcurrency: 2,
+        ttsColabGpu: 'T4',
+        healthData: { status: 'ok', gpu_name: 'Tesla T4', batch_supported: true, batch_max_size: 16, model_dtype: 'float16' },
+        onSendMessage: harness.onSendMessage,
+        onConnectPort: harness.onConnectPort,
+        extraSandbox: {
+            STV_findNextChapterUrl: (_doc, url) => (url === 'https://example.com/ch1' ? 'https://example.com/ch2' : null)
+        },
+        batchPortHandler({ msg, listeners }) {
+            queueMicrotask(() => {
+                msg.inputs.forEach((_, idx) => {
+                    listeners.msg.forEach((fn) => fn({ type: 'item', index: idx, audio: pcm35s, sampleRate: 24000 }));
+                });
+                listeners.msg.forEach((fn) => fn({ type: 'done', stats: { audioSec: 35, wallSec: 0.1, speedup: 350, dtype: 'float16' } }));
+            });
+        }
+    });
+
+    assert.equal(res.ok, true, `Expected auto-reconnect export ok, got: ${JSON.stringify(res)}`);
+    assert.equal(res.chapters, 2);
+    assert.equal(ch2SubscribeCount, 2, 'Expected stv-preload-stream to reconnect for ch2 after transient disconnect');
+    assert.equal(sandbox.STV_TTSController.getState().nextOpenUrl, 'https://example.com/ch3');
+});
+
+test('export translation pool steps down concurrency on rateLimited (429) response', async () => {
+    const ch1Text = 'Chương một nội dung chuẩn hóa độ dài. '.repeat(4).trim(); // ~160 chars (< 300)
+    const rawHanzi = '萧炎站在大殿之外，凝视着远方的火焰山脉，心中却涌起一阵莫名的悸动。'.repeat(3);
+    const pad = 'Tiêu Viêm vận chuyển đấu khí suốt nhiều canh giờ liền để phá phong ấn.';
+    const chaptersByUrl = {
+        'https://example.com/ch2': { id: 'ch2', rawChunks: [rawHanzi], translatedText: `Ch2: ${pad}`, nextUrl: 'https://example.com/ch3' },
+        'https://example.com/ch3': { id: 'ch3', rawChunks: [rawHanzi], translatedText: `Ch3: ${pad}`, nextUrl: 'https://example.com/ch4' },
+        'https://example.com/ch4': { id: 'ch4', rawChunks: [rawHanzi], translatedText: `Ch4: ${pad}`, nextUrl: 'https://example.com/ch5' },
+        'https://example.com/ch5': { id: 'ch5', rawChunks: [rawHanzi], translatedText: `Ch5: ${pad}`, nextUrl: null }
+    };
+
+    const harness = createMultiChapterPreloadHarness({
+        chaptersByUrl,
+        preloadDelayMs: 25,
+        onGlossaryPreExtract(_msg, cb) {
+            // Simulate 429 rate limit on pre-extract -> pipeline falls back & steps down concurrency 3 -> 2
+            cb({ ok: false, status: 429, error: 'Too Many Requests', rateLimited: true });
+        }
+    });
+    const pcm35s = Buffer.from(new Int16Array(24000 * 35).buffer).toString('base64');
+
+    const { res } = await runColabDownloadTest({
+        lines: [ch1Text],
+        downloadMinutes: 2,
+        ttsExportTranslateConcurrency: 3,
+        ttsColabGpu: 'T4',
+        healthData: { status: 'ok', gpu_name: 'Tesla T4', batch_supported: true, batch_max_size: 16, model_dtype: 'float16' },
+        onSendMessage: harness.onSendMessage,
+        onConnectPort: harness.onConnectPort,
+        extraSandbox: {
+            STV_findNextChapterUrl: (_doc, url) => (url === 'https://example.com/ch1' ? 'https://example.com/ch2' : null)
+        },
+        batchPortHandler({ msg, listeners }) {
+            queueMicrotask(() => {
+                msg.inputs.forEach((_, idx) => {
+                    listeners.msg.forEach((fn) => fn({ type: 'item', index: idx, audio: pcm35s, sampleRate: 24000 }));
+                });
+                listeners.msg.forEach((fn) => fn({ type: 'done', stats: { audioSec: 35, wallSec: 0.1, speedup: 350, dtype: 'float16' } }));
+            });
+        }
+    });
+
+    assert.equal(res.ok, true, `Expected graceful fallback after rate-limited pre-extract, got: ${JSON.stringify(res)}`);
+    assert.equal(res.chapters, 4);
+    assert.equal(harness.getMaxConcurrentTranslations(), 2, 'Concurrency should step down from 3 to 2 on rateLimited');
+});
+
+test('popup, i18n, and background expose parallel WAV translation wiring and MV3 keepalive contracts', () => {
+    const html = fs.readFileSync(path.resolve(__dirname, '..', 'popup.html'), 'utf8');
+    const popupJs = fs.readFileSync(path.resolve(__dirname, '..', 'popup.js'), 'utf8');
+    const backgroundJs = fs.readFileSync(path.resolve(__dirname, '..', 'background.js'), 'utf8');
+    const i18n = require(path.resolve(__dirname, '..', 'i18n.js'));
+
+    assert.ok(html.includes('id="tts-export-translate-concurrency"'));
+    for (let i = 1; i <= 6; i++) {
+        assert.ok(html.includes(`value="${i}"`), `popup.html missing concurrency option ${i}`);
+    }
+    assert.ok(popupJs.includes('ttsExportTranslateConcurrency'));
+    assert.ok(popupJs.includes('normalizeExportTranslateConcurrency'));
+
+    assert.ok(backgroundJs.includes('!redirectCheck.valid'));
+    assert.equal(backgroundJs.includes('redirectCheck.allowed'), false);
+    assert.ok(backgroundJs.includes('probe_chapter_raw'));
+    assert.ok(backgroundJs.includes('pre_extract_export_glossary'));
+    assert.ok(backgroundJs.includes('cancel_export_prefetches'));
+    assert.ok(backgroundJs.includes('glossarySaveQueues'));
+    assert.ok(backgroundJs.includes('ttsExportTranslateConcurrency'));
+    assert.ok(backgroundJs.includes("safePortPost(port, { type: 'keepalive' })"));
+
+    for (const key of [
+        'tts_export_translate_concurrency_label',
+        'optExportTransConc1', 'optExportTransConc2', 'optExportTransConc3',
+        'optExportTransConc4', 'optExportTransConc5', 'optExportTransConc6',
+        'tts_dl_pre_extract_glossary', 'tts_dl_progress_parallel'
+    ]) {
+        assert.ok(typeof i18n.DICTIONARY.vi[key] === 'string' && i18n.DICTIONARY.vi[key].length > 0, `Missing vi key ${key}`);
+        assert.ok(typeof i18n.DICTIONARY.en[key] === 'string' && i18n.DICTIONARY.en[key].length > 0, `Missing en key ${key}`);
+    }
 });

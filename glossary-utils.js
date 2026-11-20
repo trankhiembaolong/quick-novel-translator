@@ -301,23 +301,43 @@
 
     const DEFAULT_BASE_PROMPT = 'Bạn là dịch giả truyện chữ tiếng Trung. Trả về văn bản dịch thuần túy sang tiếng Việt, giữ nguyên tuyệt đối cấu trúc ngắt dòng (newlines) của bản gốc. Dòng nào trống thì trả về dòng trống. Không dùng thẻ HTML hay Markdown.';
 
-    // Dựng system prompt + user message chuẩn cho cả dịch trực tiếp lẫn dịch trước chương sau
-    function buildTranslationPromptPayload(pureTextForAPI, basePrompt, glossary = {}) {
-        const promptText = basePrompt || DEFAULT_BASE_PROMPT;
+    function buildMatchedGlossaryContext(rawText, glossary = {}) {
         const filteredTerms = [];
+        const matchedGlossary = {};
+        const text = typeof rawText === 'string' ? rawText : '';
         for (const [orig, info] of Object.entries(glossary || {})) {
-            if (!orig || !info || !info.hanviet) continue;
-            if (pureTextForAPI.includes(orig)) {
-                filteredTerms.push({ orig, hanviet: info.hanviet });
-            }
+            if (!orig || !info) continue;
+            const hanviet = typeof info === 'string' ? info : (info.hanviet || '');
+            if (!hanviet || !text.includes(orig)) continue;
+            filteredTerms.push({ orig, hanviet });
+            matchedGlossary[orig] = hanviet;
         }
         filteredTerms.sort((a, b) => b.orig.length - a.orig.length);
 
-        let glossarySection = '';
-        if (filteredTerms.length > 0) {
-            const formattedTerms = filteredTerms.map(t => `${t.orig} = ${t.hanviet}`);
-            glossarySection = `Danh sách thuật ngữ đã dịch trước đó (bắt buộc dịch đúng theo danh sách này để nhất quán):\n` + formattedTerms.join('\n');
-        }
+        const glossarySection = filteredTerms.length > 0
+            ? `Danh sách thuật ngữ đã dịch trước đó (bắt buộc dịch đúng theo danh sách này để nhất quán):\n` +
+              filteredTerms.map(t => `${t.orig} = ${t.hanviet}`).join('\n')
+            : '';
+
+        return { filteredTerms, matchedGlossary, glossarySection };
+    }
+
+    function buildGlossaryRulesText(scopePhrase = 'chương này') {
+        return `LƯU Ý QUAN TRỌNG VỀ PHẦN [GLOSSARY]:
+- CHỈ liệt kê các DANH TỪ RIÊNG thực sự MỚI xuất hiện trong ${scopePhrase} (tên nhân vật, tên tông môn/thế lực, tên địa danh cụ thể, tên công pháp/chiêu thức/pháp bảo có tên riêng độc nhất) mà CHƯA có trong danh sách được cung cấp ở trên.
+- TUYỆT ĐỐI KHÔNG THÊM:
+  + Danh từ chung, nghề nghiệp, chức danh, xưng hô (VD: 店主/điếm chủ, 小二/tiểu nhị, 掌柜/chưởng quỹ, 长老/trưởng lão, 宗主/tông chủ, 师兄/sư huynh, 道友/đạo hữu, 前辈/tiền bối, 公子/công tử, 老者/lão giả...).
+  + Vật phẩm, tài nguyên, cảnh giới tu luyện phổ thông hoặc cụm mô tả chung (VD: 灵石/linh thạch, 丹药/đan dược, 符箓/phù lục, 筑基/trúc cơ, 客栈/khách điếm, 平价制符铺/tiệm bán phù bình dân...).
+- Định dạng bắt buộc mỗi dòng: <Tiếng Trung> = <Tiếng Việt Viết Hoa Chữ Cái Đầu>. Vế trái LUÔN LÀ tiếng Trung, vế phải LUÔN LÀ tiếng Việt.
+- KHÔNG bọc từ bằng dấu 《》, "", 【】, () và KHÔNG thêm số thứ tự, gạch đầu dòng, hay chú thích giải thích.
+- KHÔNG lặp lại các từ đã có trong danh sách được cung cấp.
+- Nếu không có danh từ riêng mới nào xuất hiện, hãy để trống hoàn toàn phần dưới nhãn [GLOSSARY] (không viết thêm gì cả).`;
+    }
+
+    // Dựng system prompt + user message chuẩn cho cả dịch trực tiếp lẫn dịch trước chương sau
+    function buildTranslationPromptPayload(pureTextForAPI, basePrompt, glossary = {}) {
+        const promptText = basePrompt || DEFAULT_BASE_PROMPT;
+        const { glossarySection } = buildMatchedGlossaryContext(pureTextForAPI, glossary);
 
         const formatInstructions = `YÊU CẦU ĐỊNH DẠNG ĐẦU RA:
 Bạn phải trả về kết quả theo cấu trúc chính xác dưới đây:
@@ -327,15 +347,7 @@ Bạn phải trả về kết quả theo cấu trúc chính xác dưới đây:
 <Từ gốc tiếng Trung 1> = <Nghĩa dịch tiếng Việt 1>
 <Từ gốc tiếng Trung 2> = <Nghĩa dịch tiếng Việt 2>
 
-LƯU Ý QUAN TRỌNG VỀ PHẦN [GLOSSARY]:
-- CHỈ liệt kê các DANH TỪ RIÊNG thực sự MỚI xuất hiện trong chương này (tên nhân vật, tên tông môn/thế lực, tên địa danh cụ thể, tên công pháp/chiêu thức/pháp bảo có tên riêng độc nhất) mà CHƯA có trong danh sách được cung cấp ở trên.
-- TUYỆT ĐỐI KHÔNG THÊM:
-  + Danh từ chung, nghề nghiệp, chức danh, xưng hô (VD: 店主/điếm chủ, 小二/tiểu nhị, 掌柜/chưởng quỹ, 长老/trưởng lão, 宗主/tông chủ, 师兄/sư huynh, 道友/đạo hữu, 前辈/tiền bối, 公子/công tử, 老者/lão giả...).
-  + Vật phẩm, tài nguyên, cảnh giới tu luyện phổ thông hoặc cụm mô tả chung (VD: 灵石/linh thạch, 丹药/đan dược, 符箓/phù lục, 筑基/trúc cơ, 客栈/khách điếm, 平价制符铺/tiệm bán phù bình dân...).
-- Định dạng bắt buộc mỗi dòng: <Tiếng Trung> = <Tiếng Việt Viết Hoa Chữ Cái Đầu>. Vế trái LUÔN LÀ tiếng Trung, vế phải LUÔN LÀ tiếng Việt.
-- KHÔNG bọc từ bằng dấu 《》, "", 【】, () và KHÔNG thêm số thứ tự, gạch đầu dòng, hay chú thích giải thích.
-- KHÔNG lặp lại các từ đã có trong danh sách được cung cấp.
-- Nếu không có danh từ riêng mới nào xuất hiện, hãy để trống hoàn toàn phần dưới nhãn [GLOSSARY] (không viết thêm gì cả).`;
+${buildGlossaryRulesText('chương này')}`;
 
         const promptBlocks = [promptText, formatInstructions];
         if (glossarySection) {
@@ -345,6 +357,35 @@ LƯU Ý QUAN TRỌNG VỀ PHẦN [GLOSSARY]:
         return {
             finalSystemPrompt: promptBlocks.join("\n\n---\n\n"),
             userMessage: `Dịch toàn bộ nội dung sau sang tiếng Việt.\n\nNội dung cần dịch:\n${pureTextForAPI}\n\n---\n\n${formatInstructions}`
+        };
+    }
+
+    /**
+     * Build a glossary-only pre-extraction prompt over multiple upcoming chapters
+     * so parallel chapter translations can share unified proper nouns.
+     */
+    function buildGlossaryPreExtractPromptPayload(combinedRawText, glossary = {}) {
+        const rawText = typeof combinedRawText === 'string' ? combinedRawText : '';
+        const { matchedGlossary, glossarySection } = buildMatchedGlossaryContext(rawText, glossary);
+        const rules = buildGlossaryRulesText('các chương dưới đây');
+        const formatInstructions = `YÊU CẦU ĐỊNH DẠNG ĐẦU RA:
+KHÔNG dịch nội dung truyện. CHỈ xuất danh sách thuật ngữ theo cấu trúc chính xác dưới đây:
+[GLOSSARY]
+<Từ gốc tiếng Trung 1> = <Nghĩa dịch tiếng Việt 1>
+<Từ gốc tiếng Trung 2> = <Nghĩa dịch tiếng Việt 2>
+
+${rules}`;
+
+        const systemBase = 'Bạn là chuyên gia trích xuất danh từ riêng (nhân vật, địa danh, tông môn, công pháp/chiêu thức/pháp bảo riêng) từ nguyên tác truyện chữ tiếng Trung để thống nhất từ điển trước khi dịch song song nhiều chương.';
+        const promptBlocks = [systemBase, formatInstructions];
+        if (glossarySection) {
+            promptBlocks.push(glossarySection);
+        }
+
+        return {
+            finalSystemPrompt: promptBlocks.join('\n\n---\n\n'),
+            userMessage: `Trích xuất các danh từ riêng MỚI cần thống nhất từ các chương dưới đây (không dịch truyện):\n\n${rawText}\n\n---\n\n${formatInstructions}`,
+            matchedGlossary
         };
     }
 
@@ -363,18 +404,13 @@ LƯU Ý QUAN TRỌNG VỀ PHẦN [GLOSSARY]:
         return matched;
     }
 
-    // Phân tích khối [GLOSSARY] ở cuối bản dịch để lưu các thuật ngữ mới hợp lệ
-    function extractGlossaryTermsFromFullText(fullText) {
-        const finalCleanText = (fullText || '').replace(/^```\w*\n?/gi, '').replace(/\n?```$/gi, '');
-        if (!finalCleanText.includes('[GLOSSARY]')) {
-            return { newTerms: {}, skippedTerms: [] };
-        }
-        const glossaryContent = finalCleanText.split('[GLOSSARY]')[1].trim();
+    function parseGlossaryBlockLines(content) {
         const newTerms = {};
         const skippedTerms = [];
-        if (!glossaryContent) return { newTerms, skippedTerms };
+        const trimmed = (content || '').trim();
+        if (!trimmed) return { newTerms, skippedTerms };
 
-        for (const line of glossaryContent.split('\n')) {
+        for (const line of trimmed.split('\n')) {
             const parsed = parseGlossaryLine(line);
             if (parsed) {
                 newTerms[parsed.orig] = { hanviet: parsed.hanviet, locked: false };
@@ -383,6 +419,28 @@ LƯU Ý QUAN TRỌNG VỀ PHẦN [GLOSSARY]:
             }
         }
         return { newTerms, skippedTerms };
+    }
+
+    // Phân tích khối [GLOSSARY] ở cuối bản dịch để lưu các thuật ngữ mới hợp lệ
+    function extractGlossaryTermsFromFullText(fullText) {
+        const finalCleanText = (fullText || '').replace(/^```\w*\n?/gi, '').replace(/\n?```$/gi, '');
+        if (!finalCleanText.includes('[GLOSSARY]')) {
+            return { newTerms: {}, skippedTerms: [] };
+        }
+        return parseGlossaryBlockLines(finalCleanText.split('[GLOSSARY]')[1]);
+    }
+
+    /**
+     * Extract glossary terms from a standalone glossary pre-extraction LLM response,
+     * supporting both `[GLOSSARY]` headers and bare `orig = hanviet` line lists.
+     */
+    function extractGlossaryTermsFromResponseText(responseText) {
+        const cleaned = (responseText || '').replace(/^```\w*\n?/gi, '').replace(/\n?```$/gi, '').trim();
+        if (!cleaned) return { newTerms: {}, skippedTerms: [] };
+        if (cleaned.includes('[GLOSSARY]')) {
+            return extractGlossaryTermsFromFullText(cleaned);
+        }
+        return parseGlossaryBlockLines(cleaned);
     }
 
     // Gộp thuật ngữ mới vào glossary hiện tại, bảo vệ tuyệt đối các mục đã khóa (locked)
@@ -447,8 +505,10 @@ LƯU Ý QUAN TRỌNG VỀ PHẦN [GLOSSARY]:
         parseGlossaryLine,
         analyzeGlossaryEntries,
         buildTranslationPromptPayload,
+        buildGlossaryPreExtractPromptPayload,
         findMatchingGlossaryTerms,
         extractGlossaryTermsFromFullText,
+        extractGlossaryTermsFromResponseText,
         mergeGlossaryTerms,
         saveGlossaryFromFullText
     };

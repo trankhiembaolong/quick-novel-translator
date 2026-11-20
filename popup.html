@@ -144,6 +144,17 @@
                     <p id="tts-colab-hint" class="muted" data-i18n="tts_colab_step_hint">B1: Bấm Mở Colab &amp; chạy nút ▶ · B2: Bấm Dán link rồi Tải Audio.</p>
                 </div>
                 <div class="field">
+                    <label class="field-label" for="tts-export-translate-concurrency" data-i18n="tts_export_translate_concurrency_label">Luồng dịch song song khi tải WAV</label>
+                    <select id="tts-export-translate-concurrency" name="ttsExportTranslateConcurrency">
+                        <option value="1" data-i18n="optExportTransConc1">1 luồng (Tuần tự, giữ từ điển tuyệt đối)</option>
+                        <option value="2" data-i18n="optExportTransConc2">2 luồng (Nhẹ nhàng)</option>
+                        <option value="3" selected data-i18n="optExportTransConc3">3 luồng (Cân bằng · Khuyên dùng)</option>
+                        <option value="4" data-i18n="optExportTransConc4">4 luồng (Nhanh)</option>
+                        <option value="5" data-i18n="optExportTransConc5">5 luồng (Rất nhanh)</option>
+                        <option value="6" data-i18n="optExportTransConc6">6 luồng (Tối đa · Cần API ổn định)</option>
+                    </select>
+                </div>
+                <div class="field">
                     <label class="field-label" for="tts-download-minutes" data-i18n="tts_download_minutes_label">Thời lượng tối thiểu (phút)</label>
                     <div class="input-with-btn">
                         <input type="number" id="tts-download-minutes" name="ttsDownloadMinutes" min="5" max="240" step="5" value="30" inputmode="numeric" aria-describedby="tts-download-hint" style="flex: 0 0 90px;">
