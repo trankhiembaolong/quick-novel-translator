@@ -392,6 +392,7 @@ async function runColabDownloadTest({
     ttsColabGpu = 'A100',
     healthData = { status: 'ok', gpu_name: 'NVIDIA A100', export_max_streams: 12 },
     workerModeHandler = (msg) => ({ ok: true, data: { mode: msg.mode, max_streams: msg.workers || 6, active_workers: msg.workers || 6 } }),
+    batchPortHandler = null,
     asyncDelayMs = 0
 } = {}) {
     const code = fs.readFileSync(path.resolve(__dirname, '..', 'tts-player.js'), 'utf8');
@@ -506,6 +507,14 @@ async function runColabDownloadTest({
                                 maxConcurrentStreams = Math.max(maxConcurrentStreams, activeStreams);
                                 const pcm = new Int16Array(2400).fill(500);
                                 const b64 = Buffer.from(pcm.buffer).toString('base64');
+                                if (name === 'stv-tts-batch' && typeof batchPortHandler === 'function') {
+                                    const callNum = portStarts.filter((p) => p.portName === 'stv-tts-batch').length;
+                                    queueMicrotask(() => {
+                                        activeStreams -= 1;
+                                        batchPortHandler({ msg, listeners, b64, callNum });
+                                    });
+                                    return;
+                                }
                                 const finish = () => {
                                     activeStreams -= 1;
                                     if (name === 'stv-tts-batch') {
@@ -600,4 +609,132 @@ test('startTTSDownload uses stv-tts-batch port and STV anchor prefix when Colab 
     assert.equal(portStarts[0].voice, 'Binh');
     assert.ok(Array.isArray(portStarts[0].inputs) && portStarts[0].inputs.length >= 4);
     assert.ok(portStarts[0].inputs.every((txt) => txt.startsWith('Một. ')), 'Every batch input must include anchor prefix');
+});
+
+test('STV_StvbStreamParser decodes fragmented STVB v1 streams including empty items and detects truncation', () => {
+    const bgCode = fs.readFileSync(path.resolve(__dirname, '..', 'background.js'), 'utf8');
+    const noop = () => {};
+    const sandbox = {
+        globalThis: {},
+        importScripts: noop,
+        btoa: (str) => Buffer.from(str, 'binary').toString('base64'),
+        atob: (b64) => Buffer.from(b64, 'base64').toString('binary'),
+        Uint8Array,
+        ArrayBuffer,
+        DataView,
+        Buffer,
+        Map,
+        Set,
+        Promise,
+        Error,
+        Object,
+        Array,
+        Number,
+        String,
+        Math,
+        URL,
+        URLSearchParams,
+        TextDecoder,
+        TextEncoder,
+        setTimeout,
+        clearTimeout,
+        setInterval,
+        clearInterval,
+        console,
+        chrome: {
+            runtime: { lastError: null, onMessage: { addListener: noop }, onConnect: { addListener: noop } },
+            tabs: { onUpdated: { addListener: noop }, onRemoved: { addListener: noop } },
+            commands: { onCommand: { addListener: noop } },
+            storage: { local: { get: noop, set: noop, remove: noop, setAccessLevel: noop } }
+        }
+    };
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(bgCode, sandbox);
+
+    const { createStvbStreamParser, uint8ArrayToBase64 } = sandbox.STV_StvbStreamParser;
+    const item0 = Buffer.from([1, 2, 3, 4, 5, 6]);
+    const item1 = Buffer.alloc(0);
+    const item2 = Buffer.alloc(40000);
+    for (let i = 0; i < item2.length; i++) item2[i] = i & 0xff;
+
+    const hdr = Buffer.alloc(16);
+    hdr.write('STVB', 0, 'ascii');
+    hdr.writeUInt32LE(1, 4);
+    hdr.writeUInt32LE(24000, 8);
+    hdr.writeUInt32LE(3, 12);
+
+    const wrap = (buf) => {
+        const lenBuf = Buffer.alloc(4);
+        lenBuf.writeUInt32LE(buf.length, 0);
+        return Buffer.concat([lenBuf, buf]);
+    };
+    const fullStream = Buffer.concat([hdr, wrap(item0), wrap(item1), wrap(item2)]);
+
+    const received = [];
+    const parser = createStvbStreamParser((idx, bytes, sr) => {
+        received.push({ idx, sr, buf: Buffer.from(bytes), b64: uint8ArrayToBase64(bytes) });
+        return true;
+    }, 24000);
+
+    // Feed odd chunk sizes: 1, 3, 7, 13, 1024...
+    const stepSizes = [1, 3, 7, 13, 2, 5, 11, 1024];
+    let pos = 0;
+    let stepIdx = 0;
+    while (pos < fullStream.length) {
+        const sz = stepSizes[stepIdx % stepSizes.length];
+        stepIdx += 1;
+        parser.push(new Uint8Array(fullStream.subarray(pos, Math.min(fullStream.length, pos + sz))));
+        pos += sz;
+    }
+    parser.finish();
+
+    assert.equal(received.length, 3);
+    assert.equal(received[0].sr, 24000);
+    assert.deepStrictEqual(received[0].buf, item0);
+    assert.equal(received[1].buf.length, 0);
+    assert.equal(received[1].b64, '');
+    assert.deepStrictEqual(received[2].buf, item2);
+    assert.deepStrictEqual(Buffer.from(received[2].b64, 'base64'), item2);
+
+    const truncParser = createStvbStreamParser(() => true, 24000);
+    truncParser.push(new Uint8Array(fullStream.subarray(0, fullStream.length - 5)));
+    assert.throws(() => truncParser.finish(), /cắt cụt/);
+});
+
+test('synthesizeBatchForExport ignores keepalive and resumes remaining items after mid-batch port disconnect', async () => {
+    const longParagraph = 'Tiêu Viêm vận chuyển đấu khí suốt nhiều canh giờ liền, dòng linh lực tinh thuần cuộn trào qua từng kinh mạch khiến khí thế quanh người tăng vọt.';
+    const lines = Array.from({ length: 5 }, (_, i) => `Đoạn ${i + 1}: ${longParagraph} ${longParagraph}`);
+    const seenInputsPerCall = [];
+
+    const { res, createdAnchorClicks } = await runColabDownloadTest({
+        lines,
+        ttsColabGpu: 'T4',
+        healthData: {
+            status: 'ok',
+            gpu_name: 'Tesla T4',
+            batch_supported: true,
+            batch_max_size: 16,
+            model_dtype: 'float16'
+        },
+        batchPortHandler({ msg, listeners, b64, callNum }) {
+            seenInputsPerCall.push(msg.inputs.slice());
+            if (callNum === 1) {
+                listeners.msg.forEach((fn) => fn({ type: 'keepalive' }));
+                listeners.msg.forEach((fn) => fn({ type: 'item', index: 0, audio: b64, sampleRate: 24000 }));
+                listeners.msg.forEach((fn) => fn({ type: 'item', index: 1, audio: b64, sampleRate: 24000 }));
+                listeners.disc.forEach((fn) => fn());
+                return;
+            }
+            msg.inputs.forEach((_, idx) => {
+                listeners.msg.forEach((fn) => fn({ type: 'keepalive' }));
+                listeners.msg.forEach((fn) => fn({ type: 'item', index: idx, audio: b64, sampleRate: 24000 }));
+            });
+            listeners.msg.forEach((fn) => fn({ type: 'done', stats: { audioSec: 1.0, wallSec: 0.2, speedup: 5.0, dtype: 'float16' } }));
+        }
+    });
+
+    assert.equal(res.ok, true, `Expected resumed batch ok, got: ${JSON.stringify(res)}`);
+    assert.equal(createdAnchorClicks.length, 1);
+    assert.equal(seenInputsPerCall.length, 2, 'Should reconnect exactly once after partial disconnect');
+    assert.equal(seenInputsPerCall[1].length, seenInputsPerCall[0].length - 2, 'Retry must request ONLY remaining items');
 });

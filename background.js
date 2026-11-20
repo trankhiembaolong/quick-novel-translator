@@ -2587,13 +2587,105 @@ function buildVieNeuSamplingParams(sampling, defaultMaxChars = 280) {
 
 function uint8ArrayToBase64(bytes) {
     if (!bytes || bytes.length === 0) return '';
-    const chunkSize = 0x8000;
+    const chunkSize = 0x4000;
     const parts = [];
     for (let i = 0; i < bytes.length; i += chunkSize) {
         parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize)));
     }
     return btoa(parts.join(''));
 }
+
+function createStvbStreamParser(onItem, fallbackSampleRate = 24000) {
+    let stash = new Uint8Array(0);
+    let headerParsed = false;
+    let sampleRate = Number(fallbackSampleRate) || 24000;
+    let expectedCount = 0;
+    let emittedCount = 0;
+    let pendingItemLen = -1;
+
+    const appendBytes = (chunk) => {
+        if (!chunk || chunk.length === 0) return;
+        const incoming = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+        if (incoming.length === 0) return;
+        if (stash.length === 0) {
+            stash = incoming;
+            return;
+        }
+        const merged = new Uint8Array(stash.length + incoming.length);
+        merged.set(stash, 0);
+        merged.set(incoming, stash.length);
+        stash = merged;
+    };
+
+    const push = (chunk) => {
+        appendBytes(chunk);
+        let pos = 0;
+
+        if (!headerParsed) {
+            if (stash.length < 16) return true;
+            if (
+                stash[0] !== 0x53 ||
+                stash[1] !== 0x54 ||
+                stash[2] !== 0x56 ||
+                stash[3] !== 0x42
+            ) {
+                throw new Error('Dữ liệu VieNeu Batch không đúng định dạng STVB.');
+            }
+            const view = new DataView(stash.buffer, stash.byteOffset, 16);
+            const version = view.getUint32(4, true);
+            if (version !== 1) {
+                throw new Error(`Phiên bản STVB không được hỗ trợ: ${version}`);
+            }
+            sampleRate = view.getUint32(8, true) || sampleRate;
+            expectedCount = view.getUint32(12, true);
+            headerParsed = true;
+            pos = 16;
+        }
+
+        while (emittedCount < expectedCount) {
+            if (pendingItemLen < 0) {
+                if (stash.length - pos < 4) break;
+                const view = new DataView(stash.buffer, stash.byteOffset + pos, 4);
+                pendingItemLen = view.getUint32(0, true);
+                pos += 4;
+            }
+            if (stash.length - pos < pendingItemLen) break;
+            const payload = pendingItemLen > 0
+                ? stash.subarray(pos, pos + pendingItemLen)
+                : new Uint8Array(0);
+            pos += pendingItemLen;
+            pendingItemLen = -1;
+            const idx = emittedCount;
+            emittedCount += 1;
+            const keepGoing = onItem(idx, payload, sampleRate);
+            if (keepGoing === false) {
+                stash = new Uint8Array(0);
+                return false;
+            }
+        }
+
+        if (pos > 0) {
+            stash = pos >= stash.length ? new Uint8Array(0) : stash.slice(pos);
+        }
+        return true;
+    };
+
+    const finish = () => {
+        if (!headerParsed) {
+            throw new Error('Dữ liệu VieNeu Batch không hợp lệ (header quá ngắn).');
+        }
+        if (pendingItemLen >= 0 || emittedCount < expectedCount || stash.length > 0) {
+            throw new Error('Dữ liệu VieNeu Batch bị cắt cụt.');
+        }
+    };
+
+    return { push, finish };
+}
+
+globalThis.STV_StvbStreamParser = {
+    createStvbStreamParser,
+    uint8ArrayToBase64
+};
 
 function waitTtsRetryDelay(ms, signal, isDisconnected) {
     return new Promise((resolve, reject) => {
@@ -2621,9 +2713,18 @@ function waitTtsRetryDelay(ms, signal, isDisconnected) {
 
 function handleTtsBatchPortConnection(port) {
     let activeController = null;
+    let keepAliveTimer = null;
     let disconnected = false;
 
+    const stopKeepAlive = () => {
+        if (keepAliveTimer !== null) {
+            clearInterval(keepAliveTimer);
+            keepAliveTimer = null;
+        }
+    };
+
     const abortCurrent = () => {
+        stopKeepAlive();
         if (activeController) {
             activeController.abort();
             activeController = null;
@@ -2680,6 +2781,24 @@ function handleTtsBatchPortConnection(port) {
                 });
             }
 
+            // Ping MV3 service worker API + port every 10s so Chrome won't idle-suspend mid-batch
+            stopKeepAlive();
+            keepAliveTimer = setInterval(() => {
+                if (disconnected || controller.signal.aborted) {
+                    stopKeepAlive();
+                    return;
+                }
+                if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getPlatformInfo === 'function') {
+                    try {
+                        chrome.runtime.getPlatformInfo(() => { void chrome?.runtime?.lastError; });
+                    } catch {}
+                }
+                safePortPost(port, { type: 'keepalive' });
+            }, 10000);
+            if (keepAliveTimer && typeof keepAliveTimer.unref === 'function') {
+                keepAliveTimer.unref();
+            }
+
             const maxBatchRetries = 2;
             let response = null;
             for (let attempt = 0; attempt <= maxBatchRetries; attempt += 1) {
@@ -2704,45 +2823,34 @@ function handleTtsBatchPortConnection(port) {
                 return;
             }
 
-            const buf = await response.arrayBuffer();
-            if (disconnected || controller.signal.aborted) return;
-            if (buf.byteLength < 16) {
-                throw new Error('Dữ liệu VieNeu Batch không hợp lệ (header quá ngắn).');
-            }
-            const view = new DataView(buf);
-            if (
-                view.getUint8(0) !== 0x53 ||
-                view.getUint8(1) !== 0x54 ||
-                view.getUint8(2) !== 0x56 ||
-                view.getUint8(3) !== 0x42
-            ) {
-                throw new Error('Dữ liệu VieNeu Batch không đúng định dạng STVB.');
-            }
-            const version = view.getUint32(4, true);
-            if (version !== 1) {
-                throw new Error(`Phiên bản STVB không được hỗ trợ: ${version}`);
-            }
-            const respSampleRate = view.getUint32(8, true) || sampleRate;
-            const count = view.getUint32(12, true);
-            let offset = 16;
-
-            for (let i = 0; i < count; i += 1) {
-                if (disconnected || controller.signal.aborted) return;
-                if (offset + 4 > buf.byteLength) {
-                    throw new Error('Dữ liệu VieNeu Batch bị cắt cụt.');
-                }
-                const byteLen = view.getUint32(offset, true);
-                offset += 4;
-                if (offset + byteLen > buf.byteLength) {
-                    throw new Error('Độ dài chunk VieNeu Batch vượt quá buffer.');
-                }
-                const b64 = uint8ArrayToBase64(new Uint8Array(buf, offset, byteLen));
-                offset += byteLen;
-                if (!safePortPost(port, { type: 'item', index: i, audio: b64, sampleRate: respSampleRate })) {
+            const parser = createStvbStreamParser((idx, payloadBytes, respSampleRate) => {
+                if (disconnected || controller.signal.aborted) return false;
+                const b64 = uint8ArrayToBase64(payloadBytes);
+                if (!safePortPost(port, { type: 'item', index: idx, audio: b64, sampleRate: respSampleRate })) {
                     abortCurrent();
-                    return;
+                    return false;
                 }
+                return true;
+            }, sampleRate);
+
+            if (response.body && typeof response.body.getReader === 'function') {
+                const reader = response.body.getReader();
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (disconnected || controller.signal.aborted) {
+                        try { await reader.cancel(); } catch {}
+                        return;
+                    }
+                    if (value && !parser.push(value)) return;
+                }
+            } else {
+                const buf = await response.arrayBuffer();
+                if (disconnected || controller.signal.aborted) return;
+                parser.push(new Uint8Array(buf));
             }
+            if (disconnected || controller.signal.aborted) return;
+            parser.finish();
 
             const stats = {
                 audioSec: Number(response.headers?.get('X-Batch-Audio-Sec') || 0) || 0,
@@ -2760,6 +2868,7 @@ function handleTtsBatchPortConnection(port) {
                 : err.message;
             safePortPost(port, { type: 'error', error: friendly });
         } finally {
+            stopKeepAlive();
             if (activeController === controller) {
                 activeController = null;
             }

@@ -626,9 +626,9 @@ def _setup_cors_and_routes(
     batch_cap: int = 16,
     model_dtype: str = "auto",
 ) -> None:
-    from fastapi import Depends, HTTPException, Response
+    from fastapi import Depends, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import JSONResponse
+    from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel, Field
 
     # Allow Chrome extension / browser requests over Cloudflare / ngrok HTTPS tunnel
@@ -775,19 +775,6 @@ def _setup_cors_and_routes(
                 if w is not None:
                     total_src_samples += len(w)
 
-        pcm_items = [
-            _wav_to_pcm16_bytes(wavs_by_index[idx], src_sr, req.sample_rate, oai)
-            if idx in wavs_by_index
-            else b""
-            for idx in range(len(req.inputs))
-        ]
-
-        payload = bytearray(b"STVB")
-        payload.extend(struct.pack("<III", 1, req.sample_rate, len(pcm_items)))
-        for pcm_bytes in pcm_items:
-            payload.extend(struct.pack("<I", len(pcm_bytes)))
-            payload.extend(pcm_bytes)
-
         audio_sec = total_src_samples / float(src_sr or 48000)
         wall_sec = max(1e-3, time.perf_counter() - t0)
         speedup = audio_sec / wall_sec
@@ -805,8 +792,19 @@ def _setup_cors_and_routes(
             actual_dtype,
         )
 
-        return Response(
-            content=bytes(payload),
+        def _stream_stvb():
+            yield b"STVB" + struct.pack("<III", 1, req.sample_rate, len(req.inputs))
+            for idx in range(len(req.inputs)):
+                if idx in wavs_by_index:
+                    pcm_bytes = _wav_to_pcm16_bytes(wavs_by_index[idx], src_sr, req.sample_rate, oai)
+                else:
+                    pcm_bytes = b""
+                yield struct.pack("<I", len(pcm_bytes))
+                if pcm_bytes:
+                    yield pcm_bytes
+
+        return StreamingResponse(
+            _stream_stvb(),
             media_type="application/octet-stream",
             headers={
                 "X-Sample-Rate": str(req.sample_rate),

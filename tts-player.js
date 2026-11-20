@@ -4242,8 +4242,30 @@
         return collector.finish();
     }
 
-    function synthesizeBatchForExport(segTexts, exportRunId) {
-        return new Promise((resolve, reject) => {
+    async function synthesizeBatchForExport(segTexts, exportRunId) {
+        const waitReconnectDelay = (ms) => new Promise((resolve, reject) => {
+            if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+                reject(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+                return;
+            }
+            let timerId = null;
+            const abortHandler = (err) => {
+                if (timerId !== null) clearTimeout(timerId);
+                exportState.abortRejects.delete(abortHandler);
+                reject(err);
+            };
+            exportState.abortRejects.add(abortHandler);
+            timerId = setTimeout(() => {
+                exportState.abortRejects.delete(abortHandler);
+                if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+                    reject(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+                    return;
+                }
+                resolve();
+            }, ms);
+        });
+
+        const runBatchAttempt = (subsetTexts) => new Promise((resolve, reject) => {
             if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
                 reject(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
                 return;
@@ -4256,11 +4278,13 @@
             exportState.activePorts.add(port);
 
             let settled = false;
-            const items = new Array(segTexts.length);
-            let timer = null;
+            const items = new Array(subsetTexts.length).fill(null);
+            let inactivityTimer = null;
+            let hardTimer = null;
 
             const cleanup = () => {
-                if (timer) clearTimeout(timer);
+                if (inactivityTimer) clearTimeout(inactivityTimer);
+                if (hardTimer) clearTimeout(hardTimer);
                 exportState.activePorts.delete(port);
                 exportState.abortRejects.delete(abortHandler);
                 try { port.disconnect(); } catch {}
@@ -4280,18 +4304,19 @@
                 for (let i = 0; i < items.length; i++) {
                     if (!items[i]) items[i] = { chunks: [], totalSamples: 0 };
                 }
-                ttsLog('Batch synthesized', { count: segTexts.length, ...(stats || {}) });
+                ttsLog('Batch synthesized', { count: subsetTexts.length, ...(stats || {}) });
                 resolve({ items, stats: stats || null });
             };
 
             const abortHandler = (err) => finishErr(err);
             exportState.abortRejects.add(abortHandler);
 
-            const resetTimer = () => {
-                if (timer) clearTimeout(timer);
-                timer = setTimeout(() => finishErr(new Error('VieNeu Batch GPU timeout khi tạo audio.')), 120000);
+            const resetInactivityTimer = () => {
+                if (inactivityTimer) clearTimeout(inactivityTimer);
+                inactivityTimer = setTimeout(() => finishErr(new Error('VieNeu Batch GPU timeout khi tạo audio.')), 90000);
             };
-            resetTimer();
+            resetInactivityTimer();
+            hardTimer = setTimeout(() => finishErr(new Error('VieNeu Batch GPU vượt thời gian tối đa (180s).')), 180000);
 
             port.onMessage.addListener((msg) => {
                 if (settled || !msg) return;
@@ -4299,7 +4324,10 @@
                     finishErr(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
                     return;
                 }
-                resetTimer();
+                resetInactivityTimer();
+                if (msg.type === 'keepalive') {
+                    return;
+                }
                 if (msg.type === 'item') {
                     const idx = Number(msg.index);
                     if (Number.isInteger(idx) && idx >= 0 && idx < items.length) {
@@ -4318,7 +4346,11 @@
             port.onDisconnect.addListener(() => {
                 void chrome?.runtime?.lastError;
                 if (!settled) {
-                    finishErr(new Error('Kết nối VieNeu Batch GPU bị ngắt khi đang tạo audio.'));
+                    const err = Object.assign(new Error('Kết nối VieNeu Batch GPU bị ngắt khi đang tạo audio.'), {
+                        portDisconnected: true,
+                        partialItems: items
+                    });
+                    finishErr(err);
                 }
             });
 
@@ -4327,7 +4359,7 @@
                 const sampling = { ...getSamplingParams(state.stabilityProfile), max_chars: maxChars };
                 port.postMessage({
                     type: 'start',
-                    inputs: segTexts.map((txt) => formatTtsInputText(txt)),
+                    inputs: subsetTexts.map((txt) => formatTtsInputText(txt)),
                     voice: exportState.effectiveVoice,
                     serverUrl: exportState.effectiveServerUrl,
                     apiKey: state.apiKey,
@@ -4339,6 +4371,57 @@
                 finishErr(err);
             }
         });
+
+        const collectedItems = new Array(segTexts.length).fill(null);
+        let lastStats = null;
+        const maxDisconnectRetries = 2;
+
+        for (let attempt = 0; attempt <= maxDisconnectRetries; attempt += 1) {
+            const missingIndices = [];
+            for (let i = 0; i < segTexts.length; i++) {
+                if (!collectedItems[i]) missingIndices.push(i);
+            }
+            if (missingIndices.length === 0) {
+                return { items: collectedItems, stats: lastStats };
+            }
+
+            try {
+                const attemptRes = await runBatchAttempt(missingIndices.map((idx) => segTexts[idx]));
+                const received = Array.isArray(attemptRes?.items) ? attemptRes.items : [];
+                for (let k = 0; k < missingIndices.length; k++) {
+                    collectedItems[missingIndices[k]] = received[k] || { chunks: [], totalSamples: 0 };
+                }
+                lastStats = attemptRes?.stats || lastStats;
+                return { items: collectedItems, stats: lastStats };
+            } catch (err) {
+                if (Array.isArray(err?.partialItems)) {
+                    for (let k = 0; k < missingIndices.length; k++) {
+                        if (err.partialItems[k]) {
+                            collectedItems[missingIndices[k]] = err.partialItems[k];
+                        }
+                    }
+                }
+                const remainingCount = collectedItems.filter((item) => !item).length;
+                if (remainingCount === 0) {
+                    return { items: collectedItems, stats: lastStats };
+                }
+                const canRetry = Boolean(err?.portDisconnected)
+                    && attempt < maxDisconnectRetries
+                    && !exportState.aborted
+                    && !exportState.savePartialRequested
+                    && exportState.runId === exportRunId;
+                if (!canRetry) {
+                    throw err;
+                }
+                ttsLog('Batch port disconnected, reconnecting for remaining items', {
+                    attempt: attempt + 1,
+                    remaining: remainingCount
+                });
+                await waitReconnectDelay(800 * (attempt + 1));
+            }
+        }
+
+        return { items: collectedItems, stats: lastStats };
     }
 
     function synthesizeSegmentForExport(segText, exportRunId) {
