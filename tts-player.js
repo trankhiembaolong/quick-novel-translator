@@ -1363,6 +1363,9 @@
         leaseId: null,
         exportSessionId: '',
         useColabGpu: false,
+        useColabDriveExport: false,
+        colabDriveDir: '',
+        colabDriveFormat: 'wav',
         useBatchApi: false,
         useBatchOpus: false,
         batchSize: 16,
@@ -4088,6 +4091,9 @@
             const colabCfg = getColabGpuExportConfig(state.colabGpuTier, health);
             exportState.targetWorkers = colabCfg.workers;
             exportState.maxChunkChars = colabCfg.maxChunkChars;
+            exportState.useColabDriveExport = Boolean(health && health.drive_export_supported);
+            exportState.colabDriveDir = String((health && health.drive_export_dir) || '');
+            exportState.colabDriveFormat = String((health && health.drive_export_format) || 'wav');
             exportState.useBatchApi = Boolean(health && health.batch_supported);
             exportState.useBatchOpus = Boolean(
                 exportState.useBatchApi
@@ -4096,7 +4102,13 @@
             );
             exportState.batchSize = getColabGpuBatchSize(state.colabGpuTier, health);
             const gpuLabel = (health && health.gpu_name) ? health.gpu_name : colabCfg.tier;
-            if (exportState.useBatchApi) {
+            if (exportState.useColabDriveExport) {
+                updatePlayerUI(
+                    tTts('tts_dl_scaling_colab_drive', `Đang chạy Colab GPU → Google Drive (${gpuLabel} · Batch ${exportState.batchSize})...`)
+                        .replace('{gpu}', String(gpuLabel))
+                        .replace('{batchSize}', String(exportState.batchSize))
+                );
+            } else if (exportState.useBatchApi) {
                 updatePlayerUI(
                     tTts('tts_dl_scaling_colab_batch', `Đang chạy Colab GPU Batch (${gpuLabel} · Batch ${exportState.batchSize})...`)
                         .replace('{gpu}', String(gpuLabel))
@@ -4980,14 +4992,18 @@
         return collector.finish();
     }
 
-    async function synthesizeBatchForExport(segTexts, exportRunId) {
-        const waitReconnectDelay = (ms) => new Promise((resolve, reject) => {
-            if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
-                reject(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+    function waitExportReconnectDelay(ms, exportRunId, { allowDuringPartial = false } = {}) {
+        return new Promise((resolve, reject) => {
+            const stopped = exportState.runId !== exportRunId
+                || exportState.aborted
+                || (!allowDuringPartial && exportState.savePartialRequested);
+            if (stopped) {
+                reject(new Error(exportState.savePartialRequested && !exportState.aborted ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
                 return;
             }
             let timerId = null;
             const abortHandler = (err) => {
+                if (allowDuringPartial && err?.message === 'EXPORT_SAVE_PARTIAL') return;
                 if (timerId !== null) clearTimeout(timerId);
                 exportState.abortRejects.delete(abortHandler);
                 reject(err);
@@ -4995,13 +5011,20 @@
             exportState.abortRejects.add(abortHandler);
             timerId = setTimeout(() => {
                 exportState.abortRejects.delete(abortHandler);
-                if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
-                    reject(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+                const stoppedAfter = exportState.runId !== exportRunId
+                    || exportState.aborted
+                    || (!allowDuringPartial && exportState.savePartialRequested);
+                if (stoppedAfter) {
+                    reject(new Error(exportState.savePartialRequested && !exportState.aborted ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
                     return;
                 }
                 resolve();
             }, ms);
         });
+    }
+
+    async function synthesizeBatchForExport(segTexts, exportRunId) {
+        const waitReconnectDelay = (ms) => waitExportReconnectDelay(ms, exportRunId);
 
         const runBatchAttempt = (subsetTexts) => new Promise((resolve, reject) => {
             if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
@@ -5182,6 +5205,143 @@
         }
 
         return { items: collectedItems, stats: lastStats };
+    }
+
+    async function callColabDriveExport(op, payload, exportRunId, opts = {}) {
+        const {
+            allowDuringPartial = false,
+            ignoreAbort = false,
+            sampling = null,
+            timeoutMs = 180000
+        } = opts || {};
+
+        const isStopped = () => {
+            if (ignoreAbort) return false;
+            if (exportState.runId !== exportRunId || exportState.aborted) return true;
+            if (!allowDuringPartial && exportState.savePartialRequested) return true;
+            return false;
+        };
+
+        const runOnce = () => new Promise((resolve, reject) => {
+            if (isStopped()) {
+                reject(new Error(exportState.savePartialRequested && !exportState.aborted ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+                return;
+            }
+            const port = safeConnectTtsPort('stv-colab-export');
+            if (!port) {
+                reject(new Error('Extension vừa được cập nhật — hãy tải lại trang (F5).'));
+                return;
+            }
+            if (!ignoreAbort) {
+                exportState.activePorts.add(port);
+            }
+
+            let settled = false;
+            let inactivityTimer = null;
+            let hardTimer = null;
+
+            const cleanup = () => {
+                if (inactivityTimer) clearTimeout(inactivityTimer);
+                if (hardTimer) clearTimeout(hardTimer);
+                exportState.activePorts.delete(port);
+                exportState.abortRejects.delete(abortHandler);
+                try { port.disconnect(); } catch {}
+            };
+
+            const finishErr = (err) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(err instanceof Error ? err : new Error(String(err)));
+            };
+
+            const finishOk = (data) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve(data || {});
+            };
+
+            const abortHandler = (err) => {
+                if (ignoreAbort) return;
+                if (allowDuringPartial && err?.message === 'EXPORT_SAVE_PARTIAL') return;
+                finishErr(err);
+            };
+            if (!ignoreAbort) {
+                exportState.abortRejects.add(abortHandler);
+            }
+
+            const resetInactivityTimer = () => {
+                if (inactivityTimer) clearTimeout(inactivityTimer);
+                inactivityTimer = setTimeout(
+                    () => finishErr(new Error(`VieNeu Drive Export (${op}) timeout.`)),
+                    Math.min(timeoutMs, 120000)
+                );
+            };
+            resetInactivityTimer();
+            hardTimer = setTimeout(
+                () => finishErr(new Error(`VieNeu Drive Export (${op}) vượt thời gian tối đa.`)),
+                timeoutMs
+            );
+
+            port.onMessage.addListener((msg) => {
+                if (settled || !msg) return;
+                if (isStopped()) {
+                    finishErr(new Error(exportState.savePartialRequested && !exportState.aborted ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+                    return;
+                }
+                resetInactivityTimer();
+                if (msg.type === 'keepalive') {
+                    return;
+                }
+                if (msg.type === 'result') {
+                    finishOk(msg.data || {});
+                } else if (msg.type === 'error') {
+                    const err = Object.assign(new Error(msg.error || 'Lỗi VieNeu Drive Export'), {
+                        unsupported: Boolean(msg.unsupported)
+                    });
+                    finishErr(err);
+                }
+            });
+
+            port.onDisconnect.addListener(() => {
+                void chrome?.runtime?.lastError;
+                if (settled) return;
+                const err = Object.assign(new Error('Kết nối VieNeu Drive Export bị ngắt.'), {
+                    portDisconnected: true
+                });
+                finishErr(err);
+            });
+
+            try {
+                port.postMessage({
+                    type: 'call',
+                    op,
+                    serverUrl: exportState.effectiveServerUrl,
+                    apiKey: state.apiKey,
+                    payload: payload || {},
+                    ...(sampling ? { sampling } : {})
+                });
+            } catch (err) {
+                finishErr(err);
+            }
+        });
+
+        const maxDisconnectRetries = op === 'batch' ? 2 : 0;
+        for (let attempt = 0; attempt <= maxDisconnectRetries; attempt += 1) {
+            try {
+                return await runOnce();
+            } catch (err) {
+                const canRetry = Boolean(err?.portDisconnected)
+                    && attempt < maxDisconnectRetries
+                    && !isStopped();
+                if (!canRetry) {
+                    throw err;
+                }
+                ttsLog(`Drive export (${op}) disconnected, retrying (${attempt + 1}/${maxDisconnectRetries})`);
+                await waitExportReconnectDelay(800 * (attempt + 1), exportRunId, { allowDuringPartial });
+            }
+        }
     }
 
     function synthesizeSegmentForExport(segText, exportRunId) {
@@ -5418,6 +5578,9 @@
         exportState.activeSockets.clear();
         exportState.activePreloadPorts.clear();
         exportState.abortRejects.clear();
+        let driveExportActive = false;
+        let driveExportFinalized = false;
+        let driveTotalSec = 0;
 
         try {
             await loadAndApplyRuntimeConfig(options);
@@ -5447,6 +5610,9 @@
                 }
                 const colabCfg = getColabGpuExportConfig(resolvedColabTier);
                 exportState.useColabGpu = true;
+                exportState.useColabDriveExport = false;
+                exportState.colabDriveDir = '';
+                exportState.colabDriveFormat = 'wav';
                 exportState.useBatchApi = false;
                 exportState.useBatchOpus = false;
                 exportState.batchSize = getColabGpuBatchSize(resolvedColabTier);
@@ -5457,6 +5623,9 @@
                 exportState.maxChunkChars = Number(options.colabMaxChunkChars) || colabCfg.maxChunkChars;
             } else {
                 exportState.useColabGpu = false;
+                exportState.useColabDriveExport = false;
+                exportState.colabDriveDir = '';
+                exportState.colabDriveFormat = 'wav';
                 exportState.useBatchApi = false;
                 exportState.useBatchOpus = false;
                 exportState.batchSize = 16;
@@ -5539,6 +5708,24 @@
             let lastCompletedNextUrl = currentChapterNextUrl;
             let earlyStopReason = '';
 
+            if (exportState.useColabGpu && exportState.useColabDriveExport) {
+                try {
+                    await callColabDriveExport('start', {
+                        session_id: exportLeaseId,
+                        sample_rate: EXPORT_SAMPLE_RATE,
+                        speed: state.speed || 1.0
+                    }, myRunId);
+                    driveExportActive = true;
+                } catch (driveStartErr) {
+                    if (driveStartErr?.unsupported) {
+                        ttsLog('Colab /v1/export/start unsupported, falling back to /v1/audio/batch');
+                        exportState.useColabDriveExport = false;
+                    } else {
+                        throw driveStartErr;
+                    }
+                }
+            }
+
             const pipeline = (currentChapterNextUrl && MAX_EXPORT_CHAPTERS > 1)
                 ? createExportChapterPipeline({
                     initialNextUrl: currentChapterNextUrl,
@@ -5594,7 +5781,84 @@
 
                     let batchFallbackStartIdx = 0;
                     let batchHandledAll = false;
-                    if (exportState.useColabGpu && exportState.useBatchApi) {
+                    let chapDriveSec = 0;
+                    if (driveExportActive) {
+                        const bs = Math.max(1, Math.min(32, Number(exportState.batchSize) || 16));
+                        const batches = [];
+                        for (let start = 0; start < N; start += bs) {
+                            batches.push({
+                                start,
+                                texts: chapterSegments.slice(start, start + bs).map((seg) => seg.text)
+                            });
+                        }
+                        const chapIdx = exportState.chaptersCompleted + 1;
+                        const maxChars = Math.min(512, Math.max(380, (exportState.maxChunkChars || 320) + 60));
+                        const sampling = { ...getSamplingParams(state.stabilityProfile), max_chars: maxChars };
+                        let nextBatchIdx = 0;
+                        let batchFatalErr = null;
+
+                        const runDriveBatchWorker = async () => {
+                            while (true) {
+                                if (
+                                    exportState.aborted ||
+                                    exportState.savePartialRequested ||
+                                    exportState.runId !== myRunId ||
+                                    batchFatalErr
+                                ) {
+                                    return;
+                                }
+                                const bIdx = nextBatchIdx++;
+                                if (bIdx >= batches.length) return;
+                                const batch = batches[bIdx];
+
+                                exportState.segIndex = Math.min(N, Math.max(exportState.segIndex, batch.start + batch.texts.length));
+                                updatePlayerUI();
+
+                                try {
+                                    const batchRes = await callColabDriveExport('batch', {
+                                        session_id: exportLeaseId,
+                                        chapter_index: chapIdx,
+                                        batch_index: bIdx,
+                                        inputs: batch.texts.map((txt) => formatTtsInputText(txt)),
+                                        voice: exportState.effectiveVoice || undefined,
+                                        sample_rate: EXPORT_SAMPLE_RATE,
+                                        speed: state.speed || 1.0,
+                                        trim_anchor: true,
+                                        batch_size: bs
+                                    }, myRunId, { sampling });
+                                    if (exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) {
+                                        return;
+                                    }
+                                    const batchSec = Number(batchRes?.audio_sec || 0) || 0;
+                                    chapDriveSec += batchSec;
+                                    const reportedTotal = Number(batchRes?.total_audio_sec || 0) || 0;
+                                    if (reportedTotal > 0) {
+                                        driveTotalSec = Math.max(driveTotalSec, reportedTotal);
+                                    } else {
+                                        driveTotalSec += batchSec;
+                                    }
+                                    exportState.accumulatedSec = driveTotalSec;
+                                    completedCount += batch.texts.length;
+                                    exportState.segIndex = Math.min(N, completedCount);
+                                    updatePlayerUI();
+                                } catch (batchErr) {
+                                    if (!batchFatalErr) batchFatalErr = batchErr;
+                                    if (batchErr?.message !== 'EXPORT_SAVE_PARTIAL' && batchErr?.message !== 'EXPORT_ABORTED') {
+                                        abortActiveExportNetwork();
+                                    }
+                                    return;
+                                }
+                            }
+                        };
+
+                        const batchWorkers = Math.min(2, batches.length);
+                        await Promise.all(Array.from({ length: batchWorkers }, () => runDriveBatchWorker()));
+
+                        if (batchFatalErr) {
+                            throw batchFatalErr;
+                        }
+                        batchHandledAll = true;
+                    } else if (exportState.useColabGpu && exportState.useBatchApi) {
                         const bs = Math.max(1, Math.min(32, Number(exportState.batchSize) || 16));
                         const batches = [];
                         for (let start = 0; start < N; start += bs) {
@@ -5717,10 +5981,12 @@
                     }
 
                     exportState.chaptersCompleted += 1;
-                    exportState.accumulatedSec = totalSamples24k / EXPORT_SAMPLE_RATE;
+                    exportState.accumulatedSec = driveExportActive ? driveTotalSec : (totalSamples24k / EXPORT_SAMPLE_RATE);
                     lastCompletedNextUrl = currentChapterNextUrl;
 
-                    const chapActualSec = (totalSamples24k - chapStartSamples24k) / EXPORT_SAMPLE_RATE;
+                    const chapActualSec = driveExportActive
+                        ? chapDriveSec
+                        : ((totalSamples24k - chapStartSamples24k) / EXPORT_SAMPLE_RATE);
                     const measuredRate = calibrateExportSpeakingRate(chapActualSec, chapterSegments);
                     chapterSegments = null;
                     if (pipeline) {
@@ -5774,8 +6040,10 @@
                         break;
                     }
 
-                    pcmInt16Chunks.push(interChapSilence);
-                    totalSamples24k += interChapSilence.length;
+                    if (!driveExportActive) {
+                        pcmInt16Chunks.push(interChapSilence);
+                        totalSamples24k += interChapSilence.length;
+                    }
                     chapterSegments = nextSegs;
                     currentChapterNextUrl = nextData.nextUrl || null;
                 }
@@ -5790,7 +6058,75 @@
             }
 
             if (exportState.aborted) {
+                if (driveExportActive && !driveExportFinalized) {
+                    driveExportFinalized = true;
+                    callColabDriveExport('abort', { session_id: exportLeaseId }, myRunId, {
+                        allowDuringPartial: true,
+                        ignoreAbort: true,
+                        timeoutMs: 10000
+                    }).catch(() => {});
+                }
                 throw new Error('EXPORT_ABORTED');
+            }
+
+            if (driveExportActive) {
+                if (driveTotalSec <= 0) {
+                    if (!driveExportFinalized) {
+                        driveExportFinalized = true;
+                        callColabDriveExport('abort', { session_id: exportLeaseId }, myRunId, {
+                            allowDuringPartial: true,
+                            ignoreAbort: true,
+                            timeoutMs: 10000
+                        }).catch(() => {});
+                    }
+                    exportState.active = false;
+                    const noAudioMsg = tTts('tts_dl_no_audio', 'Chưa có dữ liệu âm thanh để lưu.');
+                    updatePlayerUI(noAudioMsg, true);
+                    return { ok: false, error: 'no_audio' };
+                }
+
+                updatePlayerUI(tTts('tts_dl_saving_drive', 'Đang ghép & lưu file lên Google Drive...'));
+                const actualMinNum = Math.max(1, Math.round(driveTotalSec / 60));
+                const exactMinLabel = (driveTotalSec / 60).toFixed(1).replace(/\.0$/, '');
+                const savedChapters = Math.max(1, exportState.chaptersCompleted || 1);
+                const suggestedFilename = `stv-audio-${actualMinNum}p-${savedChapters}ch.wav`;
+                const fin = await callColabDriveExport('finalize', {
+                    session_id: exportLeaseId,
+                    filename: suggestedFilename,
+                    chapters: savedChapters
+                }, myRunId, { allowDuringPartial: true, timeoutMs: 300000 });
+                driveExportFinalized = true;
+
+                const drivePathLabel = String(fin?.drive_path || fin?.filename || exportState.colabDriveDir || suggestedFilename);
+                const outFormat = String(fin?.format || exportState.colabDriveFormat || 'wav');
+                const finalByteLength = Number(fin?.byte_length || 0) || 0;
+                const finalMinutes = Number((Number(fin?.audio_sec || driveTotalSec) / 60).toFixed(1)) || Number(exactMinLabel);
+                const finalMinLabel = String(finalMinutes).replace(/\.0$/, '');
+
+                exportState.active = false;
+                exportState.nextOpenUrl = lastCompletedNextUrl || null;
+                if (earlyStopReason && !exportState.savePartialRequested) {
+                    const warnMsg = `Đã lưu ${finalMinLabel}p (${savedChapters} ch.) lên Drive (${drivePathLabel}) · Dừng sớm: ${earlyStopReason}`;
+                    updatePlayerUI(warnMsg, true);
+                    notifyTtsToast(warnMsg, 'warning');
+                } else {
+                    const doneMsg = tTts('tts_dl_done_drive', `Đã lưu ${finalMinLabel} phút (${savedChapters} chương) lên Google Drive: ${drivePathLabel}`)
+                        .replace('{minutes}', finalMinLabel)
+                        .replace('{chapters}', String(savedChapters))
+                        .replace('{path}', drivePathLabel);
+                    updatePlayerUI(doneMsg);
+                    notifyTtsToast(doneMsg, 'success');
+                }
+                return {
+                    ok: true,
+                    savedToDrive: true,
+                    drivePath: drivePathLabel,
+                    filename: String(fin?.filename || suggestedFilename),
+                    format: outFormat,
+                    chapters: savedChapters,
+                    minutes: finalMinutes,
+                    byteLength: finalByteLength
+                };
             }
 
             if (totalSamples24k <= 0) {
@@ -5835,12 +6171,23 @@
             notifyTtsToast(errMsg, 'error');
             return { ok: false, error: errMsg };
         } finally {
+            if (driveExportActive && !driveExportFinalized) {
+                driveExportFinalized = true;
+                callColabDriveExport('abort', { session_id: exportLeaseId }, myRunId, {
+                    allowDuringPartial: true,
+                    ignoreAbort: true,
+                    timeoutMs: 10000
+                }).catch(() => {});
+            }
             releaseExportWorkers(exportLeaseId);
             if (exportState.runId === myRunId) {
                 exportState.active = false;
                 exportState.leaseId = null;
                 exportState.exportSessionId = '';
                 exportState.useColabGpu = false;
+                exportState.useColabDriveExport = false;
+                exportState.colabDriveDir = '';
+                exportState.colabDriveFormat = 'wav';
                 exportState.useBatchApi = false;
                 exportState.useBatchOpus = false;
                 exportState.batchSize = 16;

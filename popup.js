@@ -90,6 +90,8 @@
         colabGpuName: '',
         colabWorkers: 6,
         colabBatchSize: 0,
+        colabDriveExport: false,
+        colabDriveDir: '',
         fetchedModels: [],
         modelsEndpoint: '',
         isFetchingModels: false,
@@ -1702,9 +1704,10 @@
         }
         if (pill) {
             if (state.colabOnline && state.colabGpuName) {
-                pill.textContent = state.colabBatchSize > 0
+                const basePill = state.colabBatchSize > 0
                     ? `Batch ${state.colabBatchSize}`
                     : `${state.colabWorkers || profile.workers}x`;
+                pill.textContent = state.colabDriveExport ? `${basePill} · ☁️ Drive` : basePill;
             } else {
                 pill.textContent = profile.label;
             }
@@ -1821,6 +1824,8 @@
             state.colabOnline = false;
             state.colabGpuName = '';
             state.colabBatchSize = 0;
+            state.colabDriveExport = false;
+            state.colabDriveDir = '';
             updateColabStatusUI();
             if (!silent) setColabHint(t('tts_colab_err_url_missing'), 'error');
             return false;
@@ -1830,6 +1835,8 @@
             const permOk = await ensureColabTunnelPermission(url, { promptIfMissing: true });
             if (!permOk) {
                 state.colabOnline = false;
+                state.colabDriveExport = false;
+                state.colabDriveDir = '';
                 updateColabStatusUI();
                 if (!silent) setColabHint(t('tts_colab_perm_needed'), 'error');
                 return false;
@@ -1860,6 +1867,8 @@
             state.colabBatchSize = res.data?.batch_supported
                 ? (Number(res.data?.batch_max_size) || 0)
                 : 0;
+            state.colabDriveExport = Boolean(res.data?.drive_export_supported);
+            state.colabDriveDir = String(res.data?.drive_export_dir || '');
             updateColabStatusUI();
             setColabHint(t('tts_colab_step_hint'));
             await chrome.storage.local.set({ ttsColabUrl: url });
@@ -1869,6 +1878,8 @@
             state.colabOnline = false;
             state.colabGpuName = '';
             state.colabBatchSize = 0;
+            state.colabDriveExport = false;
+            state.colabDriveDir = '';
             updateColabStatusUI();
             if (!silent) setColabHint(t('tts_colab_err_connect_fail', { url }), 'error');
             return false;
@@ -1903,21 +1914,102 @@
         const safeTier = ['T4', 'L4', 'A100', 'auto'].includes(tier) ? tier : 'T4';
         return [
             `# STV VieNeu-TTS Colab GPU Server (${safeTier})`,
-            'import os, re, sys, time, json, shutil, subprocess, urllib.request',
+            'USE_GOOGLE_DRIVE = True',
+            'DRIVE_FOLDER = "STV-VieNeu"',
+            'EXPORT_FORMAT = "wav"',
+            'import os, re, sys, time, json, glob, shutil, threading, subprocess, urllib.request, importlib.metadata',
             'from IPython.display import HTML, clear_output, display',
-            'subprocess.run("apt-get update -qq && apt-get install -y -qq espeak-ng > /dev/null 2>&1", shell=True, check=True)',
+            'drive_ready, cache_dir, export_dir, drive_display_dir = False, "", "", ""',
+            'if USE_GOOGLE_DRIVE:',
+            '    try:',
+            '        from google.colab import drive',
+            '        if not os.path.isdir("/content/drive/MyDrive"):',
+            '            drive.mount("/content/drive", force_remount=False)',
+            '        if os.path.isdir("/content/drive/MyDrive"):',
+            '            cache_dir = f"/content/drive/MyDrive/{DRIVE_FOLDER}/Cache"',
+            '            export_dir = f"/content/drive/MyDrive/{DRIVE_FOLDER}/Exports"',
+            '            os.makedirs(cache_dir, exist_ok=True)',
+            '            os.makedirs(export_dir, exist_ok=True)',
+            '            drive_display_dir = f"MyDrive/{DRIVE_FOLDER}/Exports"',
+            '            drive_ready = True',
+            '    except Exception as e:',
+            '        print(f"⚠️ Google Drive skipped: {e}")',
+            'def atomic_tar_pack(parent_dir, name, dest_tar):',
+            '    tmp = dest_tar + ".tmp"',
+            '    try:',
+            '        subprocess.run(["tar", "-cf", tmp, "-C", parent_dir, name], check=True)',
+            '        os.replace(tmp, dest_tar)',
+            '    except Exception:',
+            '        if os.path.exists(tmp): os.remove(tmp)',
+            'if not shutil.which("espeak-ng"):',
+            '    subprocess.run("apt-get update -qq && apt-get install -y -qq espeak-ng > /dev/null 2>&1", shell=True, check=True)',
+            'cf_bin = "/usr/local/bin/cloudflared"',
+            'cf_cache = os.path.join(cache_dir, "cloudflared") if drive_ready else ""',
             'if not shutil.which("cloudflared"):',
-            '    subprocess.run("curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared", shell=True, check=True)',
+            '    if cf_cache and os.path.isfile(cf_cache):',
+            '        shutil.copyfile(cf_cache, cf_bin); os.chmod(cf_bin, 0o755)',
+            '    else:',
+            '        subprocess.run("curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared", shell=True, check=True)',
+            '        if cf_cache: shutil.copyfile(cf_bin, cf_cache)',
             'repo_dir = "/content/vieneu-tts"',
+            'repo_tar = os.path.join(cache_dir, "vieneu_repo.tar") if drive_ready else ""',
             'if not os.path.isdir(repo_dir):',
-            '    subprocess.run(["git", "clone", "--depth", "1", "https://github.com/pnnbao97/VieNeu-TTS.git", repo_dir], check=True)',
-            'subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", repo_dir, "fastapi", "uvicorn", "huggingface_hub", "tokenizers"], check=True)',
+            '    if repo_tar and os.path.isfile(repo_tar): subprocess.run(["tar", "-xf", repo_tar, "-C", "/content"], check=False)',
+            '    if not os.path.isdir(repo_dir):',
+            '        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/pnnbao97/VieNeu-TTS.git", repo_dir], check=True)',
+            '        if repo_tar: atomic_tar_pack("/content", "vieneu-tts", repo_tar)',
+            'try:',
+            '    import torch as _tp',
+            '    _tv = str(getattr(_tp, "__version__", "")).split("+")[0].split(".")',
+            '    _tt = f"torch{_tv[0]}_{_tv[1]}" if len(_tv) >= 2 else "notorch"',
+            'except Exception:',
+            '    _tt = "notorch"',
+            'env_tag = f"py{sys.version_info.major}{sys.version_info.minor}_{_tt}"',
+            'wheels_dir = "/content/vieneu_wheels"',
+            'wheels_tar = os.path.join(cache_dir, f"wheels_{env_tag}.tar") if drive_ready else ""',
+            'restored_wheels = False',
+            'if wheels_tar and os.path.isfile(wheels_tar):',
+            '    try:',
+            '        shutil.rmtree(wheels_dir, ignore_errors=True)',
+            '        subprocess.run(["tar", "-xf", wheels_tar, "-C", "/content"], check=True)',
+            '        whls = sorted(glob.glob(os.path.join(wheels_dir, "*.whl")))',
+            '        if whls:',
+            '            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--no-index", "--find-links", wheels_dir, *whls], check=True)',
+            '            if subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "--no-build-isolation", "-e", repo_dir]).returncode != 0:',
+            '                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--no-deps", "-e", repo_dir], check=True)',
+            '            subprocess.run([sys.executable, "-c", "import fastapi, uvicorn, huggingface_hub, tokenizers, vieneu"], check=True)',
+            '            restored_wheels = True',
+            '    except Exception:',
+            '        restored_wheels = False',
+            'if not restored_wheels:',
+            '    before = {d.metadata["Name"].lower(): d.version for d in importlib.metadata.distributions() if d.metadata and d.metadata["Name"]}',
+            '    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e", repo_dir, "fastapi", "uvicorn", "huggingface_hub", "tokenizers"], check=True)',
+            '    if drive_ready and wheels_tar:',
+            '        try:',
+            '            after = {d.metadata["Name"].lower(): d.version for d in importlib.metadata.distributions() if d.metadata and d.metadata["Name"]}',
+            '            delta = [f"{n}=={v}" for n, v in after.items() if n not in ("vieneu", "vieneu-tts") and before.get(n) != v]',
+            '            if delta:',
+            '                shutil.rmtree(wheels_dir, ignore_errors=True); os.makedirs(wheels_dir, exist_ok=True)',
+            '                subprocess.run([sys.executable, "-m", "pip", "wheel", "-q", "--no-deps", "--wheel-dir", wheels_dir, *delta], check=True)',
+            '                atomic_tar_pack("/content", "vieneu_wheels", wheels_tar)',
+            '        except Exception:',
+            '            pass',
             'runner_path = os.path.join(repo_dir, "vieneu_colab_runner.py")',
             'try:',
             '    urllib.request.urlretrieve("https://raw.githubusercontent.com/trankhiembaolong/quick-novel-translator/main/colab/vieneu_colab_runner.py", runner_path)',
             'except Exception:',
             '    runner_path = ""',
-            `env = {**os.environ, "HOST": "127.0.0.1", "PORT": "8000", "VIENEU_COLAB_GPU_TIER": "${safeTier}", "VIENEU_WATERMARK": "0", "PYTHONUNBUFFERED": "1"}`,
+            'hf_dir = "/content/hf_cache"',
+            'hf_tar = os.path.join(cache_dir, "hf_cache.tar") if drive_ready else ""',
+            'hf_cached = False',
+            'if hf_tar and os.path.isfile(hf_tar):',
+            '    shutil.rmtree(hf_dir, ignore_errors=True)',
+            '    if subprocess.run(["tar", "-xf", hf_tar, "-C", "/content"]).returncode == 0 and os.path.isdir(hf_dir) and any(os.scandir(hf_dir)):',
+            '        hf_cached = True',
+            'os.makedirs(hf_dir, exist_ok=True)',
+            `env = {**os.environ, "HOST": "127.0.0.1", "PORT": "8000", "VIENEU_COLAB_GPU_TIER": "${safeTier}", "VIENEU_WATERMARK": "0", "PYTHONUNBUFFERED": "1", "HF_HOME": hf_dir, "HF_HUB_DISABLE_TELEMETRY": "1"}`,
+            'if drive_ready:',
+            '    env.update({"VIENEU_DRIVE_EXPORT_DIR": export_dir, "VIENEU_DRIVE_EXPORT_DISPLAY": drive_display_dir, "VIENEU_DRIVE_EXPORT_FORMAT": EXPORT_FORMAT})',
             'server_log = open("/content/vieneu_server.log", "w", encoding="utf-8")',
             'cmd = [sys.executable, runner_path] if (runner_path and os.path.exists(runner_path)) else [sys.executable, "-m", "apps.openai_speech"]',
             'server_proc = subprocess.Popen(cmd, cwd=repo_dir, env=env, stdout=server_log, stderr=subprocess.STDOUT)',
@@ -1933,6 +2025,8 @@
             '    except Exception:',
             '        pass',
             '    time.sleep(2)',
+            'if drive_ready and hf_tar and not hf_cached and any(os.scandir(hf_dir)):',
+            '    threading.Thread(target=lambda: atomic_tar_pack("/content", "hf_cache", hf_tar), daemon=True).start()',
             'tunnel_proc = subprocess.Popen(["cloudflared", "tunnel", "--url", "http://127.0.0.1:8000", "--no-autoupdate"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)',
             'tunnel_url = ""',
             'for _ in range(300):',
@@ -1942,7 +2036,10 @@
             '        tunnel_url = m.group(0)',
             '        break',
             'clear_output(wait=True)',
-            'display(HTML(f"<div style=\'padding:14px;border:2px solid #10b981;border-radius:12px;background:#ecfdf5;color:#064e3b;font-family:sans-serif\'><b>🟢 {health.get(\\"gpu_name\\", \\"Colab GPU\\")} ready ({health.get(\\"export_max_streams\\", 6)} workers)</b><br><input id=\'stv-u\' readonly value=\'{tunnel_url}\' style=\'width:72%;padding:8px;margin-top:8px\'><button onclick=\\"navigator.clipboard.writeText(document.getElementById(\'stv-u\').value);this.innerText=\'✓ Copied!\'\\" style=\'padding:9px 14px;margin-left:8px;background:#10b981;color:#fff;border:0;border-radius:6px;cursor:pointer\'>📋 Copy Link</button></div>"))',
+            'gpu_n = health.get("gpu_name", "Colab GPU")',
+            'w_n = health.get("export_max_streams", 6)',
+            'drv_tag = f" · ☁️ Drive ({drive_display_dir})" if drive_ready else ""',
+            'display(HTML(f"<div style=\'padding:14px;border:2px solid #10b981;border-radius:12px;background:#ecfdf5;color:#064e3b;font-family:sans-serif\'><b>🟢 {gpu_n} ready ({w_n} workers){drv_tag}</b><br><input id=\'stv-u\' readonly value=\'{tunnel_url}\' style=\'width:72%;padding:8px;margin-top:8px\'><button onclick=\\"navigator.clipboard.writeText(document.getElementById(\'stv-u\').value);this.innerText=\'✓ Copied!\'\\" style=\'padding:9px 14px;margin-left:8px;background:#10b981;color:#fff;border:0;border-radius:6px;cursor:pointer\'>📋 Copy Link</button></div>"))',
             'while server_proc.poll() is None and tunnel_proc.poll() is None:',
             '    time.sleep(5)'
         ].join('\n');

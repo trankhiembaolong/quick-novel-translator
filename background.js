@@ -3284,20 +3284,42 @@ function waitTtsRetryDelay(ms, signal, isDisconnected) {
     });
 }
 
-function handleTtsBatchPortConnection(port) {
-    let activeController = null;
+function createPortKeepAlive(port) {
     let keepAliveTimer = null;
-    let disconnected = false;
-
-    const stopKeepAlive = () => {
+    const stop = () => {
         if (keepAliveTimer !== null) {
             clearInterval(keepAliveTimer);
             keepAliveTimer = null;
         }
     };
+    const start = (shouldStop) => {
+        stop();
+        keepAliveTimer = setInterval(() => {
+            if (shouldStop()) {
+                stop();
+                return;
+            }
+            if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getPlatformInfo === 'function') {
+                try {
+                    chrome.runtime.getPlatformInfo(() => { void chrome?.runtime?.lastError; });
+                } catch {}
+            }
+            safePortPost(port, { type: 'keepalive' });
+        }, 10000);
+        if (keepAliveTimer && typeof keepAliveTimer.unref === 'function') {
+            keepAliveTimer.unref();
+        }
+    };
+    return { start, stop };
+}
+
+function handleTtsBatchPortConnection(port) {
+    let activeController = null;
+    let disconnected = false;
+    const keepAlive = createPortKeepAlive(port);
 
     const abortCurrent = () => {
-        stopKeepAlive();
+        keepAlive.stop();
         if (activeController) {
             activeController.abort();
             activeController = null;
@@ -3356,22 +3378,7 @@ function handleTtsBatchPortConnection(port) {
             }
 
             // Ping MV3 service worker API + port every 10s so Chrome won't idle-suspend mid-batch
-            stopKeepAlive();
-            keepAliveTimer = setInterval(() => {
-                if (disconnected || controller.signal.aborted) {
-                    stopKeepAlive();
-                    return;
-                }
-                if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getPlatformInfo === 'function') {
-                    try {
-                        chrome.runtime.getPlatformInfo(() => { void chrome?.runtime?.lastError; });
-                    } catch {}
-                }
-                safePortPost(port, { type: 'keepalive' });
-            }, 10000);
-            if (keepAliveTimer && typeof keepAliveTimer.unref === 'function') {
-                keepAliveTimer.unref();
-            }
+            keepAlive.start(() => disconnected || controller.signal.aborted);
 
             const maxBatchRetries = 2;
             let response = null;
@@ -3443,7 +3450,101 @@ function handleTtsBatchPortConnection(port) {
                 : err.message;
             safePortPost(port, { type: 'error', error: friendly });
         } finally {
-            stopKeepAlive();
+            keepAlive.stop();
+            if (activeController === controller) {
+                activeController = null;
+            }
+        }
+    });
+}
+
+function handleColabExportPortConnection(port) {
+    let activeController = null;
+    let disconnected = false;
+    const keepAlive = createPortKeepAlive(port);
+
+    const abortCurrent = () => {
+        keepAlive.stop();
+        if (activeController) {
+            activeController.abort();
+            activeController = null;
+        }
+    };
+
+    port.onDisconnect.addListener(() => {
+        void chrome?.runtime?.lastError;
+        disconnected = true;
+        abortCurrent();
+    });
+
+    port.onMessage.addListener(async (msg) => {
+        if (!msg) return;
+        if (msg.type === 'abort') {
+            abortCurrent();
+            return;
+        }
+        const op = String(msg.op || '').trim().toLowerCase();
+        if (!['start', 'batch', 'finalize', 'abort'].includes(op)) return;
+
+        abortCurrent();
+        activeController = new AbortController();
+        const controller = activeController;
+        const serverUrl = normalizeServerUrl(msg.serverUrl);
+        const rawPayload = (msg.payload && typeof msg.payload === 'object') ? { ...msg.payload } : {};
+        const body = (op === 'batch' && msg.sampling)
+            ? { ...rawPayload, ...buildVieNeuSamplingParams(msg.sampling, 380) }
+            : rawPayload;
+
+        try {
+            const ttsCfg = await chrome.storage.local.get(['ttsApiKey', 'stvDebugLog']);
+            const resolvedApiKey = (msg.apiKey !== undefined && msg.apiKey !== '') ? msg.apiKey : (ttsCfg.ttsApiKey || '');
+            if (ttsCfg.stvDebugLog) {
+                console.log(`[STV Background TTS] POST /v1/export/${op}`, {
+                    serverUrl,
+                    sessionId: body.session_id || '',
+                    chapterIndex: body.chapter_index,
+                    batchIndex: body.batch_index
+                });
+            }
+
+            keepAlive.start(() => disconnected || controller.signal.aborted);
+
+            const maxRetries = op === 'batch' ? 2 : 0;
+            let response = null;
+            for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+                response = await fetch(`${serverUrl}/v1/export/${op}`, {
+                    method: 'POST',
+                    headers: buildAuthHeaders(resolvedApiKey, { 'Content-Type': 'application/json' }),
+                    body: JSON.stringify(body),
+                    signal: controller.signal
+                });
+                if ((response.status !== 429 && response.status !== 503) || attempt >= maxRetries) break;
+                await response.body?.cancel?.().catch(() => {});
+                await waitTtsRetryDelay(2000 * (attempt + 1), controller.signal, () => disconnected);
+            }
+
+            if (!response.ok) {
+                const errJson = await response.json().catch(() => null);
+                const errMsg = errJson?.error?.message || errJson?.detail || `VieNeu Drive Export HTTP ${response.status}`;
+                const unsupported = response.status === 404 || response.status === 405;
+                if (!disconnected && !controller.signal.aborted) {
+                    safePortPost(port, { type: 'error', unsupported, status: response.status, error: errMsg });
+                }
+                return;
+            }
+
+            const data = await response.json().catch(() => ({}));
+            if (!disconnected && !controller.signal.aborted) {
+                safePortPost(port, { type: 'result', data });
+            }
+        } catch (err) {
+            if (err.name === 'AbortError' || disconnected) return;
+            const friendly = /Failed to fetch|NetworkError/i.test(err.message)
+                ? `Không kết nối được tới VieNeu server (${serverUrl}). Hãy kiểm tra Server/Tunnel trước.`
+                : err.message;
+            safePortPost(port, { type: 'error', error: friendly });
+        } finally {
+            keepAlive.stop();
             if (activeController === controller) {
                 activeController = null;
             }
@@ -3461,6 +3562,10 @@ chrome.runtime.onConnect.addListener((port) => {
     }
     if (port.name === 'stv-tts-batch') {
         handleTtsBatchPortConnection(port);
+        return;
+    }
+    if (port.name === 'stv-colab-export') {
+        handleColabExportPortConnection(port);
         return;
     }
     if (port.name === 'stv-preload-stream') {

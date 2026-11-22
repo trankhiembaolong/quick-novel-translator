@@ -398,6 +398,7 @@ async function runColabDownloadTest({
     healthData = { status: 'ok', gpu_name: 'NVIDIA A100', export_max_streams: 12 },
     workerModeHandler = (msg) => ({ ok: true, data: { mode: msg.mode, max_streams: msg.workers || 6, active_workers: msg.workers || 6 } }),
     batchPortHandler = null,
+    colabExportPortHandler = null,
     onSendMessage = null,
     onConnectPort = null,
     beforeDownload = null,
@@ -407,6 +408,7 @@ async function runColabDownloadTest({
     const code = fs.readFileSync(path.resolve(__dirname, '..', 'tts-player.js'), 'utf8');
     const messages = [];
     const portStarts = [];
+    const colabExportCalls = [];
     const createdAnchorClicks = [];
     let activeStreams = 0;
     let maxConcurrentStreams = 0;
@@ -567,6 +569,44 @@ async function runColabDownloadTest({
                         onDisconnect: { addListener: (fn) => listeners.disc.push(fn) },
                         disconnect() {},
                         postMessage(msg) {
+                            if (name === 'stv-colab-export' && msg && msg.type === 'call') {
+                                colabExportCalls.push(msg);
+                                const callNum = colabExportCalls.length;
+                                if (typeof colabExportPortHandler === 'function') {
+                                    queueMicrotask(() => colabExportPortHandler({ msg, listeners, callNum, sandbox }));
+                                    return;
+                                }
+                                queueMicrotask(() => {
+                                    const op = msg.op;
+                                    if (op === 'start') {
+                                        listeners.msg.forEach((fn) => fn({
+                                            type: 'result',
+                                            data: { ok: true, session_id: msg.payload?.session_id, drive_dir: 'MyDrive/STV-VieNeu/Exports', output_format: 'wav' }
+                                        }));
+                                    } else if (op === 'batch') {
+                                        listeners.msg.forEach((fn) => fn({
+                                            type: 'result',
+                                            data: { ok: true, audio_sec: 32.0, total_audio_sec: 32.0 * colabExportCalls.filter((c) => c.op === 'batch').length }
+                                        }));
+                                    } else if (op === 'finalize') {
+                                        listeners.msg.forEach((fn) => fn({
+                                            type: 'result',
+                                            data: {
+                                                ok: true,
+                                                filename: msg.payload?.filename || 'stv-audio-1p-1ch.wav',
+                                                drive_path: `MyDrive/STV-VieNeu/Exports/${msg.payload?.filename || 'stv-audio-1p-1ch.wav'}`,
+                                                format: 'wav',
+                                                audio_sec: 64.0,
+                                                chapters: msg.payload?.chapters || 1,
+                                                byte_length: 3072044
+                                            }
+                                        }));
+                                    } else {
+                                        listeners.msg.forEach((fn) => fn({ type: 'result', data: { ok: true } }));
+                                    }
+                                });
+                                return;
+                            }
                             if (msg.type === 'start') {
                                 portStarts.push({ portName: name, ...msg });
                                 activeStreams += 1;
@@ -617,7 +657,7 @@ async function runColabDownloadTest({
         await beforeDownload({ sandbox, lineEls });
     }
     const res = await sandbox.STV_TTSController.startDownload({ downloadMinutes });
-    return { res, sandbox, messages, portStarts, createdAnchorClicks, maxConcurrentStreams, lineEls };
+    return { res, sandbox, messages, portStarts, colabExportCalls, createdAnchorClicks, maxConcurrentStreams, lineEls };
 }
 
 test('startTTSDownload routes colab_gpu exports independently of webspeech listening engine', async () => {
@@ -1442,6 +1482,258 @@ test('popup, i18n, and background expose parallel WAV translation wiring and MV3
         'optExportTransConc4', 'optExportTransConc5', 'optExportTransConc6',
         'tts_dl_pre_extract_glossary', 'tts_dl_progress_parallel'
     ]) {
+        assert.ok(typeof i18n.DICTIONARY.vi[key] === 'string' && i18n.DICTIONARY.vi[key].length > 0, `Missing vi key ${key}`);
+        assert.ok(typeof i18n.DICTIONARY.en[key] === 'string' && i18n.DICTIONARY.en[key].length > 0, `Missing en key ${key}`);
+    }
+});
+
+test('startTTSDownload uses stv-colab-export across multiple chapters and saves directly to Drive without local download', async () => {
+    const ch1Text = 'Chương một: Tiêu Viêm ngẩng đầu nhìn bầu trời đêm rực sáng.';
+    const chaptersByUrl = {
+        'https://example.com/ch2': {
+            id: 'ch2',
+            rawChunks: ['第二章内容非常长。'],
+            translatedText: 'Chương hai: Hắn bước chân vào khu rừng rậm linh khí nồng đậm.',
+            nextUrl: null
+        }
+    };
+    const harness = createMultiChapterPreloadHarness({ chaptersByUrl, preloadDelayMs: 10 });
+    const driveHealth = {
+        status: 'ok',
+        gpu_name: 'NVIDIA A100',
+        export_max_streams: 12,
+        batch_supported: true,
+        batch_max_size: 32,
+        batch_codecs: ['opus', 'pcm'],
+        drive_export_supported: true,
+        drive_export_dir: 'MyDrive/STV-VieNeu/Exports',
+        drive_export_format: 'mp3'
+    };
+
+    const { res, portStarts, colabExportCalls, createdAnchorClicks } = await runColabDownloadTest({
+        lines: [ch1Text],
+        downloadMinutes: 1,
+        healthData: driveHealth,
+        extraSandbox: {
+            STV_findNextChapterUrl: () => 'https://example.com/ch2'
+        },
+        onSendMessage: harness.onSendMessage,
+        onConnectPort: harness.onConnectPort
+    });
+
+    assert.equal(res.ok, true, `Expected Drive export ok, got: ${JSON.stringify(res)}`);
+    assert.equal(res.savedToDrive, true);
+    assert.equal(res.chapters, 2);
+    assert.ok(res.drivePath.includes('MyDrive/STV-VieNeu/Exports/'));
+    assert.equal(portStarts.filter((p) => p.portName === 'stv-tts-batch').length, 0, 'Must NOT stream audio back over stv-tts-batch');
+    assert.equal(createdAnchorClicks.length, 0, 'Must NOT trigger browser anchor download when saving directly to Drive');
+
+    const ops = colabExportCalls.map((c) => c.op);
+    assert.equal(ops[0], 'start');
+    assert.equal(ops[ops.length - 1], 'finalize');
+    const batchCalls = colabExportCalls.filter((c) => c.op === 'batch');
+    assert.equal(batchCalls.length, 2);
+    assert.equal(batchCalls[0].payload.chapter_index, 1);
+    assert.equal(batchCalls[0].payload.batch_index, 0);
+    assert.equal(batchCalls[1].payload.chapter_index, 2);
+    assert.equal(batchCalls[1].payload.batch_index, 0);
+    assert.ok(batchCalls[0].payload.inputs[0].startsWith('Một. '));
+});
+
+test('Colab Drive export partial save finalizes accumulated audio on Drive instead of aborting', async () => {
+    const driveHealth = {
+        status: 'ok',
+        gpu_name: 'NVIDIA T4',
+        export_max_streams: 6,
+        batch_supported: true,
+        batch_max_size: 16,
+        drive_export_supported: true,
+        drive_export_dir: 'MyDrive/STV-VieNeu/Exports',
+        drive_export_format: 'wav'
+    };
+    const manyLines = Array.from({ length: 18 }, (_, i) => `Đoạn văn dài số ${i + 1}: Tiêu Viêm vận chuyển đấu khí trong kinh mạch để đột phá cảnh giới mới.`);
+
+    const { res, colabExportCalls, createdAnchorClicks } = await runColabDownloadTest({
+        lines: manyLines,
+        ttsColabGpu: 'T4',
+        downloadMinutes: 10,
+        healthData: driveHealth,
+        colabExportPortHandler({ msg, listeners, sandbox }) {
+            if (msg.op === 'start') {
+                listeners.msg.forEach((fn) => fn({ type: 'result', data: { ok: true } }));
+                return;
+            }
+            if (msg.op === 'batch') {
+                if (msg.payload.batch_index === 0) {
+                    listeners.msg.forEach((fn) => fn({
+                        type: 'result',
+                        data: { ok: true, audio_sec: 35.0, total_audio_sec: 35.0 }
+                    }));
+                    // Trigger Save Now right after first batch completes
+                    setTimeout(() => sandbox.STV_TTSController.savePartialDownload(), 5);
+                }
+                // Batch 1 remains in-flight until Save Now aborts it with EXPORT_SAVE_PARTIAL
+                return;
+            }
+            if (msg.op === 'finalize') {
+                listeners.msg.forEach((fn) => fn({
+                    type: 'result',
+                    data: {
+                        ok: true,
+                        filename: 'partial.wav',
+                        drive_path: 'MyDrive/STV-VieNeu/Exports/partial.wav',
+                        format: 'wav',
+                        audio_sec: 35.0,
+                        chapters: 1,
+                        byte_length: 1680044
+                    }
+                }));
+            }
+        }
+    });
+
+    assert.equal(res.ok, true, `Expected partial save ok, got: ${JSON.stringify(res)}`);
+    assert.equal(res.savedToDrive, true);
+    assert.equal(res.filename, 'partial.wav');
+    assert.equal(createdAnchorClicks.length, 0);
+    const ops = colabExportCalls.map((c) => c.op);
+    assert.ok(ops.includes('finalize'), `Expected finalize in ops: ${JSON.stringify(ops)}`);
+    assert.equal(ops.includes('abort'), false, 'Partial save must not abort session');
+});
+
+test('Colab Drive export cancel calls /v1/export/abort and skips finalize', async () => {
+    const driveHealth = {
+        status: 'ok',
+        gpu_name: 'NVIDIA T4',
+        export_max_streams: 6,
+        batch_supported: true,
+        batch_max_size: 16,
+        drive_export_supported: true,
+        drive_export_dir: 'MyDrive/STV-VieNeu/Exports',
+        drive_export_format: 'wav'
+    };
+
+    const { res, colabExportCalls } = await runColabDownloadTest({
+        lines: ['Đoạn văn kiểm tra hủy tải Colab Drive.'],
+        ttsColabGpu: 'T4',
+        healthData: driveHealth,
+        colabExportPortHandler({ msg, listeners, sandbox }) {
+            if (msg.op === 'start') {
+                listeners.msg.forEach((fn) => fn({ type: 'result', data: { ok: true } }));
+                return;
+            }
+            if (msg.op === 'batch') {
+                setTimeout(() => sandbox.STV_TTSController.cancelDownload(), 5);
+                return;
+            }
+            listeners.msg.forEach((fn) => fn({ type: 'result', data: { ok: true } }));
+        }
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.cancelled, true);
+    // Allow microtask/best-effort abort message to post
+    await new Promise((r) => setTimeout(r, 20));
+    const ops = colabExportCalls.map((c) => c.op);
+    assert.ok(ops.includes('abort'), `Expected abort call, got ops: ${JSON.stringify(ops)}`);
+    assert.equal(ops.includes('finalize'), false, 'Cancelled export must never finalize');
+});
+
+test('Colab Drive export retries idempotent (chapter_index, batch_index) on mid-batch port disconnect', async () => {
+    const driveHealth = {
+        status: 'ok',
+        gpu_name: 'NVIDIA A100',
+        export_max_streams: 12,
+        batch_supported: true,
+        batch_max_size: 32,
+        drive_export_supported: true,
+        drive_export_dir: 'MyDrive/STV-VieNeu/Exports',
+        drive_export_format: 'wav'
+    };
+    let batchAttempts = 0;
+
+    const { res, colabExportCalls } = await runColabDownloadTest({
+        lines: ['Câu đầu tiên thử nghiệm tự nối lại kết nối khi port ngắt giữa chừng.'],
+        healthData: driveHealth,
+        colabExportPortHandler({ msg, listeners }) {
+            if (msg.op === 'start') {
+                listeners.msg.forEach((fn) => fn({ type: 'result', data: { ok: true } }));
+                return;
+            }
+            if (msg.op === 'batch') {
+                batchAttempts += 1;
+                if (batchAttempts === 1) {
+                    // Simulate keepalive first, then sudden MV3 port disconnect
+                    listeners.msg.forEach((fn) => fn({ type: 'keepalive' }));
+                    listeners.disc.forEach((fn) => fn());
+                    return;
+                }
+                listeners.msg.forEach((fn) => fn({
+                    type: 'result',
+                    data: { ok: true, audio_sec: 65.0, total_audio_sec: 65.0 }
+                }));
+                return;
+            }
+            if (msg.op === 'finalize') {
+                listeners.msg.forEach((fn) => fn({
+                    type: 'result',
+                    data: {
+                        ok: true,
+                        filename: 'retry-ok.wav',
+                        drive_path: 'MyDrive/STV-VieNeu/Exports/retry-ok.wav',
+                        format: 'wav',
+                        audio_sec: 65.0,
+                        chapters: 1,
+                        byte_length: 3120044
+                    }
+                }));
+            }
+        }
+    });
+
+    assert.equal(res.ok, true, `Expected retry recovery ok, got: ${JSON.stringify(res)}`);
+    assert.equal(res.savedToDrive, true);
+    assert.equal(batchAttempts, 2);
+    const batchCalls = colabExportCalls.filter((c) => c.op === 'batch');
+    assert.equal(batchCalls.length, 2);
+    assert.equal(batchCalls[0].payload.chapter_index, batchCalls[1].payload.chapter_index);
+    assert.equal(batchCalls[0].payload.batch_index, batchCalls[1].payload.batch_index);
+});
+
+test('Google Drive Colab cache & direct export are wired across notebook, runner, popup, background, player, and i18n', () => {
+    const root = path.resolve(__dirname, '..');
+    const notebookSrc = JSON.parse(fs.readFileSync(path.join(root, 'colab', 'VieNeu_Colab_GPU.ipynb'), 'utf8')).cells[0].source.join('');
+    const runnerPy = fs.readFileSync(path.join(root, 'colab', 'vieneu_colab_runner.py'), 'utf8');
+    const popupJs = fs.readFileSync(path.join(root, 'popup.js'), 'utf8');
+    const backgroundJs = fs.readFileSync(path.join(root, 'background.js'), 'utf8');
+    const playerJs = fs.readFileSync(path.join(root, 'tts-player.js'), 'utf8');
+    const i18n = require(path.join(root, 'i18n.js'));
+
+    // Notebook Drive cache & config contracts
+    for (const token of [
+        'USE_GOOGLE_DRIVE', 'DRIVE_FOLDER', 'EXPORT_FORMAT',
+        'hf_cache.tar', 'wheels_', 'vieneu_repo.tar', 'cloudflared',
+        'VIENEU_DRIVE_EXPORT_DIR', 'VIENEU_DRIVE_EXPORT_FORMAT'
+    ]) {
+        assert.ok(notebookSrc.includes(token), `VieNeu_Colab_GPU.ipynb missing ${token}`);
+    }
+
+    // Runner contracts
+    for (const token of [
+        'DriveExportManager', '_trim_anchor_float32', '_render_batch_to_pcm16',
+        'drive_export_supported', '/v1/export/start', '/v1/export/batch',
+        '/v1/export/finalize', '/v1/export/abort'
+    ]) {
+        assert.ok(runnerPy.includes(token), `vieneu_colab_runner.py missing ${token}`);
+    }
+
+    // Extension wiring contracts
+    assert.ok(popupJs.includes('colabDriveExport') && popupJs.includes('drive_export_supported'));
+    assert.ok(popupJs.includes('VIENEU_DRIVE_EXPORT_DIR'));
+    assert.ok(backgroundJs.includes("'stv-colab-export'") && backgroundJs.includes('handleColabExportPortConnection'));
+    assert.ok(playerJs.includes('useColabDriveExport') && playerJs.includes('callColabDriveExport'));
+
+    for (const key of ['tts_dl_scaling_colab_drive', 'tts_dl_saving_drive', 'tts_dl_done_drive']) {
         assert.ok(typeof i18n.DICTIONARY.vi[key] === 'string' && i18n.DICTIONARY.vi[key].length > 0, `Missing vi key ${key}`);
         assert.ok(typeof i18n.DICTIONARY.en[key] === 'string' && i18n.DICTIONARY.en[key].length > 0, `Missing en key ${key}`);
     }

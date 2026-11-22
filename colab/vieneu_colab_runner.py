@@ -13,6 +13,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -157,6 +158,16 @@ def _resample_float32(arr, src_sr: int, target_sr: int):
         return np.asarray(np.interp(x, xp, arr), dtype=np.float32)
 
 
+def _float32_to_pcm16_bytes(arr, oai=None) -> bytes:
+    """Encode a 1D float32 numpy waveform into little-endian s16le PCM bytes."""
+    import numpy as np
+
+    pcm_fn = getattr(oai, "_pcm16", None) if oai is not None else None
+    if callable(pcm_fn):
+        return pcm_fn(arr)
+    return (np.asarray(arr, dtype=np.float32) * 32767).clip(-32768, 32767).astype("<i2").tobytes()
+
+
 def _wav_to_pcm16_bytes(wav, src_sr: int, target_sr: int, oai) -> bytes:
     """Resample float32 waveform from ``src_sr`` to ``target_sr`` and encode s16le PCM."""
     import numpy as np
@@ -165,10 +176,178 @@ def _wav_to_pcm16_bytes(wav, src_sr: int, target_sr: int, oai) -> bytes:
     if arr.size == 0:
         return b""
     arr = _resample_float32(arr, src_sr, target_sr)
-    pcm_fn = getattr(oai, "_pcm16", None)
-    if callable(pcm_fn):
-        return pcm_fn(arr)
-    return (np.asarray(arr, dtype=np.float32) * 32767).clip(-32768, 32767).astype("<i2").tobytes()
+    return _float32_to_pcm16_bytes(arr, oai)
+
+
+def _trim_anchor_float32(arr, sr: int):
+    """Trim leading ``Một.`` anchor prefix using 10ms RMS frame scan matching client createAnchorTrimmer."""
+    import numpy as np
+
+    if arr.size == 0:
+        return arr
+    eff_sr = int(sr or 24000)
+    hop = max(160, int(round(eff_sr * 0.01)))
+    n_frames = arr.size // hop
+    if n_frames <= 0:
+        return arr
+    scan_frames = min(n_frames, 85)
+    frames = arr[: scan_frames * hop].reshape(scan_frames, hop)
+    rms_vals = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+
+    anchor_start = -1
+    valley_start = -1
+    for f in range(scan_frames):
+        rms = float(rms_vals[f])
+        if anchor_start == -1:
+            if f < 55 and rms > 0.02:
+                anchor_start = f
+            continue
+        if f < anchor_start + 8:
+            continue
+        if rms < 0.012:
+            if valley_start == -1:
+                valley_start = f
+            continue
+        if valley_start != -1 and (f - valley_start) >= 7:
+            cut_frame = max(valley_start + 2, f - 3)
+            return arr[min(arr.size, cut_frame * hop):]
+        valley_start = -1
+
+    if valley_start != -1 and (scan_frames - valley_start) >= 7:
+        return arr[min(arr.size, (valley_start + 2) * hop):]
+    return arr
+
+
+def _apply_fade_in_float32(arr, sr: int, fade_sec: float = 0.005):
+    """Apply linear fade-in ramp over the first ``fade_sec`` seconds."""
+    import numpy as np
+
+    if arr.size == 0:
+        return arr
+    fade_len = min(arr.size, int(round(int(sr or 24000) * fade_sec)))
+    if fade_len <= 1:
+        return arr
+    out = np.array(arr, dtype=np.float32, copy=True)
+    out[:fade_len] *= np.linspace(0.0, 1.0, fade_len, endpoint=False, dtype=np.float32)
+    return out
+
+
+def _build_atempo_filter(speed: float) -> str:
+    """Build chained ffmpeg ``atempo`` filter expression (each factor in [0.5, 2.0])."""
+    s = max(0.5, min(3.0, float(speed)))
+    filters = []
+    while s > 2.0 + 1e-6:
+        filters.append("atempo=2.0")
+        s /= 2.0
+    while s < 0.5 - 1e-6:
+        filters.append("atempo=0.5")
+        s /= 0.5
+    filters.append(f"atempo={s:.6f}".rstrip("0").rstrip("."))
+    return ",".join(filters)
+
+
+def _stretch_speed_float32(arr, sr: int, speed: float):
+    """Time-stretch float32 waveform without pitch shift via ffmpeg ``atempo``."""
+    import numpy as np
+
+    if arr.size == 0 or abs(float(speed) - 1.0) < 0.001 or not shutil.which("ffmpeg"):
+        return arr
+    eff_sr = int(sr or 24000)
+    af = _build_atempo_filter(float(speed))
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "f32le",
+                "-ar",
+                str(eff_sr),
+                "-ac",
+                "1",
+                "-i",
+                "pipe:0",
+                "-af",
+                af,
+                "-f",
+                "f32le",
+                "-ar",
+                str(eff_sr),
+                "-ac",
+                "1",
+                "pipe:1",
+            ],
+            input=np.asarray(arr, dtype="<f4").tobytes(),
+            capture_output=True,
+            check=True,
+        )
+        out = np.frombuffer(proc.stdout, dtype="<f4").copy()
+        return out if out.size > 0 else arr
+    except Exception as exc:
+        log.warning("ffmpeg atempo speed stretch failed (speed=%.2f): %s", speed, exc)
+        return arr
+
+
+def _render_batch_to_pcm16(
+    wavs,
+    src_sr: int,
+    target_sr: int,
+    speed: float = 1.0,
+    trim_anchor: bool = True,
+    inter_seg_sec: float = 0.03,
+    oai=None,
+) -> bytes:
+    """Clean, trim anchor prefix, fade-in, time-stretch, resample, and stitch a batch into s16le PCM."""
+    import numpy as np
+
+    eff_src_sr = int(src_sr or 24000)
+    eff_target_sr = int(target_sr or 24000)
+    eff_speed = max(0.5, min(3.0, float(speed or 1.0)))
+
+    processed = []
+    for wav in wavs or ():
+        if wav is None:
+            continue
+        arr = np.asarray(wav, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            continue
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).clip(-1.0, 1.0)
+        if trim_anchor:
+            arr = _trim_anchor_float32(arr, eff_src_sr)
+            if arr.size == 0:
+                continue
+        arr = _apply_fade_in_float32(arr, eff_src_sr, 0.005)
+        processed.append(arr)
+
+    if not processed:
+        return b""
+
+    if abs(eff_speed - 1.0) >= 0.001:
+        gap_samples = max(0, int(round(eff_src_sr * inter_seg_sec * eff_speed)))
+        if len(processed) == 1 or gap_samples == 0:
+            joined = np.concatenate(processed) if len(processed) > 1 else processed[0]
+        else:
+            gap = np.zeros(gap_samples, dtype=np.float32)
+            parts = []
+            for idx, seg in enumerate(processed):
+                if idx > 0:
+                    parts.append(gap)
+                parts.append(seg)
+            joined = np.concatenate(parts)
+        stretched = _stretch_speed_float32(joined, eff_src_sr, eff_speed)
+        resampled = _resample_float32(stretched, eff_src_sr, eff_target_sr)
+        return _float32_to_pcm16_bytes(resampled, oai)
+
+    gap_bytes = b"\x00\x00" * max(0, int(round(eff_target_sr * inter_seg_sec)))
+    chunks = []
+    for idx, seg in enumerate(processed):
+        if idx > 0 and gap_bytes:
+            chunks.append(gap_bytes)
+        resampled = _resample_float32(seg, eff_src_sr, eff_target_sr)
+        chunks.append(_float32_to_pcm16_bytes(resampled, oai))
+    return b"".join(chunks)
 
 
 def _detect_opus_encoder() -> str:
@@ -694,6 +873,423 @@ class ColabEnginePool:
             self._slots = [s for s in self._slots if not s.is_extra]
 
 
+class DriveExportManager:
+    """Manage staged batch PCM chunks on local SSD and assemble final audio directly to Google Drive."""
+
+    _SUPPORTED_FORMATS = ("wav", "mp3", "m4a")
+    _STREAM_READ_BYTES = 1024 * 1024
+
+    def __init__(
+        self,
+        export_dir: Path,
+        display_dir: str = "",
+        default_format: str = "wav",
+        staging_root: Optional[Path] = None,
+    ) -> None:
+        self.export_dir = Path(export_dir)
+        self.export_dir.mkdir(parents=True, exist_ok=True)
+        self.display_dir = str(display_dir or self.export_dir)
+        fmt = str(default_format or "wav").strip().lower()
+        self.default_format = fmt if fmt in self._SUPPORTED_FORMATS else "wav"
+        self.staging_root = Path(
+            staging_root or os.environ.get("VIENEU_EXPORT_STAGING_DIR", "/content/stv_exports")
+        )
+        self.staging_root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._sessions: dict[str, dict] = {}
+
+    @staticmethod
+    def _sanitize_id(raw: str) -> str:
+        cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(raw or "").strip())[:64].strip("_")
+        return cleaned or f"exp_{uuid.uuid4().hex[:12]}"
+
+    @classmethod
+    def _normalize_format(cls, raw_fmt: Optional[str], fallback: str = "wav") -> str:
+        fmt = str(raw_fmt or fallback).strip().lower()
+        return fmt if fmt in cls._SUPPORTED_FORMATS else fallback
+
+    @staticmethod
+    def _sanitize_filename(filename: Optional[str], fallback_stem: str, ext: str) -> str:
+        raw_name = os.path.basename(str(filename or "").strip())
+        stem = os.path.splitext(raw_name)[0] if raw_name else fallback_stem
+        safe_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", stem).strip(" .")
+        if not safe_stem:
+            safe_stem = fallback_stem
+        return f"{safe_stem[:140]}.{ext}"
+
+    @staticmethod
+    def _dedup_target_path(directory: Path, filename: str) -> Path:
+        candidate = directory / filename
+        if not candidate.exists():
+            return candidate
+        stem, ext = os.path.splitext(filename)
+        idx = 2
+        while True:
+            alt = directory / f"{stem} ({idx}){ext}"
+            if not alt.exists():
+                return alt
+            idx += 1
+
+    def _evict_stale_sessions(self, ttl_sec: float = 7200.0) -> None:
+        now = time.monotonic()
+        stale_ids = [
+            sid
+            for sid, sess in self._sessions.items()
+            if (now - float(sess.get("updated_at", now))) > ttl_sec
+        ]
+        for sid in stale_ids:
+            sess = self._sessions.pop(sid, None)
+            if sess and sess.get("staging_dir"):
+                shutil.rmtree(sess["staging_dir"], ignore_errors=True)
+
+    @staticmethod
+    def _plan_stitch_layout(batches: dict, sr: int) -> Tuple[List[dict], bytes, bytes, int, int]:
+        inter_batch_samples = max(0, int(round(sr * 0.03)))
+        inter_chap_samples = max(0, int(round(sr * 0.8)))
+        inter_batch_silence = b"\x00\x00" * inter_batch_samples
+        inter_chap_silence = b"\x00\x00" * inter_chap_samples
+
+        ordered: List[dict] = []
+        total_pcm_bytes = 0
+        prev_chap: Optional[int] = None
+        chapters_seen = set()
+        for key in sorted(batches.keys()):
+            entry = batches[key]
+            chunk_bytes = int(entry.get("bytes", 0))
+            if chunk_bytes <= 0:
+                continue
+            chap_idx = int(key[0])
+            chapters_seen.add(chap_idx)
+            if prev_chap is not None:
+                gap = inter_batch_silence if chap_idx == prev_chap else inter_chap_silence
+                total_pcm_bytes += len(gap)
+            total_pcm_bytes += chunk_bytes
+            ordered.append({"chap": chap_idx, "path": entry["path"], "bytes": chunk_bytes})
+            prev_chap = chap_idx
+        return ordered, inter_batch_silence, inter_chap_silence, total_pcm_bytes, len(chapters_seen)
+
+    @classmethod
+    def _iter_stitched_pcm(
+        cls,
+        ordered: List[dict],
+        inter_batch_silence: bytes,
+        inter_chap_silence: bytes,
+    ):
+        prev_chap: Optional[int] = None
+        for entry in ordered:
+            chap_idx = entry["chap"]
+            if prev_chap is not None:
+                gap = inter_batch_silence if chap_idx == prev_chap else inter_chap_silence
+                if gap:
+                    yield gap
+            with open(entry["path"], "rb") as f:
+                while True:
+                    buf = f.read(cls._STREAM_READ_BYTES)
+                    if not buf:
+                        break
+                    yield buf
+            prev_chap = chap_idx
+
+    @classmethod
+    def _write_wav_from_stitched_pcm(
+        cls,
+        out_path: Path,
+        sample_rate: int,
+        total_pcm_bytes: int,
+        ordered: List[dict],
+        inter_batch_silence: bytes,
+        inter_chap_silence: bytes,
+    ) -> None:
+        header = struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            36 + total_pcm_bytes,
+            b"WAVE",
+            b"fmt ",
+            16,
+            1,
+            1,
+            sample_rate,
+            sample_rate * 2,
+            2,
+            16,
+            b"data",
+            total_pcm_bytes,
+        )
+        with open(out_path, "wb") as out_f:
+            out_f.write(header)
+            for chunk in cls._iter_stitched_pcm(ordered, inter_batch_silence, inter_chap_silence):
+                out_f.write(chunk)
+
+    @classmethod
+    def _encode_ffmpeg_from_stitched_pcm(
+        cls,
+        out_path: Path,
+        fmt: str,
+        sample_rate: int,
+        ordered: List[dict],
+        inter_batch_silence: bytes,
+        inter_chap_silence: bytes,
+        err_log_path: Path,
+    ) -> bool:
+        if not shutil.which("ffmpeg"):
+            return False
+        codec_args = (
+            ["-c:a", "libmp3lame", "-b:a", "128k"]
+            if fmt == "mp3"
+            else ["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
+        )
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            str(sample_rate),
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            *codec_args,
+            str(out_path),
+        ]
+        try:
+            with open(err_log_path, "wb") as err_f:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=err_f)
+                assert proc.stdin is not None
+                for chunk in cls._iter_stitched_pcm(ordered, inter_batch_silence, inter_chap_silence):
+                    proc.stdin.write(chunk)
+                proc.stdin.close()
+                rc = proc.wait()
+            return rc == 0 and out_path.is_file() and out_path.stat().st_size > 0
+        except Exception as exc:
+            log.warning("ffmpeg %s encode failed, falling back to wav: %s", fmt, exc)
+            return False
+
+    def start_session(
+        self,
+        session_id: str,
+        sample_rate: int = 24000,
+        speed: float = 1.0,
+        output_format: Optional[str] = None,
+        title_hint: str = "",
+    ) -> dict:
+        sid = self._sanitize_id(session_id)
+        sr = int(sample_rate) if int(sample_rate or 24000) in (8000, 16000, 24000, 48000) else 24000
+        eff_speed = max(0.5, min(3.0, float(speed or 1.0)))
+        fmt = self._normalize_format(output_format, self.default_format)
+        staging_dir = self.staging_root / sid
+
+        with self._lock:
+            self._evict_stale_sessions()
+            old = self._sessions.pop(sid, None)
+            if old and old.get("staging_dir"):
+                shutil.rmtree(old["staging_dir"], ignore_errors=True)
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            self._sessions[sid] = {
+                "session_id": sid,
+                "sample_rate": sr,
+                "speed": eff_speed,
+                "output_format": fmt,
+                "title_hint": str(title_hint or ""),
+                "staging_dir": staging_dir,
+                "batches": {},
+                "updated_at": time.monotonic(),
+            }
+
+        return {
+            "ok": True,
+            "session_id": sid,
+            "sample_rate": sr,
+            "output_format": fmt,
+            "drive_dir": self.display_dir,
+        }
+
+    def write_batch(
+        self,
+        session_id: str,
+        chapter_index: int,
+        batch_index: int,
+        pcm_bytes: bytes,
+        item_count: int = 0,
+    ) -> dict:
+        sid = self._sanitize_id(session_id)
+        chap_i = max(1, int(chapter_index))
+        batch_i = max(0, int(batch_index))
+
+        with self._lock:
+            sess = self._sessions.get(sid)
+            if sess is None:
+                raise KeyError(f"Unknown export session: {sid}")
+            staging_dir: Path = sess["staging_dir"]
+            sr = int(sess["sample_rate"])
+            chunk_path = staging_dir / f"c{chap_i:04d}_b{batch_i:04d}.pcm"
+            tmp_path = staging_dir / f"c{chap_i:04d}_b{batch_i:04d}.pcm.tmp"
+
+        with open(tmp_path, "wb") as f:
+            f.write(pcm_bytes)
+        os.replace(tmp_path, chunk_path)
+
+        batch_samples = len(pcm_bytes) // 2
+        with self._lock:
+            sess = self._sessions.get(sid)
+            if sess is None:
+                raise KeyError(f"Unknown export session: {sid}")
+            sess["batches"][(chap_i, batch_i)] = {
+                "path": chunk_path,
+                "bytes": len(pcm_bytes),
+                "samples": batch_samples,
+                "items": int(item_count),
+            }
+            sess["updated_at"] = time.monotonic()
+            _, _, _, total_pcm_bytes, chap_count = self._plan_stitch_layout(sess["batches"], sr)
+
+        total_samples = total_pcm_bytes // 2
+        return {
+            "session_id": sid,
+            "batch_audio_sec": round(batch_samples / float(sr), 3),
+            "total_audio_sec": round(total_samples / float(sr), 3),
+            "total_samples": total_samples,
+            "chapters_count": chap_count,
+        }
+
+    def finalize_session(
+        self,
+        session_id: str,
+        filename: Optional[str] = None,
+        chapters: Optional[int] = None,
+        output_format: Optional[str] = None,
+    ) -> dict:
+        sid = self._sanitize_id(session_id)
+        with self._lock:
+            sess = self._sessions.get(sid)
+            if sess is None:
+                raise KeyError(f"Unknown export session: {sid}")
+            sr = int(sess["sample_rate"])
+            staging_dir: Path = sess["staging_dir"]
+            batches_snapshot = dict(sess["batches"])
+            sess_fmt = sess["output_format"]
+            sess["updated_at"] = time.monotonic()
+
+        ordered, inter_batch_silence, inter_chap_silence, total_pcm_bytes, detected_chaps = (
+            self._plan_stitch_layout(batches_snapshot, sr)
+        )
+        if total_pcm_bytes <= 0 or not ordered:
+            self.abort_session(sid)
+            raise ValueError("No audio data recorded in export session")
+
+        total_sec = (total_pcm_bytes // 2) / float(sr)
+        chap_count = max(1, int(chapters)) if (chapters is not None and int(chapters) > 0) else max(1, detected_chaps)
+        requested_fmt = self._normalize_format(output_format, sess_fmt)
+        actual_fmt = requested_fmt
+        if actual_fmt in ("mp3", "m4a") and not shutil.which("ffmpeg"):
+            actual_fmt = "wav"
+
+        fallback_stem = f"stv-audio-{max(1, round(total_sec / 60.0))}p-{chap_count}ch"
+        self.export_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = self._sanitize_filename(filename, fallback_stem, actual_fmt)
+        target_path = self._dedup_target_path(self.export_dir, safe_name)
+        local_out = staging_dir / target_path.name
+
+        try:
+            encoded_ok = False
+            if actual_fmt in ("mp3", "m4a"):
+                encoded_ok = self._encode_ffmpeg_from_stitched_pcm(
+                    local_out,
+                    actual_fmt,
+                    sr,
+                    ordered,
+                    inter_batch_silence,
+                    inter_chap_silence,
+                    staging_dir / "ffmpeg.log",
+                )
+                if not encoded_ok:
+                    actual_fmt = "wav"
+                    safe_name = self._sanitize_filename(filename, fallback_stem, "wav")
+                    target_path = self._dedup_target_path(self.export_dir, safe_name)
+                    local_out = staging_dir / target_path.name
+
+            if actual_fmt == "wav":
+                self._write_wav_from_stitched_pcm(
+                    local_out,
+                    sr,
+                    total_pcm_bytes,
+                    ordered,
+                    inter_batch_silence,
+                    inter_chap_silence,
+                )
+
+            tmp_drive = target_path.parent / f".{target_path.name}.{sid}.tmp"
+            try:
+                shutil.copyfile(local_out, tmp_drive)
+                os.replace(tmp_drive, target_path)
+            finally:
+                if tmp_drive.exists():
+                    try:
+                        tmp_drive.unlink()
+                    except OSError:
+                        pass
+
+            byte_length = target_path.stat().st_size
+            drive_display_path = (
+                f"{self.display_dir.rstrip('/')}/{target_path.name}"
+                if self.display_dir
+                else str(target_path)
+            )
+            log.info(
+                "💾 DRIVE saved: path=%s size=%.2fMB audio=%.1fs chapters=%d format=%s",
+                drive_display_path,
+                byte_length / (1024.0 * 1024.0),
+                total_sec,
+                chap_count,
+                actual_fmt,
+            )
+            return {
+                "ok": True,
+                "session_id": sid,
+                "filename": target_path.name,
+                "drive_path": drive_display_path,
+                "format": actual_fmt,
+                "audio_sec": round(total_sec, 2),
+                "chapters": chap_count,
+                "byte_length": byte_length,
+            }
+        finally:
+            with self._lock:
+                self._sessions.pop(sid, None)
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def abort_session(self, session_id: str) -> dict:
+        sid = self._sanitize_id(session_id)
+        with self._lock:
+            sess = self._sessions.pop(sid, None)
+        staging_dir = sess.get("staging_dir") if sess else (self.staging_root / sid)
+        if staging_dir:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        return {"ok": True, "session_id": sid}
+
+
+def create_drive_export_manager_from_env() -> Optional[DriveExportManager]:
+    """Create a ``DriveExportManager`` when ``VIENEU_DRIVE_EXPORT_DIR`` is configured."""
+    raw_dir = str(os.environ.get("VIENEU_DRIVE_EXPORT_DIR", "") or "").strip()
+    if not raw_dir:
+        return None
+    try:
+        return DriveExportManager(
+            export_dir=Path(raw_dir),
+            display_dir=str(os.environ.get("VIENEU_DRIVE_EXPORT_DISPLAY", "") or raw_dir).strip(),
+            default_format=str(os.environ.get("VIENEU_DRIVE_EXPORT_FORMAT", "wav") or "wav").strip().lower(),
+        )
+    except Exception as exc:
+        log.warning("Drive export disabled (failed to initialize %s): %s", raw_dir, exc)
+        return None
+
+
 def _setup_cors_and_routes(
     oai,
     eng,
@@ -706,6 +1302,7 @@ def _setup_cors_and_routes(
     export_cap: int,
     batch_cap: int = 16,
     model_dtype: str = "auto",
+    drive_exporter: Optional[DriveExportManager] = None,
 ) -> None:
     from fastapi import Depends, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
@@ -732,7 +1329,7 @@ def _setup_cors_and_routes(
         )
 
     # Bind into module globals so FastAPI resolves annotations under `from __future__ import annotations`.
-    global ColabWorkerModeRequest, ColabBatchSpeechRequest
+    global ColabWorkerModeRequest, ColabBatchSpeechRequest, ColabDriveExportStartRequest, ColabDriveExportBatchRequest, ColabDriveExportFinalizeRequest, ColabDriveExportAbortRequest
 
     class ColabWorkerModeRequest(BaseModel):
         mode: str = "listen"
@@ -754,10 +1351,50 @@ def _setup_cors_and_routes(
         max_chars: int = Field(380, ge=64, le=512)
         batch_size: Optional[int] = Field(default=None, ge=1, le=64)
 
+    class ColabDriveExportStartRequest(BaseModel):
+        session_id: str = Field(min_length=1, max_length=128)
+        sample_rate: int = 24000
+        speed: float = Field(1.0, ge=0.5, le=3.0, allow_inf_nan=False)
+        output_format: Optional[str] = None
+        title_hint: Optional[str] = ""
+
+    class ColabDriveExportBatchRequest(BaseModel):
+        session_id: str = Field(min_length=1, max_length=128)
+        chapter_index: int = Field(1, ge=1, le=10000)
+        batch_index: int = Field(0, ge=0, le=10000)
+        inputs: List[str] = Field(min_length=1, max_length=64)
+        voice: Optional[str] = None
+        sample_rate: int = 24000
+        speed: float = Field(1.0, ge=0.5, le=3.0, allow_inf_nan=False)
+        trim_anchor: bool = True
+        temperature: float = Field(0.4, ge=0.0, le=2.0, allow_inf_nan=False)
+        top_k: int = Field(12, ge=1, le=1024)
+        top_p: float = Field(0.85, gt=0.0, le=1.0, allow_inf_nan=False)
+        repetition_penalty: float = Field(1.05, ge=1.0, le=2.0, allow_inf_nan=False)
+        max_chars: int = Field(380, ge=64, le=512)
+        batch_size: Optional[int] = Field(default=None, ge=1, le=64)
+
+    class ColabDriveExportFinalizeRequest(BaseModel):
+        session_id: str = Field(min_length=1, max_length=128)
+        filename: Optional[str] = None
+        chapters: Optional[int] = Field(default=None, ge=1, le=10000)
+        output_format: Optional[str] = None
+
+    class ColabDriveExportAbortRequest(BaseModel):
+        session_id: str = Field(min_length=1, max_length=128)
+
     oai.app.router.routes = [
         r
         for r in oai.app.router.routes
-        if getattr(r, "path", None) not in ("/health", "/v1/workers/mode", "/v1/audio/batch")
+        if getattr(r, "path", None) not in (
+            "/health",
+            "/v1/workers/mode",
+            "/v1/audio/batch",
+            "/v1/export/start",
+            "/v1/export/batch",
+            "/v1/export/finalize",
+            "/v1/export/abort",
+        )
     ]
 
     active_leases: dict[str, float] = {}
@@ -765,6 +1402,61 @@ def _setup_cors_and_routes(
     batch_lock = threading.Lock()
     batch_stats = {"total_batches": 0, "total_audio_sec": 0.0, "last_speedup": 0.0}
     opus_encoder = _detect_opus_encoder()
+
+    def _run_tts_batch_texts(req_obj) -> Tuple[List[int], dict[int, object], int, int, int]:
+        if req_obj.sample_rate not in (48000, 24000, 16000, 8000):
+            raise HTTPException(400, "sample_rate must be one of (48000, 24000, 16000, 8000)")
+        tts = getattr(eng, "tts", None)
+        if tts is None:
+            raise HTTPException(503, "speech engine not ready")
+        if req_obj.voice and hasattr(tts, "resolve_voice_name") and tts.resolve_voice_name(req_obj.voice) is None:
+            raise HTTPException(400, f"unknown voice '{req_obj.voice}'; see GET /v1/voices")
+
+        non_empty_indices: List[int] = []
+        non_empty_texts: List[str] = []
+        for idx, raw_text in enumerate(req_obj.inputs):
+            txt = str(raw_text or "").strip()
+            if txt:
+                non_empty_indices.append(idx)
+                non_empty_texts.append(txt)
+
+        effective_bs = max(1, min(batch_cap, int(req_obj.batch_size or batch_cap)))
+        src_sr = int(getattr(tts, "sample_rate", getattr(oai, "SAMPLE_RATE", 48000)) or 48000)
+        wavs_by_index: dict[int, object] = {}
+        total_src_samples = 0
+        if non_empty_texts:
+            with batch_lock:
+                if hasattr(tts, "infer_batch"):
+                    wavs = tts.infer_batch(
+                        non_empty_texts,
+                        voice=req_obj.voice or None,
+                        apply_watermark=getattr(eng, "watermark", False),
+                        temperature=req_obj.temperature,
+                        top_k=req_obj.top_k,
+                        top_p=req_obj.top_p,
+                        repetition_penalty=req_obj.repetition_penalty,
+                        max_chars=req_obj.max_chars,
+                        batch_size=effective_bs,
+                    )
+                else:
+                    wavs = [
+                        tts.infer(
+                            t,
+                            voice=req_obj.voice or None,
+                            apply_watermark=getattr(eng, "watermark", False),
+                            temperature=req_obj.temperature,
+                            top_k=req_obj.top_k,
+                            top_p=req_obj.top_p,
+                            repetition_penalty=req_obj.repetition_penalty,
+                            max_chars=req_obj.max_chars,
+                        )
+                        for t in non_empty_texts
+                    ]
+            for idx, w in zip(non_empty_indices, wavs):
+                wavs_by_index[idx] = w
+                if w is not None:
+                    total_src_samples += len(w)
+        return non_empty_indices, wavs_by_index, total_src_samples, effective_bs, src_sr
 
     @oai.app.get("/health")
     def health():
@@ -785,6 +1477,9 @@ def _setup_cors_and_routes(
             "batch_supported": True,
             "batch_max_size": batch_cap,
             "batch_codecs": (["opus", "pcm"] if opus_encoder != "none" else ["pcm"]),
+            "drive_export_supported": bool(drive_exporter is not None),
+            "drive_export_dir": (drive_exporter.display_dir if drive_exporter is not None else ""),
+            "drive_export_format": (drive_exporter.default_format if drive_exporter is not None else ""),
             "model_dtype": _detect_model_dtype_label(eng, model_dtype),
             "stats": {
                 "total_batches": batch_stats["total_batches"],
@@ -805,60 +1500,8 @@ def _setup_cors_and_routes(
 
     @oai.app.post("/v1/audio/batch", dependencies=[Depends(oai._auth)])
     def speech_batch(req: ColabBatchSpeechRequest):
-        if req.sample_rate not in (48000, 24000, 16000, 8000):
-            raise HTTPException(400, "sample_rate must be one of (48000, 24000, 16000, 8000)")
-        tts = getattr(eng, "tts", None)
-        if tts is None:
-            raise HTTPException(503, "speech engine not ready")
-        if req.voice and hasattr(tts, "resolve_voice_name") and tts.resolve_voice_name(req.voice) is None:
-            raise HTTPException(400, f"unknown voice '{req.voice}'; see GET /v1/voices")
-
-        non_empty_indices: List[int] = []
-        non_empty_texts: List[str] = []
-        for idx, raw_text in enumerate(req.inputs):
-            txt = str(raw_text or "").strip()
-            if txt:
-                non_empty_indices.append(idx)
-                non_empty_texts.append(txt)
-
         t0 = time.perf_counter()
-        effective_bs = max(1, min(batch_cap, int(req.batch_size or batch_cap)))
-        src_sr = int(getattr(tts, "sample_rate", getattr(oai, "SAMPLE_RATE", 48000)) or 48000)
-
-        wavs_by_index: dict[int, object] = {}
-        total_src_samples = 0
-        if non_empty_texts:
-            with batch_lock:
-                if hasattr(tts, "infer_batch"):
-                    wavs = tts.infer_batch(
-                        non_empty_texts,
-                        voice=req.voice or None,
-                        apply_watermark=getattr(eng, "watermark", False),
-                        temperature=req.temperature,
-                        top_k=req.top_k,
-                        top_p=req.top_p,
-                        repetition_penalty=req.repetition_penalty,
-                        max_chars=req.max_chars,
-                        batch_size=effective_bs,
-                    )
-                else:
-                    wavs = [
-                        tts.infer(
-                            t,
-                            voice=req.voice or None,
-                            apply_watermark=getattr(eng, "watermark", False),
-                            temperature=req.temperature,
-                            top_k=req.top_k,
-                            top_p=req.top_p,
-                            repetition_penalty=req.repetition_penalty,
-                            max_chars=req.max_chars,
-                        )
-                        for t in non_empty_texts
-                    ]
-            for idx, w in zip(non_empty_indices, wavs):
-                wavs_by_index[idx] = w
-                if w is not None:
-                    total_src_samples += len(w)
+        _, wavs_by_index, total_src_samples, effective_bs, src_sr = _run_tts_batch_texts(req)
 
         audio_sec = total_src_samples / float(src_sr or 48000)
         wall_sec = max(1e-3, time.perf_counter() - t0)
@@ -970,6 +1613,95 @@ def _setup_cors_and_routes(
                 "vram_gb": vram_gb,
             }
 
+    @oai.app.post("/v1/export/start", dependencies=[Depends(oai._auth)])
+    def drive_export_start(req: ColabDriveExportStartRequest):
+        if drive_exporter is None:
+            raise HTTPException(503, "Google Drive export is not enabled on this Colab runtime")
+        return drive_exporter.start_session(
+            req.session_id,
+            sample_rate=req.sample_rate,
+            speed=req.speed,
+            output_format=req.output_format,
+            title_hint=req.title_hint or "",
+        )
+
+    @oai.app.post("/v1/export/batch", dependencies=[Depends(oai._auth)])
+    def drive_export_batch(req: ColabDriveExportBatchRequest):
+        if drive_exporter is None:
+            raise HTTPException(503, "Google Drive export is not enabled on this Colab runtime")
+        t0 = time.perf_counter()
+        _, wavs_by_index, total_src_samples, effective_bs, src_sr = _run_tts_batch_texts(req)
+        ordered_wavs = [wavs_by_index.get(idx) for idx in range(len(req.inputs))]
+        pcm_bytes = _render_batch_to_pcm16(
+            ordered_wavs,
+            src_sr,
+            req.sample_rate,
+            speed=req.speed,
+            trim_anchor=req.trim_anchor,
+            oai=oai,
+        )
+        try:
+            write_res = drive_exporter.write_batch(
+                req.session_id,
+                req.chapter_index,
+                req.batch_index,
+                pcm_bytes,
+                item_count=len(req.inputs),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc))
+
+        raw_audio_sec = total_src_samples / float(src_sr or 48000)
+        wall_sec = max(1e-3, time.perf_counter() - t0)
+        speedup = raw_audio_sec / wall_sec
+        actual_dtype = _detect_model_dtype_label(eng, model_dtype)
+        batch_stats["total_batches"] += 1
+        batch_stats["total_audio_sec"] += write_res["batch_audio_sec"]
+        batch_stats["last_speedup"] = speedup
+        log.info(
+            "⚡ BATCH done: items=%d bs=%d audio=%.1fs wall=%.2fs speed=%.1fx dtype=%s (drive)",
+            len(req.inputs),
+            effective_bs,
+            write_res["batch_audio_sec"],
+            wall_sec,
+            speedup,
+            actual_dtype,
+        )
+        return {
+            "ok": True,
+            "session_id": write_res.get("session_id", req.session_id),
+            "chapter_index": req.chapter_index,
+            "batch_index": req.batch_index,
+            "items": len(req.inputs),
+            "audio_sec": write_res["batch_audio_sec"],
+            "total_audio_sec": write_res["total_audio_sec"],
+            "wall_sec": round(wall_sec, 2),
+            "speedup": round(speedup, 1),
+            "dtype": actual_dtype,
+        }
+
+    @oai.app.post("/v1/export/finalize", dependencies=[Depends(oai._auth)])
+    def drive_export_finalize(req: ColabDriveExportFinalizeRequest):
+        if drive_exporter is None:
+            raise HTTPException(503, "Google Drive export is not enabled on this Colab runtime")
+        try:
+            return drive_exporter.finalize_session(
+                req.session_id,
+                filename=req.filename,
+                chapters=req.chapters,
+                output_format=req.output_format,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @oai.app.post("/v1/export/abort", dependencies=[Depends(oai._auth)])
+    def drive_export_abort(req: ColabDriveExportAbortRequest):
+        if drive_exporter is None:
+            return {"ok": True, "session_id": req.session_id}
+        return drive_exporter.abort_session(req.session_id)
+
 
 def configure_colab_server() -> None:
     import apps.openai_speech as oai
@@ -979,6 +1711,7 @@ def configure_colab_server() -> None:
     gpu_tier, listen_streams, export_cap = resolve_tier_limits(requested_tier, vram_gb, gpu_name)
     batch_cap = resolve_batch_limit(gpu_tier)
     requested_dtype = _patch_cuda_dtype_for_colab()
+    drive_exporter = create_drive_export_manager_from_env()
 
     os.environ.setdefault("HOST", "127.0.0.1")
     os.environ.setdefault("PORT", "8000")
@@ -1037,10 +1770,11 @@ def configure_colab_server() -> None:
         export_cap=export_cap,
         batch_cap=batch_cap,
         model_dtype=actual_dtype,
+        drive_exporter=drive_exporter,
     )
 
     log.info(
-        "VieNeu Colab GPU Server ready: gpu=%s tier=%s vram=%.2fGB dtype=%s batch=%d listen=%d export_max=%d backend=%s",
+        "VieNeu Colab GPU Server ready: gpu=%s tier=%s vram=%.2fGB dtype=%s batch=%d listen=%d export_max=%d backend=%s drive_export=%s",
         gpu_name,
         gpu_tier,
         vram_gb,
@@ -1049,6 +1783,7 @@ def configure_colab_server() -> None:
         listen_streams,
         export_cap,
         getattr(eng, "backend", "unknown"),
+        (drive_exporter.display_dir if drive_exporter is not None else "disabled"),
     )
 
 
