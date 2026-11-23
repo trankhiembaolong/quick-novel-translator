@@ -1303,6 +1303,7 @@ def _setup_cors_and_routes(
     batch_cap: int = 16,
     model_dtype: str = "auto",
     drive_exporter: Optional[DriveExportManager] = None,
+    boot_sec: float = 0.0,
 ) -> None:
     from fastapi import Depends, HTTPException
     from fastapi.middleware.cors import CORSMiddleware
@@ -1480,6 +1481,7 @@ def _setup_cors_and_routes(
             "drive_export_supported": bool(drive_exporter is not None),
             "drive_export_dir": (drive_exporter.display_dir if drive_exporter is not None else ""),
             "drive_export_format": (drive_exporter.default_format if drive_exporter is not None else ""),
+            "boot_sec": round(float(boot_sec or 0.0), 2),
             "model_dtype": _detect_model_dtype_label(eng, model_dtype),
             "stats": {
                 "total_batches": batch_stats["total_batches"],
@@ -1706,6 +1708,7 @@ def _setup_cors_and_routes(
 def configure_colab_server() -> None:
     import apps.openai_speech as oai
 
+    t_boot_start = time.perf_counter()
     gpu_name, vram_gb = detect_cuda_gpu()
     requested_tier = os.environ.get("VIENEU_COLAB_GPU_TIER", "auto")
     gpu_tier, listen_streams, export_cap = resolve_tier_limits(requested_tier, vram_gb, gpu_name)
@@ -1720,7 +1723,17 @@ def configure_colab_server() -> None:
     os.environ.setdefault("VIENEU_QUEUE", str(max(64, export_cap * 8)))
     os.environ.setdefault("VIENEU_QUEUE_TIMEOUT", "180")
 
-    eng = oai.engine()
+    t_engine_start = time.perf_counter()
+    try:
+        eng = oai.engine()
+    except Exception as exc:
+        if os.environ.get("HF_HUB_OFFLINE") == "1":
+            log.warning("HF offline load failed (%s); falling back to online HuggingFace download", exc)
+            os.environ.pop("HF_HUB_OFFLINE", None)
+            eng = oai.engine()
+        else:
+            raise
+    engine_load_sec = round(time.perf_counter() - t_engine_start, 2)
     if hasattr(eng, "tts") and hasattr(eng.tts, "max_batch_size"):
         cur_bs = int(getattr(eng.tts, "max_batch_size", 32) or 32)
         eng.tts.max_batch_size = max(cur_bs, batch_cap)
@@ -1759,6 +1772,7 @@ def configure_colab_server() -> None:
     eng.queue_timeout = 180.0
     eng.max_queue = max(64, export_cap * 8)
 
+    boot_sec = round(time.perf_counter() - t_boot_start, 2)
     _setup_cors_and_routes(
         oai,
         eng,
@@ -1771,10 +1785,11 @@ def configure_colab_server() -> None:
         batch_cap=batch_cap,
         model_dtype=actual_dtype,
         drive_exporter=drive_exporter,
+        boot_sec=boot_sec,
     )
 
     log.info(
-        "VieNeu Colab GPU Server ready: gpu=%s tier=%s vram=%.2fGB dtype=%s batch=%d listen=%d export_max=%d backend=%s drive_export=%s",
+        "VieNeu Colab GPU Server ready: gpu=%s tier=%s vram=%.2fGB dtype=%s batch=%d listen=%d export_max=%d backend=%s drive_export=%s engine=%.1fs boot=%.1fs",
         gpu_name,
         gpu_tier,
         vram_gb,
@@ -1784,6 +1799,8 @@ def configure_colab_server() -> None:
         export_cap,
         getattr(eng, "backend", "unknown"),
         (drive_exporter.display_dir if drive_exporter is not None else "disabled"),
+        engine_load_sec,
+        boot_sec,
     )
 
 

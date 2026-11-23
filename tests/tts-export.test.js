@@ -395,6 +395,9 @@ async function runColabDownloadTest({
     ttsColabGpu = 'A100',
     downloadMinutes = 1,
     ttsExportTranslateConcurrency = 3,
+    ttsExportFetchPace = 'fast',
+    exportPaceOverride = null,
+    exportVerificationPollMs = 20,
     healthData = { status: 'ok', gpu_name: 'NVIDIA A100', export_max_streams: 12 },
     workerModeHandler = (msg) => ({ ok: true, data: { mode: msg.mode, max_streams: msg.workers || 6, active_workers: msg.workers || 6 } }),
     batchPortHandler = null,
@@ -452,6 +455,7 @@ async function runColabDownloadTest({
     };
     const windowListeners = new Map();
     const doc = {
+        title: 'STV Novel - Ch.1',
         head: { appendChild() {} },
         body: { appendChild() {} },
         documentElement: { appendChild() {} },
@@ -546,6 +550,7 @@ async function runColabDownloadTest({
                                 ttsColabVoice: 'Binh',
                                 ttsColabGpu,
                                 ttsExportTranslateConcurrency,
+                                ttsExportFetchPace,
                                 ttsIconMode: 'off'
                             }
                         });
@@ -656,7 +661,12 @@ async function runColabDownloadTest({
     if (typeof beforeDownload === 'function') {
         await beforeDownload({ sandbox, lineEls });
     }
-    const res = await sandbox.STV_TTSController.startDownload({ downloadMinutes });
+    const res = await sandbox.STV_TTSController.startDownload({
+        downloadMinutes,
+        exportFetchPace: ttsExportFetchPace,
+        exportPaceOverride,
+        exportVerificationPollMs
+    });
     return { res, sandbox, messages, portStarts, colabExportCalls, createdAnchorClicks, maxConcurrentStreams, lineEls };
 }
 
@@ -1711,17 +1721,18 @@ test('Google Drive Colab cache & direct export are wired across notebook, runner
 
     // Notebook Drive cache & config contracts
     for (const token of [
-        'USE_GOOGLE_DRIVE', 'DRIVE_FOLDER', 'EXPORT_FORMAT',
-        'hf_cache.tar', 'wheels_', 'vieneu_repo.tar', 'cloudflared',
-        'VIENEU_DRIVE_EXPORT_DIR', 'VIENEU_DRIVE_EXPORT_FORMAT'
+        'USE_GOOGLE_DRIVE', 'DRIVE_FOLDER', 'EXPORT_FORMAT', 'MODEL_SOURCE',
+        'site_', 'espeak_debs_', 'hf_cache.tar', 'HF_HUB_ENABLE_HF_TRANSFER',
+        'cloudflared', 'VIENEU_DRIVE_EXPORT_DIR', 'VIENEU_DRIVE_EXPORT_FORMAT'
     ]) {
         assert.ok(notebookSrc.includes(token), `VieNeu_Colab_GPU.ipynb missing ${token}`);
     }
+    assert.equal(notebookSrc.includes('import torch as _torch_probe'), false, 'Notebook must not import torch just to probe version');
 
     // Runner contracts
     for (const token of [
         'DriveExportManager', '_trim_anchor_float32', '_render_batch_to_pcm16',
-        'drive_export_supported', '/v1/export/start', '/v1/export/batch',
+        'drive_export_supported', 'boot_sec', '/v1/export/start', '/v1/export/batch',
         '/v1/export/finalize', '/v1/export/abort'
     ]) {
         assert.ok(runnerPy.includes(token), `vieneu_colab_runner.py missing ${token}`);
@@ -1734,6 +1745,505 @@ test('Google Drive Colab cache & direct export are wired across notebook, runner
     assert.ok(playerJs.includes('useColabDriveExport') && playerJs.includes('callColabDriveExport'));
 
     for (const key of ['tts_dl_scaling_colab_drive', 'tts_dl_saving_drive', 'tts_dl_done_drive']) {
+        assert.ok(typeof i18n.DICTIONARY.vi[key] === 'string' && i18n.DICTIONARY.vi[key].length > 0, `Missing vi key ${key}`);
+        assert.ok(typeof i18n.DICTIONARY.en[key] === 'string' && i18n.DICTIONARY.en[key].length > 0, `Missing en key ${key}`);
+    }
+});
+
+test('getExportFetchPaceProfile and computeNaturalProbeDelayMs model natural, gentle, fast, and post-CAPTCHA step-down', () => {
+    const helpers = loadTtsHelpers();
+
+    assert.equal(helpers.normalizeExportFetchPace(undefined), 'natural');
+    assert.equal(helpers.normalizeExportFetchPace('GENTLE'), 'gentle');
+    assert.equal(helpers.normalizeExportFetchPace('fast'), 'fast');
+    assert.equal(helpers.normalizeExportFetchPace('unknown'), 'natural');
+
+    const naturalProfile = helpers.getExportFetchPaceProfile('natural', false);
+    assert.equal(naturalProfile.pace, 'natural');
+    assert.equal(naturalProfile.lookaheadChapters, 2);
+    assert.equal(naturalProfile.waveMaxChapters, 1);
+    assert.equal(naturalProfile.maxTranslateConcurrency, 2);
+
+    const steppedDownProfile = helpers.getExportFetchPaceProfile('natural', true);
+    assert.equal(steppedDownProfile.pace, 'gentle');
+    assert.equal(steppedDownProfile.lookaheadChapters, 1);
+    assert.equal(steppedDownProfile.waveMaxChapters, 1);
+    assert.equal(steppedDownProfile.maxTranslateConcurrency, 1);
+
+    const fastProfile = helpers.getExportFetchPaceProfile('fast', false);
+    assert.equal(fastProfile.pace, 'fast');
+    assert.equal(fastProfile.waveMaxChapters, 6);
+    assert.equal(fastProfile.maxTranslateConcurrency, 6);
+
+    const initialWait = helpers.computeNaturalProbeDelayMs(naturalProfile, 0, 10000, () => 0.5);
+    assert.equal(initialWait, 2500);
+
+    const shortElapsedWait = helpers.computeNaturalProbeDelayMs(naturalProfile, 10000, 12000, () => 0);
+    assert.equal(shortElapsedWait, 3000);
+
+    const longElapsedJitter = helpers.computeNaturalProbeDelayMs(naturalProfile, 10000, 40000, () => 0.5);
+    assert.equal(longElapsedJitter, 1050);
+});
+
+test('natural sliding-window pacing caps lookahead at 2 chapters and avoids burst probing', async () => {
+    const ch1Text = 'Chương một mở đầu: Tiêu Viêm bước vào cổ điện tĩnh mịch. '.repeat(4).trim();
+    const rawHanzi = '萧炎站在大殿之外，凝视着远方的火焰山脉，心中却涌起一阵莫名的悸动。'.repeat(3);
+    const pad = 'Linh khí cuộn trào khắp kinh mạch khiến thiên địa biến sắc dữ dội suốt canh giờ dài.';
+    const chaptersByUrl = {
+        'https://example.com/ch2': { id: 'ch2', rawChunks: [rawHanzi], translatedText: `Chương 2: ${pad}`, nextUrl: 'https://example.com/ch3' },
+        'https://example.com/ch3': { id: 'ch3', rawChunks: [rawHanzi], translatedText: `Chương 3: ${pad}`, nextUrl: 'https://example.com/ch4' },
+        'https://example.com/ch4': { id: 'ch4', rawChunks: [rawHanzi], translatedText: `Chương 4: ${pad}`, nextUrl: 'https://example.com/ch5' },
+        'https://example.com/ch5': { id: 'ch5', rawChunks: [rawHanzi], translatedText: `Chương 5: ${pad}`, nextUrl: null }
+    };
+
+    const harness = createMultiChapterPreloadHarness({ chaptersByUrl, preloadDelayMs: 15 });
+    const pcm16s = Buffer.from(new Int16Array(24000 * 16).buffer).toString('base64');
+    const pcm38s = Buffer.from(new Int16Array(24000 * 38).buffer).toString('base64');
+    let ch1SynthFinished = false;
+    const probesBeforeCh1Done = [];
+
+    const { res, portStarts } = await runColabDownloadTest({
+        lines: [ch1Text],
+        downloadMinutes: 2,
+        ttsExportTranslateConcurrency: 4,
+        ttsExportFetchPace: 'natural',
+        exportPaceOverride: {
+            initialDelayMinMs: 5,
+            initialDelayMaxMs: 5,
+            minGapMs: 8,
+            maxGapMs: 8,
+            settleJitterMinMs: 2,
+            settleJitterMaxMs: 2
+        },
+        ttsColabGpu: 'T4',
+        healthData: { status: 'ok', gpu_name: 'Tesla T4', batch_supported: true, batch_max_size: 16, model_dtype: 'float16' },
+        onSendMessage({ msg, cb, sandbox, setTranslatedLines }) {
+            if (msg.action === 'probe_chapter_raw' && !ch1SynthFinished) {
+                probesBeforeCh1Done.push(msg.url);
+            }
+            return harness.onSendMessage({ msg, cb, sandbox, setTranslatedLines });
+        },
+        onConnectPort: harness.onConnectPort,
+        extraSandbox: {
+            STV_findNextChapterUrl: (_doc, url) => (url === 'https://example.com/ch1' ? 'https://example.com/ch2' : null)
+        },
+        batchPortHandler({ msg, listeners }) {
+            const isCh1 = String(msg.inputs[0] || '').includes('Chương một mở đầu');
+            const delayMs = isCh1 ? 120 : 15;
+            const audioB64 = isCh1 ? pcm16s : pcm38s;
+            const audioSec = isCh1 ? 16 : 38;
+            const t = setTimeout(() => {
+                if (isCh1) ch1SynthFinished = true;
+                msg.inputs.forEach((_, idx) => {
+                    listeners.msg.forEach((fn) => fn({ type: 'item', index: idx, audio: audioB64, sampleRate: 24000 }));
+                });
+                listeners.msg.forEach((fn) => fn({ type: 'done', stats: { audioSec, wallSec: 0.1, speedup: 200, dtype: 'float16' } }));
+            }, delayMs);
+            if (typeof t.unref === 'function') t.unref();
+        }
+    });
+
+    assert.equal(res.ok, true, `Expected natural pacing export ok, got: ${JSON.stringify(res)}`);
+    assert.equal(res.chapters, 4);
+    assert.ok(probesBeforeCh1Done.length <= 2, `Lookahead during Ch1 must stay <= 2, got probes: ${probesBeforeCh1Done.join(',')}`);
+    assert.ok(harness.getMaxConcurrentTranslations() <= 2, `Natural pace must cap parallel translations <= 2, got ${harness.getMaxConcurrentTranslations()}`);
+    const synthOrder = portStarts.filter((p) => p.portName === 'stv-tts-batch').map((p) => p.inputs[0]);
+    assert.equal(synthOrder.length, 4);
+    assert.ok(synthOrder[0].includes('Chương một mở đầu'));
+    assert.ok(synthOrder[1].includes('Chương 2:'));
+    assert.ok(synthOrder[2].includes('Chương 3:'));
+    assert.ok(synthOrder[3].includes('Chương 4:'));
+});
+
+test('CAPTCHA pause-and-resume opens visible verification tab, preserves audio, auto-resumes on verified check, and steps down pacing', async () => {
+    const ch1Text = 'Chương một mở đầu: Tiêu Viêm bước vào cổ điện tĩnh mịch. '.repeat(4).trim();
+    const rawHanzi = '萧炎站在大殿之外，凝视着远方的火焰山脉，心中却涌起一阵莫名的悸动。'.repeat(3);
+    const pad = 'Linh khí cuộn trào khắp kinh mạch khiến thiên địa biến sắc dữ dội suốt canh giờ dài.';
+    const chaptersByUrl = {
+        'https://example.com/ch2': { id: 'ch2', rawChunks: [rawHanzi], translatedText: `Chương 2 sau xác minh: ${pad}`, nextUrl: 'https://example.com/ch3' },
+        'https://example.com/ch3': { id: 'ch3', rawChunks: [rawHanzi], translatedText: `Chương 3 nối tiếp: ${pad}`, nextUrl: 'https://example.com/ch4' },
+        'https://example.com/ch4': { id: 'ch4', rawChunks: [rawHanzi], translatedText: `Chương 4 hoàn tất: ${pad}`, nextUrl: null }
+    };
+
+    const harness = createMultiChapterPreloadHarness({ chaptersByUrl, preloadDelayMs: 15 });
+    const pcm16s = Buffer.from(new Int16Array(24000 * 16).buffer).toString('base64');
+    const pcm40s = Buffer.from(new Int16Array(24000 * 40).buffer).toString('base64');
+
+    let ch2ProbeCount = 0;
+    let checkCalls = 0;
+    let sawWaitingStatus = false;
+    let sawTitleAlert = false;
+    const openedVerifyUrls = [];
+
+    const { res, sandbox, portStarts, createdAnchorClicks } = await runColabDownloadTest({
+        lines: [ch1Text],
+        downloadMinutes: 2,
+        ttsExportTranslateConcurrency: 3,
+        ttsExportFetchPace: 'fast',
+        exportPaceOverride: {
+            initialDelayMinMs: 2,
+            initialDelayMaxMs: 2,
+            minGapMs: 5,
+            maxGapMs: 5,
+            settleJitterMinMs: 2,
+            settleJitterMaxMs: 2
+        },
+        exportVerificationPollMs: 15,
+        ttsColabGpu: 'T4',
+        healthData: { status: 'ok', gpu_name: 'Tesla T4', batch_supported: true, batch_max_size: 16, model_dtype: 'float16' },
+        onSendMessage({ msg, cb, sandbox: sb, setTranslatedLines }) {
+            if (msg.action === 'probe_chapter_raw' && msg.url === 'https://example.com/ch2') {
+                ch2ProbeCount += 1;
+                if (ch2ProbeCount === 1) {
+                    cb({
+                        ok: false,
+                        captchaRequired: true,
+                        captchaReason: 'turnstile_iframe',
+                        targetUrl: msg.url,
+                        error: 'Trang web yêu cầu xác minh Captcha (Cloudflare).'
+                    });
+                    return true;
+                }
+            }
+            if (msg.action === 'open_captcha_verification_tab') {
+                openedVerifyUrls.push(msg.url);
+                cb({ ok: true, verifyTabId: 77, targetUrl: msg.url });
+                return true;
+            }
+            if (msg.action === 'check_captcha_verification_tab') {
+                checkCalls += 1;
+                if (sb.STV_TTSController.getState().exportWaitingVerification) {
+                    sawWaitingStatus = true;
+                }
+                if (String(sb.document.title || '').includes('Xác minh')) {
+                    sawTitleAlert = true;
+                }
+                if (checkCalls === 1) {
+                    cb({ ok: true, status: 'waiting', captchaVisible: true });
+                    return true;
+                }
+                cb({
+                    ok: true,
+                    status: 'verified',
+                    origChunks: [rawHanzi],
+                    nextUrl: 'https://example.com/ch3'
+                });
+                return true;
+            }
+            return harness.onSendMessage({ msg, cb, sandbox: sb, setTranslatedLines });
+        },
+        onConnectPort: harness.onConnectPort,
+        extraSandbox: {
+            STV_findNextChapterUrl: (_doc, url) => (url === 'https://example.com/ch1' ? 'https://example.com/ch2' : null)
+        },
+        batchPortHandler({ msg, listeners }) {
+            const isCh1 = String(msg.inputs[0] || '').includes('Chương một mở đầu');
+            const delayMs = isCh1 ? 20 : 15;
+            const audioB64 = isCh1 ? pcm16s : pcm40s;
+            const audioSec = isCh1 ? 16 : 40;
+            const t = setTimeout(() => {
+                msg.inputs.forEach((_, idx) => {
+                    listeners.msg.forEach((fn) => fn({ type: 'item', index: idx, audio: audioB64, sampleRate: 24000 }));
+                });
+                listeners.msg.forEach((fn) => fn({ type: 'done', stats: { audioSec, wallSec: 0.1, speedup: 250, dtype: 'float16' } }));
+            }, delayMs);
+            if (typeof t.unref === 'function') t.unref();
+        }
+    });
+
+    assert.equal(res.ok, true, `Expected resumed export ok, got: ${JSON.stringify(res)}`);
+    assert.equal(res.chapters, 4);
+    assert.equal(createdAnchorClicks.length, 1, 'Must export 1 continuous WAV file after resuming');
+    assert.deepStrictEqual(openedVerifyUrls, ['https://example.com/ch2']);
+    assert.equal(ch2ProbeCount, 1, 'Must not re-probe Ch2 after auto-verified tab supplied origChunks');
+    assert.equal(sawWaitingStatus, true, 'Controller state must expose exportWaitingVerification while paused');
+    assert.equal(sawTitleAlert, true, 'Document title must alert user while paused on verification');
+    assert.equal(sandbox.document.title, 'STV Novel - Ch.1', 'Document title must restore after completion');
+    assert.equal(sandbox.STV_TTSController.getState().exportWaitingVerification, false);
+    assert.equal(harness.getMaxConcurrentTranslations(), 1, 'Post-CAPTCHA step-down must drop parallel translation concurrency to 1');
+
+    const synthOrder = portStarts.filter((p) => p.portName === 'stv-tts-batch').map((p) => p.inputs[0]);
+    assert.equal(synthOrder.length, 4);
+    assert.ok(synthOrder[1].includes('Chương 2 sau xác minh'));
+    assert.ok(synthOrder[2].includes('Chương 3 nối tiếp'));
+    assert.ok(synthOrder[3].includes('Chương 4 hoàn tất'));
+});
+
+test('CAPTCHA pause supports manual resumeAfterVerification and Save Partial without losing audio', async () => {
+    const ch1Text = 'Chương một mở đầu: Tiêu Viêm bước vào cổ điện tĩnh mịch. '.repeat(4).trim();
+    const rawHanzi = '萧炎站在大殿之外，凝视着远方的火焰山脉，心中却涌起一阵莫名的悸动。'.repeat(3);
+    const pad = 'Linh khí cuộn trào khắp kinh mạch khiến thiên địa biến sắc dữ dội suốt canh giờ dài.';
+
+    // Part A: Manual Resume
+    {
+        const chaptersByUrl = {
+            'https://example.com/ch2': { id: 'ch2', rawChunks: [rawHanzi], translatedText: `Ch2 thủ công: ${pad}`, nextUrl: null }
+        };
+        const harness = createMultiChapterPreloadHarness({ chaptersByUrl, preloadDelayMs: 10 });
+        const pcm40s = Buffer.from(new Int16Array(24000 * 40).buffer).toString('base64');
+        let ch2ProbeAttempts = 0;
+
+        const { res, createdAnchorClicks } = await runColabDownloadTest({
+            lines: [ch1Text],
+            downloadMinutes: 1,
+            ttsExportFetchPace: 'natural',
+            exportPaceOverride: { initialDelayMinMs: 2, initialDelayMaxMs: 2, minGapMs: 2, maxGapMs: 2, settleJitterMinMs: 1, settleJitterMaxMs: 1 },
+            exportVerificationPollMs: 500,
+            ttsColabGpu: 'T4',
+            healthData: { status: 'ok', gpu_name: 'Tesla T4', batch_supported: true, batch_max_size: 16, model_dtype: 'float16' },
+            onSendMessage({ msg, cb, sandbox: sb, setTranslatedLines }) {
+                if (msg.action === 'probe_chapter_raw' && msg.url === 'https://example.com/ch2') {
+                    ch2ProbeAttempts += 1;
+                    if (ch2ProbeAttempts === 1) {
+                        cb({ ok: false, captchaRequired: true, targetUrl: msg.url, error: 'Captcha required' });
+                        return true;
+                    }
+                }
+                if (msg.action === 'open_captcha_verification_tab') {
+                    cb({ ok: true, verifyTabId: 88, targetUrl: msg.url });
+                    const t = setTimeout(() => { void sb.STV_TTSController.resumeAfterVerification(); }, 25);
+                    if (typeof t.unref === 'function') t.unref();
+                    return true;
+                }
+                if (msg.action === 'check_captcha_verification_tab') {
+                    cb({ ok: true, status: 'waiting', captchaVisible: true });
+                    return true;
+                }
+                return harness.onSendMessage({ msg, cb, sandbox: sb, setTranslatedLines });
+            },
+            onConnectPort: harness.onConnectPort,
+            extraSandbox: {
+                STV_findNextChapterUrl: (_doc, url) => (url === 'https://example.com/ch1' ? 'https://example.com/ch2' : null)
+            },
+            batchPortHandler({ msg, listeners }) {
+                queueMicrotask(() => {
+                    msg.inputs.forEach((_, idx) => {
+                        listeners.msg.forEach((fn) => fn({ type: 'item', index: idx, audio: pcm40s, sampleRate: 24000 }));
+                    });
+                    listeners.msg.forEach((fn) => fn({ type: 'done', stats: { audioSec: 40, wallSec: 0.1, speedup: 400, dtype: 'float16' } }));
+                });
+            }
+        });
+
+        assert.equal(res.ok, true, `Expected manual resume export ok, got: ${JSON.stringify(res)}`);
+        assert.equal(res.chapters, 2);
+        assert.equal(ch2ProbeAttempts, 2, 'Manual resume must re-probe Ch2');
+        assert.equal(createdAnchorClicks.length, 1);
+    }
+
+    // Part B: Save Partial while paused on verification
+    {
+        const chaptersByUrl = {
+            'https://example.com/ch2': { id: 'ch2', rawChunks: [rawHanzi], translatedText: `Ch2: ${pad}`, nextUrl: null }
+        };
+        const harness = createMultiChapterPreloadHarness({ chaptersByUrl, preloadDelayMs: 10 });
+        const pcm30s = Buffer.from(new Int16Array(24000 * 30).buffer).toString('base64');
+        let closeVerifyCalled = false;
+
+        const { res, sandbox, createdAnchorClicks } = await runColabDownloadTest({
+            lines: [ch1Text],
+            downloadMinutes: 5,
+            ttsExportFetchPace: 'natural',
+            exportPaceOverride: { initialDelayMinMs: 2, initialDelayMaxMs: 2, minGapMs: 2, maxGapMs: 2, settleJitterMinMs: 1, settleJitterMaxMs: 1 },
+            exportVerificationPollMs: 500,
+            ttsColabGpu: 'T4',
+            healthData: { status: 'ok', gpu_name: 'Tesla T4', batch_supported: true, batch_max_size: 16, model_dtype: 'float16' },
+            onSendMessage({ msg, cb, sandbox: sb, setTranslatedLines }) {
+                if (msg.action === 'probe_chapter_raw' && msg.url === 'https://example.com/ch2') {
+                    cb({ ok: false, captchaRequired: true, targetUrl: msg.url, error: 'Captcha required' });
+                    return true;
+                }
+                if (msg.action === 'open_captcha_verification_tab') {
+                    cb({ ok: true, verifyTabId: 99, targetUrl: msg.url });
+                    const t = setTimeout(() => { sb.STV_TTSController.savePartialDownload(); }, 35);
+                    if (typeof t.unref === 'function') t.unref();
+                    return true;
+                }
+                if (msg.action === 'check_captcha_verification_tab') {
+                    cb({ ok: true, status: 'waiting', captchaVisible: true });
+                    return true;
+                }
+                if (msg.action === 'close_captcha_verification_tab' && msg.closeTab === true) {
+                    closeVerifyCalled = true;
+                }
+                return harness.onSendMessage({ msg, cb, sandbox: sb, setTranslatedLines });
+            },
+            onConnectPort: harness.onConnectPort,
+            extraSandbox: {
+                STV_findNextChapterUrl: (_doc, url) => (url === 'https://example.com/ch1' ? 'https://example.com/ch2' : null)
+            },
+            batchPortHandler({ msg, listeners }) {
+                queueMicrotask(() => {
+                    msg.inputs.forEach((_, idx) => {
+                        listeners.msg.forEach((fn) => fn({ type: 'item', index: idx, audio: pcm30s, sampleRate: 24000 }));
+                    });
+                    listeners.msg.forEach((fn) => fn({ type: 'done', stats: { audioSec: 30, wallSec: 0.1, speedup: 300, dtype: 'float16' } }));
+                });
+            }
+        });
+
+        assert.equal(res.ok, true, `Expected Save Partial during CAPTCHA pause to succeed, got: ${JSON.stringify(res)}`);
+        assert.equal(res.chapters, 1);
+        assert.equal(createdAnchorClicks.length, 1, 'Save Partial must download accumulated audio');
+        assert.equal(closeVerifyCalled, true, 'Save Partial must close verification tab tracking');
+        assert.equal(sandbox.document.title, 'STV Novel - Ch.1', 'Document title must restore after Save Partial');
+    }
+});
+
+test('background.js deduplicates AJAX-only host fetches and flags Cloudflare HTTP 403 challenges as captchaRequired', async () => {
+    const bgCode = fs.readFileSync(path.resolve(__dirname, '..', 'background.js'), 'utf8');
+    const validatorCode = fs.readFileSync(path.resolve(__dirname, '..', 'url-validator.js'), 'utf8');
+    const noop = () => {};
+    const fetchCalls = [];
+    const iframeCalls = [];
+
+    const sandbox = {
+        globalThis: {},
+        importScripts: noop,
+        btoa: (str) => Buffer.from(str, 'binary').toString('base64'),
+        atob: (b64) => Buffer.from(b64, 'base64').toString('binary'),
+        Uint8Array,
+        ArrayBuffer,
+        DataView,
+        Buffer,
+        Map,
+        Set,
+        Promise,
+        Error,
+        Object,
+        Array,
+        Number,
+        String,
+        Math,
+        URL,
+        URLSearchParams,
+        TextDecoder,
+        TextEncoder,
+        AbortController,
+        setTimeout,
+        clearTimeout,
+        setInterval,
+        clearInterval,
+        console,
+        async fetch(url) {
+            fetchCalls.push(url);
+            if (url.includes('cf.test')) {
+                return {
+                    ok: false,
+                    status: 403,
+                    url,
+                    headers: { get: (k) => (String(k).toLowerCase() === 'cf-mitigated' ? 'challenge' : '') },
+                    text: async () => '<title>Just a moment...</title>'
+                };
+            }
+            const html = '<div id="content-container">Đang tải nội dung chương...</div>';
+            return {
+                ok: true,
+                status: 200,
+                url,
+                headers: { get: () => 'text/html; charset=utf-8' },
+                arrayBuffer: async () => Buffer.from(html, 'utf8')
+            };
+        },
+        chrome: {
+            runtime: { lastError: null, onMessage: { addListener: noop }, onConnect: { addListener: noop } },
+            tabs: { onUpdated: { addListener: noop }, onRemoved: { addListener: noop } },
+            commands: { onCommand: { addListener: noop } },
+            storage: {
+                local: {
+                    async get(keys, cb) {
+                        const res = {};
+                        if (typeof cb === 'function') cb(res);
+                        return res;
+                    },
+                    set: noop,
+                    remove: noop,
+                    setAccessLevel: noop
+                }
+            },
+            scripting: {
+                async executeScript({ args }) {
+                    // Distinguish extractChunksFromPreloadedHtml (3 args: html, url, sel) vs extractChunksViaHiddenIframe (3 args: url, sel, timeout)
+                    if (args && typeof args[0] === 'string' && args[0].includes('Đang tải nội dung chương')) {
+                        return [{ result: { ok: false, chunks: null, nextUrl: null, pendingNextUrl: false, reason: 'not_ready' } }];
+                    }
+                    iframeCalls.push(args[0]);
+                    return [{
+                        result: {
+                            ok: true,
+                            chunks: [`Nội dung ${args[0]}`],
+                            nextUrl: args[0].includes('/ch2') ? 'https://novel.test/ch3' : null,
+                            pendingNextUrl: false
+                        }
+                    }];
+                }
+            }
+        }
+    };
+    sandbox.globalThis = sandbox;
+    vm.runInNewContext(validatorCode, sandbox);
+    vm.runInNewContext(bgCode, sandbox);
+
+    const broker = sandbox.STV_TranslationBroker;
+    assert.equal(typeof broker.fetchAndExtractChapterRaw, 'function');
+
+    // First AJAX chapter: static fetch fails to find prose -> falls back to iframe and marks novel.test as AJAX host
+    const ch2 = await broker.fetchAndExtractChapterRaw(1, 'https://novel.test/ch2', undefined, 'https://novel.test/ch1');
+    assert.deepStrictEqual(ch2.origChunks, ['Nội dung https://novel.test/ch2']);
+    assert.equal(fetchCalls.length, 1);
+    assert.equal(iframeCalls.length, 1);
+    assert.equal(broker.isAjaxOnlyHost('novel.test'), true);
+
+    // Second chapter on same AJAX host: MUST skip fetch() and go straight to hidden iframe
+    const ch3 = await broker.fetchAndExtractChapterRaw(1, 'https://novel.test/ch3', undefined, 'https://novel.test/ch2');
+    assert.deepStrictEqual(ch3.origChunks, ['Nội dung https://novel.test/ch3']);
+    assert.equal(fetchCalls.length, 1, 'Must skip redundant fetch() on known AJAX-only host');
+    assert.equal(iframeCalls.length, 2);
+
+    // Cloudflare 403 challenge response must surface captchaRequired = true
+    let cfErr = null;
+    try {
+        await broker.fetchAndExtractChapterRaw(1, 'https://cf.test/ch2', undefined, 'https://cf.test/ch1');
+    } catch (err) {
+        cfErr = err;
+    }
+    assert.ok(cfErr && cfErr.captchaRequired === true, `Expected captchaRequired=true for Cloudflare 403, got: ${cfErr}`);
+});
+
+test('natural fetch pace and CAPTCHA pause-resume verification are wired across popup, i18n, extractor, background, and player', () => {
+    const root = path.resolve(__dirname, '..');
+    const html = fs.readFileSync(path.join(root, 'popup.html'), 'utf8');
+    const popupJs = fs.readFileSync(path.join(root, 'popup.js'), 'utf8');
+    const extractorJs = fs.readFileSync(path.join(root, 'extractor.js'), 'utf8');
+    const backgroundJs = fs.readFileSync(path.join(root, 'background.js'), 'utf8');
+    const playerJs = fs.readFileSync(path.join(root, 'tts-player.js'), 'utf8');
+    const i18n = require(path.join(root, 'i18n.js'));
+
+    assert.ok(html.includes('id="tts-export-fetch-pace"'));
+    for (const val of ['value="natural"', 'value="gentle"', 'value="fast"']) {
+        assert.ok(html.includes(val), `popup.html missing fetch pace option ${val}`);
+    }
+    assert.ok(popupJs.includes('ttsExportFetchPace') && popupJs.includes('normalizeExportFetchPace'));
+    assert.ok(extractorJs.includes('STV_detectCaptchaInDocument') && extractorJs.includes('STV_extractFromDocument'));
+    assert.ok(backgroundJs.includes('open_captcha_verification_tab'));
+    assert.ok(backgroundJs.includes('check_captcha_verification_tab'));
+    assert.ok(backgroundJs.includes('close_captcha_verification_tab'));
+    assert.ok(backgroundJs.includes('ajaxOnlyHosts') && backgroundJs.includes('ttsExportFetchPace'));
+    assert.ok(playerJs.includes('waitForCaptchaVerification') && playerJs.includes('computeNaturalProbeDelayMs'));
+    assert.ok(playerJs.includes('dl-verify-box') && playerJs.includes('dl-resume-verify'));
+
+    for (const key of [
+        'tts_export_fetch_pace_label',
+        'optExportFetchPaceNatural',
+        'optExportFetchPaceGentle',
+        'optExportFetchPaceFast',
+        'tts_dl_verify_needed',
+        'tts_dl_verify_hint',
+        'tts_dl_verify_tab_closed',
+        'tts_dl_verify_open',
+        'tts_dl_verify_resume',
+        'tts_dl_verify_resumed'
+    ]) {
         assert.ok(typeof i18n.DICTIONARY.vi[key] === 'string' && i18n.DICTIONARY.vi[key].length > 0, `Missing vi key ${key}`);
         assert.ok(typeof i18n.DICTIONARY.en[key] === 'string' && i18n.DICTIONARY.en[key].length > 0, `Missing en key ${key}`);
     }

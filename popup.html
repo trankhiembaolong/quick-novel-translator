@@ -155,6 +155,14 @@
                     </select>
                 </div>
                 <div class="field">
+                    <label class="field-label" for="tts-export-fetch-pace" data-i18n="tts_export_fetch_pace_label">Nhịp quét chương (chống Captcha)</label>
+                    <select id="tts-export-fetch-pace" name="ttsExportFetchPace">
+                        <option value="natural" selected data-i18n="optExportFetchPaceNatural">Tự nhiên như người đọc (Khuyên dùng)</option>
+                        <option value="gentle" data-i18n="optExportFetchPaceGentle">Rất chậm · An toàn tối đa (1 chương/lần)</option>
+                        <option value="fast" data-i18n="optExportFetchPaceFast">Nhanh (Tải trước nhiều chương · Dễ dính Captcha)</option>
+                    </select>
+                </div>
+                <div class="field">
                     <label class="field-label" for="tts-download-minutes" data-i18n="tts_download_minutes_label">Thời lượng tối thiểu (phút)</label>
                     <div class="input-with-btn">
                         <input type="number" id="tts-download-minutes" name="ttsDownloadMinutes" min="5" max="240" step="5" value="30" inputmode="numeric" aria-describedby="tts-download-hint" style="flex: 0 0 90px;">

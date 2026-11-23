@@ -152,4 +152,54 @@ describe('Feature 2: Safe Extraction & DOM XSS Remediation', () => {
         assert.strictEqual(lastRes.nextUrl, null);
         assert.strictEqual(lastRes.pendingNextUrl, false);
     });
+
+    it('T1.12c: STV_detectCaptchaInDocument detects Cloudflare/Turnstile/STV modals while ignoring hidden templates and loaded chapters', () => {
+        const interstitialDoc = new DOMParser().parseFromString(`
+            <html><head><title>Just a moment...</title></head>
+            <body><form id="challenge-form" action="/?__cf_chl_f_tk=abc"></form></body></html>
+        `, 'text/html');
+        assert.deepStrictEqual(
+            { ...window.STV_detectCaptchaInDocument(interstitialDoc, { isStaticHtml: true }) },
+            { detected: true, kind: 'cloudflare_interstitial' }
+        );
+
+        const turnstileDoc = new DOMParser().parseFromString(`
+            <div class="box"><iframe src="https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile"></iframe></div>
+        `, 'text/html');
+        assert.deepStrictEqual(
+            { ...window.STV_detectCaptchaInDocument(turnstileDoc, { isStaticHtml: false }) },
+            { detected: true, kind: 'turnstile_iframe' }
+        );
+
+        const visibleModalDoc = new DOMParser().parseFromString(`
+            <div id="content-container">Đang tải nội dung chương...</div>
+            <div class="modal show" id="captchaModal" style="display: block">
+                <div>Captcha STV Verify you are human</div>
+            </div>
+        `, 'text/html');
+        assert.deepStrictEqual(
+            { ...window.STV_detectCaptchaInDocument(visibleModalDoc, { isStaticHtml: false }) },
+            { detected: true, kind: 'captcha_modal' }
+        );
+
+        const dormantAjaxHtml = `
+            <div id="content-container">Đang tải nội dung chương...</div>
+            <div class="modal fade" id="captchaModal">
+                <div>Captcha STV Verify you are human</div>
+            </div>
+        `;
+        const dormantRes = window.STV_extractFromHtml(dormantAjaxHtml, 'https://truyen.test/truyen/demo/1/105/');
+        assert.strictEqual(dormantRes.ok, false);
+        assert.strictEqual(dormantRes.captchaRequired, false);
+
+        const loadedChapterHtml = `
+            <div id="chapter-content">
+                <p>Nội dung chương tiểu thuyết đã được tải đầy đủ dài hơn 150 ký tự để chứng minh trình trích xuất luôn ưu tiên nội dung thực tế trước mọi dấu hiệu modal phụ trên trang web.</p>
+            </div>
+            <div class="modal show" id="captchaModal">Verify you are human</div>
+        `;
+        const loadedRes = window.STV_extractFromHtml(loadedChapterHtml, 'https://truyen.test/truyen/demo/1/106/');
+        assert.strictEqual(loadedRes.ok, true);
+        assert.strictEqual(loadedRes.captchaRequired, false);
+    });
 });

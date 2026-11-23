@@ -633,7 +633,7 @@ describe('Feature 3: Background Translation Broker & Secret Isolation', () => {
         assert.strictEqual('reasoning_effort' in capturedBodies[1], false);
     });
 
-    it('T1.18b: Non-OpenRouter OpenAI-compatible endpoint sends reasoning_effort=none without reasoning', async () => {
+    it('T1.18b: Non-OpenRouter OpenAI-compatible endpoint sends reasoning_effort=medium without reasoning', async () => {
         globalThis.STV_TranslationBroker.resetLlmReasoningModeCache();
         const capturedBodies = [];
 
@@ -650,7 +650,7 @@ describe('Feature 3: Background Translation Broker & Secret Isolation', () => {
         await runTranslateStreamText('run-gemini-none', ['云韵点了点头']);
 
         assert.strictEqual(capturedBodies.length, 1);
-        assert.strictEqual(capturedBodies[0].reasoning_effort, 'none');
+        assert.strictEqual(capturedBodies[0].reasoning_effort, 'medium');
         assert.strictEqual('reasoning' in capturedBodies[0], false);
     });
 
@@ -676,7 +676,7 @@ describe('Feature 3: Background Translation Broker & Secret Isolation', () => {
         const out1 = await runTranslateStreamText('run-omit-1', ['测试文本']);
         assert.strictEqual(out1, 'Dịch thành công.');
         assert.strictEqual(sentModes.length, 2);
-        assert.strictEqual(sentModes[0].reasoning_effort, 'none');
+        assert.strictEqual(sentModes[0].reasoning_effort, 'medium');
         assert.strictEqual(sentModes[1].reasoning_effort, undefined);
 
         const out2 = await runTranslateStreamText('run-omit-2', ['测试文本']);

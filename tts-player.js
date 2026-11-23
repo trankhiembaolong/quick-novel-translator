@@ -20,6 +20,7 @@
     const EXPORT_WAVE_MAX_RAW_CHARS = 18000;
     const EXPORT_PROBE_BUFFER_RATIO = 1.05;
     const EXPORT_PROBE_DELAY_MS = 120;
+    const DEFAULT_EXPORT_FETCH_PACE = 'natural';
 
     function getColabGpuExportConfig(tier = 'T4', healthData = null) {
         const raw = String(tier || 'T4').trim().toUpperCase();
@@ -935,6 +936,99 @@
         return Math.max(6, Math.min(35, viChars / sec));
     }
 
+    function normalizeExportFetchPace(raw) {
+        const val = String(raw || '').trim().toLowerCase();
+        if (val === 'gentle' || val === 'fast') return val;
+        return DEFAULT_EXPORT_FETCH_PACE;
+    }
+
+    function getExportFetchPaceProfile(pace = DEFAULT_EXPORT_FETCH_PACE, captchaEncountered = false, override = null) {
+        const normalized = normalizeExportFetchPace(pace);
+        let base;
+        if (captchaEncountered || normalized === 'gentle') {
+            base = {
+                pace: 'gentle',
+                lookaheadChapters: 1,
+                waveMaxChapters: 1,
+                initialDelayMinMs: 2500,
+                initialDelayMaxMs: 4500,
+                minGapMs: 10000,
+                maxGapMs: 16000,
+                settleJitterMinMs: 1000,
+                settleJitterMaxMs: 2200,
+                maxTranslateConcurrency: 1
+            };
+        } else if (normalized === 'fast') {
+            base = {
+                pace: 'fast',
+                lookaheadChapters: MAX_EXPORT_CHAPTERS,
+                waveMaxChapters: EXPORT_WAVE_MAX_CHAPTERS,
+                initialDelayMinMs: 0,
+                initialDelayMaxMs: 0,
+                minGapMs: EXPORT_PROBE_DELAY_MS,
+                maxGapMs: EXPORT_PROBE_DELAY_MS,
+                settleJitterMinMs: 0,
+                settleJitterMaxMs: 0,
+                maxTranslateConcurrency: 6
+            };
+        } else {
+            base = {
+                pace: 'natural',
+                lookaheadChapters: 2,
+                waveMaxChapters: 1,
+                initialDelayMinMs: 1800,
+                initialDelayMaxMs: 3200,
+                minGapMs: 5000,
+                maxGapMs: 8500,
+                settleJitterMinMs: 600,
+                settleJitterMaxMs: 1500,
+                maxTranslateConcurrency: 2
+            };
+        }
+        if (override && typeof override === 'object') {
+            const numericFields = [
+                'lookaheadChapters',
+                'waveMaxChapters',
+                'initialDelayMinMs',
+                'initialDelayMaxMs',
+                'minGapMs',
+                'maxGapMs',
+                'settleJitterMinMs',
+                'settleJitterMaxMs',
+                'maxTranslateConcurrency'
+            ];
+            const merged = { ...base };
+            for (const key of numericFields) {
+                if (override[key] !== undefined && Number.isFinite(Number(override[key]))) {
+                    merged[key] = Math.max(0, Number(override[key]));
+                }
+            }
+            return merged;
+        }
+        return base;
+    }
+
+    function computeNaturalProbeDelayMs(profile, lastProbeCompletedAt = 0, now = Date.now(), rng = Math.random) {
+        const p = profile || getExportFetchPaceProfile(DEFAULT_EXPORT_FETCH_PACE, false);
+        const pick = (minVal, maxVal) => {
+            const lo = Math.max(0, Number(minVal) || 0);
+            const hi = Math.max(lo, Number(maxVal) || lo);
+            if (hi === lo) return Math.round(lo);
+            const rawR = typeof rng === 'function' ? Number(rng()) : Math.random();
+            const r = Number.isFinite(rawR) ? Math.min(0.999999, Math.max(0, rawR)) : 0.5;
+            return Math.round(lo + r * (hi - lo));
+        };
+        if (!lastProbeCompletedAt) {
+            return pick(p.initialDelayMinMs, p.initialDelayMaxMs);
+        }
+        const targetGap = pick(p.minGapMs, p.maxGapMs);
+        const elapsed = Math.max(0, (Number(now) || 0) - (Number(lastProbeCompletedAt) || 0));
+        if (elapsed < targetGap) {
+            return Math.round(targetGap - elapsed);
+        }
+        return pick(p.settleJitterMinMs, p.settleJitterMaxMs);
+    }
+
     // Export DSP helpers for testing and external consumption
     global.STV_TTSHelpers = {
         cleanTextForSpeech,
@@ -951,6 +1045,10 @@
         packSegmentsForExport,
         containsForeignCjkText,
         estimateRawChapterDurationSec,
+        DEFAULT_EXPORT_FETCH_PACE,
+        normalizeExportFetchPace,
+        getExportFetchPaceProfile,
+        computeNaturalProbeDelayMs,
         COLAB_TIER_CONFIG,
         getColabGpuExportConfig,
         COLAB_BATCH_SIZE_BY_TIER,
@@ -1221,6 +1319,43 @@
             #stv-tts-player .stv-tts-dl-cancel:hover:not(:disabled) {
                 background: #7f1d1d;
             }
+            #stv-tts-player .stv-tts-dl-verify {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                padding: 7px 8px;
+                border-radius: 7px;
+                background: rgba(217, 119, 6, 0.16);
+                border: 1px solid rgba(245, 158, 11, 0.55);
+            }
+            #stv-tts-player .stv-tts-dl-verify-msg {
+                font-size: 11.5px;
+                line-height: 1.35;
+                color: #fde68a;
+            }
+            #stv-tts-player .stv-tts-dl-verify-row {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            #stv-tts-player .stv-tts-dl-verify-row .stv-tts-btn {
+                flex: 1;
+                font-size: 11.5px;
+                padding: 4px 7px;
+                white-space: nowrap;
+            }
+            #stv-tts-player .stv-tts-dl-verify-open {
+                background: #d97706;
+            }
+            #stv-tts-player .stv-tts-dl-verify-open:hover:not(:disabled) {
+                background: #b45309;
+            }
+            #stv-tts-player .stv-tts-dl-verify-resume {
+                background: #059669;
+            }
+            #stv-tts-player .stv-tts-dl-verify-resume:hover:not(:disabled) {
+                background: #047857;
+            }
         `;
 
     function getActiveIconOptions() {
@@ -1354,6 +1489,7 @@
         liveIconDebounceTimer: null,
         hasTranslationApiKey: false,
         exportTranslateConcurrency: DEFAULT_EXPORT_TRANSLATE_CONCURRENCY,
+        exportFetchPace: DEFAULT_EXPORT_FETCH_PACE,
         debugLog: false
     };
 
@@ -1388,6 +1524,16 @@
         segTotal: 0,
         fetchingNext: false,
         waitingTranslation: false,
+        waitingVerification: false,
+        verificationUrl: '',
+        verificationChapter: 0,
+        verificationTabId: null,
+        verificationTabClosed: false,
+        verificationManualOnly: false,
+        verificationResumeHandler: null,
+        verificationPollMs: 1500,
+        captchaEncountered: false,
+        savedDocTitle: null,
         nextOpenUrl: null,
         activePorts: new Set(),
         activeSockets: new Set(),
@@ -1851,7 +1997,12 @@
         if (statusEl) {
             if (exportState.active && !isError && !statusText) {
                 const curMin = (exportState.accumulatedSec / 60).toFixed(1);
-                if (exportState.waitingTranslation) {
+                if (exportState.waitingVerification) {
+                    statusEl.textContent = tTts('tts_dl_verify_needed', `⚠️ Cần xác minh trang web tại chương ${exportState.verificationChapter} · Đã giữ ${curMin}/${exportState.targetMinutes}p`)
+                        .replace('{chap}', String(exportState.verificationChapter || exportState.currentChapter))
+                        .replace('{current}', curMin)
+                        .replace('{target}', String(exportState.targetMinutes));
+                } else if (exportState.waitingTranslation) {
                     statusEl.textContent = tTts('tts_dl_waiting_translation', 'Đang đợi chương hiện tại dịch xong để tải audio...');
                 } else if (exportState.fetchingNext) {
                     if (exportState.preExtractingGlossary) {
@@ -1903,6 +2054,10 @@
         const dlBtn = el.querySelector('[data-act="download"]');
         const dlIdleRow = el.querySelector('[data-role="dl-idle-row"]');
         const dlActiveBox = el.querySelector('[data-role="dl-active-box"]');
+        const dlVerifyBox = el.querySelector('[data-role="dl-verify-box"]');
+        const dlVerifyMsg = el.querySelector('[data-role="dl-verify-msg"]');
+        const dlOpenVerifyBtn = el.querySelector('[data-act="dl-open-verify"]');
+        const dlResumeVerifyBtn = el.querySelector('[data-act="dl-resume-verify"]');
         const dlProgressFill = el.querySelector('[data-role="dl-progress-fill"]');
         const dlSaveNowBtn = el.querySelector('[data-act="dl-save-now"]');
         const dlCancelBtn = el.querySelector('[data-act="dl-cancel"]');
@@ -1937,6 +2092,14 @@
         }
         if (dlIdleRow) dlIdleRow.hidden = exportState.active;
         if (dlActiveBox) dlActiveBox.hidden = !exportState.active;
+        if (dlVerifyBox) dlVerifyBox.hidden = !(exportState.active && exportState.waitingVerification);
+        if (dlVerifyMsg) {
+            dlVerifyMsg.textContent = exportState.verificationTabClosed
+                ? tTts('tts_dl_verify_tab_closed', 'Tab xác minh đã đóng. Hãy bấm "Mở trang xác minh" hoặc "Tiếp tục xuất" sau khi xong.')
+                : tTts('tts_dl_verify_hint', 'Hãy tick xác minh con người ở tab vừa mở — sẽ tự tiếp tục khi tải xong chương.');
+        }
+        if (dlOpenVerifyBtn) dlOpenVerifyBtn.textContent = tTts('tts_dl_verify_open', '🔐 Mở trang xác minh');
+        if (dlResumeVerifyBtn) dlResumeVerifyBtn.textContent = tTts('tts_dl_verify_resume', '▶ Tiếp tục xuất');
         if (dlSourceBtn) {
             const hasColab = Boolean((state.colabServerUrl || '').trim());
             const isColab = state.downloadSource === 'colab_gpu';
@@ -2028,6 +2191,13 @@
                     <div class="stv-tts-dl-progress">
                         <div class="stv-tts-dl-progress-fill" data-role="dl-progress-fill"></div>
                     </div>
+                    <div class="stv-tts-dl-verify" data-role="dl-verify-box" hidden>
+                        <div class="stv-tts-dl-verify-msg" data-role="dl-verify-msg"></div>
+                        <div class="stv-tts-dl-verify-row">
+                            <button type="button" class="stv-tts-btn stv-tts-dl-verify-open" data-act="dl-open-verify">🔐 Mở trang xác minh</button>
+                            <button type="button" class="stv-tts-btn stv-tts-dl-verify-resume" data-act="dl-resume-verify">▶ Tiếp tục xuất</button>
+                        </div>
+                    </div>
                     <div class="stv-tts-dl-active-row">
                         <button type="button" class="stv-tts-btn stv-tts-dl-save" data-act="dl-save-now">💾 Lưu ngay</button>
                         <button type="button" class="stv-tts-btn stv-tts-dl-cancel" data-act="dl-cancel">✖ Hủy tải</button>
@@ -2078,6 +2248,8 @@
             else if (act === 'dl-save-now') requestSavePartialDownload();
             else if (act === 'dl-cancel') cancelTTSDownload();
             else if (act === 'dl-goto-next') openNextExportChapter();
+            else if (act === 'dl-open-verify') void openVerificationPage();
+            else if (act === 'dl-resume-verify') void resumeAfterVerification();
         });
 
         shadow.append(style, box);
@@ -3971,6 +4143,10 @@
         state.exportTranslateConcurrency = Number.isFinite(parsedConc)
             ? Math.max(1, Math.min(6, parsedConc))
             : DEFAULT_EXPORT_TRANSLATE_CONCURRENCY;
+        const rawPace = options.exportFetchPace !== undefined
+            ? options.exportFetchPace
+            : config.ttsExportFetchPace;
+        state.exportFetchPace = normalizeExportFetchPace(rawPace);
 
         return config;
     }
@@ -3994,7 +4170,8 @@
                 chrome.runtime.sendMessage({
                     action: 'cancel_export_prefetches',
                     exportSessionId: exportState.exportSessionId,
-                    keepReady: true
+                    keepReady: true,
+                    closeVerifyTab: Boolean(exportState.aborted || exportState.savePartialRequested)
                 }, () => { void chrome?.runtime?.lastError; });
             } catch {}
         }
@@ -4025,6 +4202,283 @@
         if (!exportState.active) return;
         exportState.savePartialRequested = true;
         abortActiveExportNetwork();
+    }
+
+    let activeVerificationPromise = null;
+
+    function playVerificationAlertChime() {
+        try {
+            const Ctx = global.AudioContext || global.webkitAudioContext;
+            if (typeof Ctx !== 'function') return;
+            const ctx = new Ctx();
+            const now = ctx.currentTime || 0;
+            const playTone = (freq, startOff, dur) => {
+                const osc = ctx.createOscillator?.();
+                const gain = ctx.createGain?.();
+                if (!osc || !gain) return;
+                osc.type = 'sine';
+                osc.frequency.value = freq;
+                gain.gain.setValueAtTime(0.08, now + startOff);
+                gain.gain.exponentialRampToValueAtTime(0.001, now + startOff + dur);
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.start(now + startOff);
+                osc.stop(now + startOff + dur);
+            };
+            playTone(660, 0, 0.14);
+            playTone(880, 0.16, 0.2);
+            const closeTimer = setTimeout(() => {
+                try { ctx.close?.(); } catch {}
+            }, 600);
+            if (typeof closeTimer.unref === 'function') closeTimer.unref();
+        } catch {}
+    }
+
+    function setVerificationTitleAlert(active, chapterNumber = 0) {
+        try {
+            if (typeof document === 'undefined' || typeof document.title !== 'string') return;
+            if (active) {
+                if (exportState.savedDocTitle === null) {
+                    exportState.savedDocTitle = document.title;
+                }
+                const chapTag = chapterNumber > 0 ? ` Ch.${chapterNumber}` : '';
+                document.title = `⚠️ Xác minh${chapTag} | ${exportState.savedDocTitle}`;
+            } else if (exportState.savedDocTitle !== null) {
+                document.title = exportState.savedDocTitle;
+                exportState.savedDocTitle = null;
+            }
+        } catch {}
+    }
+
+    async function checkVerificationTabOnce(targetUrl, exportSessionId, verifyTabId) {
+        if (!isExtensionAlive()) return { ok: false, status: 'unavailable' };
+        return await new Promise((resolve) => {
+            try {
+                chrome.runtime.sendMessage({
+                    action: 'check_captcha_verification_tab',
+                    url: targetUrl,
+                    exportSessionId,
+                    verifyTabId
+                }, (resp) => {
+                    if (chrome.runtime.lastError) {
+                        resolve({ ok: false, error: chrome.runtime.lastError.message });
+                        return;
+                    }
+                    resolve(resp || { ok: false });
+                });
+            } catch (err) {
+                resolve({ ok: false, error: err?.message || String(err) });
+            }
+        });
+    }
+
+    async function openVerificationPage() {
+        if (!exportState.active || !exportState.verificationUrl || !isExtensionAlive()) {
+            return { ok: false, error: 'verification_unavailable' };
+        }
+        return await new Promise((resolve) => {
+            try {
+                chrome.runtime.sendMessage({
+                    action: 'open_captcha_verification_tab',
+                    url: exportState.verificationUrl,
+                    exportSessionId: exportState.exportSessionId,
+                    autoFocus: true
+                }, (resp) => {
+                    if (chrome.runtime.lastError || !resp || !resp.ok) {
+                        resolve({ ok: false, error: resp?.error || chrome.runtime.lastError?.message || 'open_verification_failed' });
+                        return;
+                    }
+                    exportState.verificationTabId = resp.verifyTabId || null;
+                    exportState.verificationTabClosed = false;
+                    exportState.verificationManualOnly = false;
+                    updatePlayerUI();
+                    resolve(resp);
+                });
+            } catch (err) {
+                resolve({ ok: false, error: err?.message || String(err) });
+            }
+        });
+    }
+
+    async function resumeAfterVerification() {
+        if (!exportState.active || !exportState.waitingVerification) {
+            return { ok: false, error: 'not_waiting_verification' };
+        }
+        if (exportState.verificationUrl && exportState.verificationTabId && !exportState.verificationTabClosed && isExtensionAlive()) {
+            const checkRes = await checkVerificationTabOnce(
+                exportState.verificationUrl,
+                exportState.exportSessionId,
+                exportState.verificationTabId
+            );
+            if (checkRes && checkRes.ok && checkRes.status === 'verified' && Array.isArray(checkRes.origChunks) && checkRes.origChunks.length > 0) {
+                if (typeof exportState.verificationResumeHandler === 'function') {
+                    exportState.verificationResumeHandler({
+                        status: 'verified',
+                        origChunks: checkRes.origChunks,
+                        nextUrl: checkRes.nextUrl || null
+                    });
+                }
+                return { ok: true, status: 'verified' };
+            }
+        }
+        if (typeof exportState.verificationResumeHandler === 'function') {
+            exportState.verificationResumeHandler({ status: 'manual_resume' });
+            return { ok: true, status: 'manual_resume' };
+        }
+        return { ok: false, error: 'no_resume_handler' };
+    }
+
+    function refreshExportWorkerLeaseBestEffort() {
+        const activeExportEngine = exportState.useColabGpu ? 'vieneu' : (exportState.effectiveEngine || state.engine);
+        const targetServerUrl = exportState.useColabGpu ? exportState.effectiveServerUrl : state.serverUrl;
+        if (activeExportEngine !== 'vieneu' || !exportState.leaseId || !isExtensionAlive()) return;
+        try {
+            chrome.runtime.sendMessage({
+                action: 'vieneu_set_worker_mode',
+                serverUrl: targetServerUrl,
+                apiKey: state.apiKey,
+                mode: 'export',
+                leaseId: exportState.leaseId,
+                workers: exportState.targetWorkers || EXPORT_CONCURRENCY,
+                ...(exportState.useColabGpu ? { gpuTier: state.colabGpuTier } : {})
+            }, () => { void chrome?.runtime?.lastError; });
+        } catch {}
+    }
+
+    function waitForCaptchaVerification(targetUrl, chapterNumber, exportRunId, exportSessionId) {
+        if (activeVerificationPromise) {
+            return activeVerificationPromise;
+        }
+        activeVerificationPromise = (async () => {
+            if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+                throw new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED');
+            }
+
+            exportState.waitingVerification = true;
+            exportState.verificationUrl = targetUrl || '';
+            exportState.verificationChapter = Number(chapterNumber) || exportState.currentChapter || 1;
+            exportState.verificationTabId = null;
+            exportState.verificationTabClosed = false;
+            exportState.verificationManualOnly = false;
+            setVerificationTitleAlert(true, exportState.verificationChapter);
+            playVerificationAlertChime();
+            updatePlayerUI();
+            const curMin = (exportState.accumulatedSec / 60).toFixed(1);
+            notifyTtsToast(
+                tTts('tts_dl_verify_needed', `⚠️ Cần xác minh trang web tại chương ${exportState.verificationChapter} · Đã giữ ${curMin}/${exportState.targetMinutes}p`)
+                    .replace('{chap}', String(exportState.verificationChapter))
+                    .replace('{current}', curMin)
+                    .replace('{target}', String(exportState.targetMinutes)),
+                'warning'
+            );
+
+            await openVerificationPage();
+            if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+                throw new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED');
+            }
+
+            return await new Promise((resolve, reject) => {
+                let settled = false;
+                let pollTimer = null;
+                let checking = false;
+
+                const cleanup = () => {
+                    if (pollTimer) clearTimeout(pollTimer);
+                    pollTimer = null;
+                    exportState.abortRejects.delete(abortHandler);
+                    exportState.verificationResumeHandler = null;
+                    exportState.waitingVerification = false;
+                    setVerificationTitleAlert(false);
+                    updatePlayerUI();
+                };
+
+                const finishOk = (payload) => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    refreshExportWorkerLeaseBestEffort();
+                    notifyTtsToast(
+                        tTts('tts_dl_verify_resumed', 'Đã xác minh xong, đang xuất nối tiếp!'),
+                        'success'
+                    );
+                    resolve(payload);
+                };
+
+                const finishErr = (err) => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    if (exportSessionId && isExtensionAlive()) {
+                        try {
+                            chrome.runtime.sendMessage({
+                                action: 'close_captcha_verification_tab',
+                                exportSessionId,
+                                closeTab: true
+                            }, () => { void chrome?.runtime?.lastError; });
+                        } catch {}
+                    }
+                    reject(err instanceof Error ? err : new Error(String(err)));
+                };
+
+                const abortHandler = (err) => finishErr(err);
+                exportState.abortRejects.add(abortHandler);
+                exportState.verificationResumeHandler = (payload) => finishOk(payload || { status: 'manual_resume' });
+
+                const pollMs = Math.max(15, Number(exportState.verificationPollMs) || 1500);
+                const schedulePoll = (delayMs) => {
+                    if (settled) return;
+                    if (pollTimer) clearTimeout(pollTimer);
+                    pollTimer = setTimeout(() => { void pollOnce(); }, delayMs);
+                    if (pollTimer && typeof pollTimer.unref === 'function') pollTimer.unref();
+                };
+
+                const pollOnce = async () => {
+                    if (settled || checking) return;
+                    if (exportState.runId !== exportRunId || exportState.aborted || exportState.savePartialRequested) {
+                        finishErr(new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED'));
+                        return;
+                    }
+                    if (!exportState.verificationTabId || exportState.verificationTabClosed || exportState.verificationManualOnly) {
+                        schedulePoll(pollMs);
+                        return;
+                    }
+                    checking = true;
+                    try {
+                        const res = await checkVerificationTabOnce(targetUrl, exportSessionId, exportState.verificationTabId);
+                        if (settled) return;
+                        if (res && res.ok) {
+                            if (res.status === 'verified' && Array.isArray(res.origChunks) && res.origChunks.length > 0) {
+                                finishOk({
+                                    status: 'verified',
+                                    origChunks: res.origChunks,
+                                    nextUrl: res.nextUrl || null
+                                });
+                                return;
+                            }
+                            if (res.status === 'tab_closed') {
+                                exportState.verificationTabClosed = true;
+                                updatePlayerUI();
+                            } else if (res.status === 'manual_only') {
+                                exportState.verificationManualOnly = true;
+                                updatePlayerUI();
+                            }
+                        }
+                    } finally {
+                        checking = false;
+                        if (!settled) {
+                            schedulePoll(pollMs);
+                        }
+                    }
+                };
+
+                schedulePoll(0);
+            });
+        })().finally(() => {
+            exportState.waitingVerification = false;
+            setVerificationTitleAlert(false);
+            activeVerificationPromise = null;
+        });
+        return activeVerificationPromise;
     }
 
     function openNextExportChapter() {
@@ -4448,6 +4902,9 @@
                     } else if (msg.type === 'error') {
                         const err = new Error(msg.error || 'Preload failed');
                         err.rateLimited = Boolean(msg.rateLimited);
+                        err.captchaRequired = Boolean(msg.captchaRequired);
+                        err.captchaReason = msg.captchaReason || '';
+                        err.targetUrl = msg.targetUrl || targetUrl;
                         finishErr(err);
                     }
                 });
@@ -4493,7 +4950,7 @@
 
     /**
      * Coordinate 3 overlapping stages for multi-chapter export:
-     * 1) Sequential raw probing by estimated duration (in capped waves),
+     * 1) Sequential raw probing by estimated duration (in natural sliding window or fast waves),
      * 2) Wave-level glossary pre-extraction before parallel translation,
      * 3) Adaptive parallel translation worker pool feeding sequential GPU synthesis.
      */
@@ -4505,7 +4962,10 @@
         speed,
         exportRunId,
         exportSessionId,
-        initialConcurrency = DEFAULT_EXPORT_TRANSLATE_CONCURRENCY
+        initialConcurrency = DEFAULT_EXPORT_TRANSLATE_CONCURRENCY,
+        exportFetchPace = DEFAULT_EXPORT_FETCH_PACE,
+        exportPaceOverride = null,
+        onRequestCaptchaVerification = null
     }) {
         let stopped = false;
         let cursorUrl = initialNextUrl || null;
@@ -4517,6 +4977,8 @@
         let probeTerminalError = null;
         let pumpPromise = null;
         let pumpDirty = false;
+        let lastProbeCompletedAt = 0;
+        let captchaEncountered = false;
         const slots = [];
         const structureWaiters = new Set();
 
@@ -4526,6 +4988,16 @@
             exportState.savePartialRequested ||
             exportState.runId !== exportRunId
         );
+
+        const getActivePaceProfile = () => getExportFetchPaceProfile(exportFetchPace, captchaEncountered, exportPaceOverride);
+        const getBufferedAheadCount = () => Math.max(0, slots.length - consumedCount);
+        const markCaptchaEncountered = () => {
+            captchaEncountered = true;
+            exportState.captchaEncountered = true;
+            if (currentConcurrency > 1) {
+                currentConcurrency = 1;
+            }
+        };
 
         const notifyStructure = () => {
             for (const fn of Array.from(structureWaiters)) {
@@ -4563,6 +5035,7 @@
             if (isAborted() || probeTerminalError) return false;
             if (!cursorUrl) return false;
             if (1 + slots.length >= MAX_EXPORT_CHAPTERS) return false;
+            if (getBufferedAheadCount() >= getActivePaceProfile().lookaheadChapters) return false;
             return getProjectedSec() < targetSeconds * EXPORT_PROBE_BUFFER_RATIO;
         };
 
@@ -4601,18 +5074,60 @@
             while (
                 !isAborted() &&
                 cursorUrl &&
-                waveSlots.length < EXPORT_WAVE_MAX_CHAPTERS &&
+                waveSlots.length < getActivePaceProfile().waveMaxChapters &&
+                getBufferedAheadCount() < getActivePaceProfile().lookaheadChapters &&
                 waveRawChars < EXPORT_WAVE_MAX_RAW_CHARS &&
                 (1 + slots.length) < MAX_EXPORT_CHAPTERS &&
                 getProjectedSec() < targetSeconds * EXPORT_PROBE_BUFFER_RATIO
             ) {
-                if (waveSlots.length > 0) {
-                    await abortableExportDelay(EXPORT_PROBE_DELAY_MS, exportRunId);
+                const profile = getActivePaceProfile();
+                const waitMs = (profile.pace === 'fast' && waveSlots.length === 0)
+                    ? 0
+                    : computeNaturalProbeDelayMs(profile, lastProbeCompletedAt, Date.now());
+                if (waitMs > 0) {
+                    await abortableExportDelay(waitMs, exportRunId);
                     if (isAborted()) break;
                 }
                 const target = cursorUrl;
-                const resp = await probeOneChapter(target);
+                let resp = await probeOneChapter(target);
+                lastProbeCompletedAt = Date.now();
                 if (isAborted()) break;
+
+                if (resp && resp.captchaRequired) {
+                    markCaptchaEncountered();
+                    if (typeof onRequestCaptchaVerification !== 'function') {
+                        probeTerminalError = new Error(resp.error || 'Trang web yêu cầu xác minh Captcha.');
+                        break;
+                    }
+                    while (!isAborted()) {
+                        const verifyRes = await onRequestCaptchaVerification(target, 2 + slots.length);
+                        if (isAborted()) break;
+                        if (
+                            verifyRes &&
+                            verifyRes.status === 'verified' &&
+                            Array.isArray(verifyRes.origChunks) &&
+                            verifyRes.origChunks.length > 0
+                        ) {
+                            resp = {
+                                ok: true,
+                                targetUrl: target,
+                                origChunks: verifyRes.origChunks,
+                                nextUrl: verifyRes.nextUrl || null,
+                                alreadyReady: false,
+                                alreadyTranslating: false
+                            };
+                            lastProbeCompletedAt = Date.now();
+                            break;
+                        }
+                        resp = await probeOneChapter(target);
+                        lastProbeCompletedAt = Date.now();
+                        if (isAborted()) break;
+                        if (!resp || !resp.captchaRequired) {
+                            break;
+                        }
+                    }
+                    if (isAborted()) break;
+                }
 
                 if (!resp || !resp.ok || !Array.isArray(resp.origChunks) || resp.origChunks.length === 0) {
                     const fallbackSlot = createSlot({
@@ -4708,7 +5223,8 @@
 
         const translateWaveSlots = async (waveSlots) => {
             let queueIdx = 0;
-            const workerTotal = Math.min(currentConcurrency, waveSlots.length);
+            const maxPaceConc = Math.max(1, getActivePaceProfile().maxTranslateConcurrency || 1);
+            const workerTotal = Math.min(currentConcurrency, maxPaceConc, waveSlots.length);
 
             const runWorker = async (workerIdx) => {
                 while (!isAborted()) {
@@ -4725,36 +5241,53 @@
                     }
 
                     slot.translationState = 'translating';
-                    try {
-                        const data = await fetchAndTranslateChapterForExport(slot.url, preloadMode, exportRunId, {
-                            preserveOtherPreloads: true,
-                            exportSessionId
-                        });
-                        slot.data = data;
-                        slot.origChunks = null;
-                        slot.translationState = 'ready';
-                        if (data && data.rateLimited) {
-                            stepDownConcurrency();
+                    while (!isAborted()) {
+                        try {
+                            const data = await fetchAndTranslateChapterForExport(slot.url, preloadMode, exportRunId, {
+                                preserveOtherPreloads: true,
+                                exportSessionId
+                            });
+                            slot.data = data;
+                            slot.origChunks = null;
+                            slot.translationState = 'ready';
+                            if (data && data.rateLimited) {
+                                stepDownConcurrency();
+                            }
+                            if (!slot.probeSupported && data?.nextUrl && !cursorUrl && !isAborted()) {
+                                slot.nextUrl = data.nextUrl;
+                                cursorUrl = data.nextUrl;
+                                pumpDirty = true;
+                            }
+                            exportState.translatedChapters = 1 + slots.filter((s) => s.translationState === 'ready').length;
+                            updatePlayerUI();
+                            slot.resolve(data);
+                            break;
+                        } catch (err) {
+                            if (err?.captchaRequired && !isAborted() && typeof onRequestCaptchaVerification === 'function') {
+                                markCaptchaEncountered();
+                                await onRequestCaptchaVerification(err.targetUrl || slot.url, slot.chapterNumber);
+                                if (isAborted()) {
+                                    const abortErr = new Error(exportState.savePartialRequested ? 'EXPORT_SAVE_PARTIAL' : 'EXPORT_ABORTED');
+                                    slot.error = abortErr;
+                                    slot.origChunks = null;
+                                    slot.translationState = 'cancelled';
+                                    slot.reject(abortErr);
+                                    return;
+                                }
+                                continue;
+                            }
+                            if (err?.rateLimited) {
+                                stepDownConcurrency();
+                            }
+                            slot.error = err;
+                            slot.origChunks = null;
+                            slot.translationState = 'error';
+                            if (!slot.probeSupported) {
+                                cursorUrl = null;
+                            }
+                            slot.reject(err);
+                            break;
                         }
-                        if (!slot.probeSupported && data?.nextUrl && !cursorUrl && !isAborted()) {
-                            slot.nextUrl = data.nextUrl;
-                            cursorUrl = data.nextUrl;
-                            pumpDirty = true;
-                        }
-                        exportState.translatedChapters = 1 + slots.filter((s) => s.translationState === 'ready').length;
-                        updatePlayerUI();
-                        slot.resolve(data);
-                    } catch (err) {
-                        if (err?.rateLimited) {
-                            stepDownConcurrency();
-                        }
-                        slot.error = err;
-                        slot.origChunks = null;
-                        slot.translationState = 'error';
-                        if (!slot.probeSupported) {
-                            cursorUrl = null;
-                        }
-                        slot.reject(err);
                     }
                 }
             };
@@ -4816,7 +5349,8 @@
                     chrome.runtime.sendMessage({
                         action: 'cancel_export_prefetches',
                         exportSessionId,
-                        keepReady
+                        keepReady,
+                        closeVerifyTab: Boolean(exportState.aborted || exportState.savePartialRequested)
                     }, () => { void chrome?.runtime?.lastError; });
                 } catch {}
             }
@@ -4845,7 +5379,7 @@
         };
 
         const getNextChapter = async (upcomingIdx) => {
-            while (!isAborted() && upcomingIdx >= slots.length && (cursorUrl || pumpPromise)) {
+            while (!isAborted() && !probeTerminalError && upcomingIdx >= slots.length && (cursorUrl || pumpPromise)) {
                 await new Promise((resolve) => {
                     const cleanup = () => {
                         structureWaiters.delete(onWake);
@@ -4878,6 +5412,7 @@
             consumedCount = Math.max(consumedCount, upcomingIdx + 1);
             currentRenderingEstSec = Math.max(0, Number(slot.estSec) || 0);
             slot.data = null;
+            maybePump();
             return data;
         };
 
@@ -5573,6 +6108,16 @@
         exportState.segTotal = 0;
         exportState.fetchingNext = false;
         exportState.waitingTranslation = false;
+        exportState.waitingVerification = false;
+        exportState.verificationUrl = '';
+        exportState.verificationChapter = 0;
+        exportState.verificationTabId = null;
+        exportState.verificationTabClosed = false;
+        exportState.verificationManualOnly = false;
+        exportState.verificationResumeHandler = null;
+        exportState.verificationPollMs = Math.max(15, Number(options.exportVerificationPollMs) || 1500);
+        exportState.captchaEncountered = false;
+        exportState.savedDocTitle = null;
         exportState.nextOpenUrl = null;
         exportState.activePorts.clear();
         exportState.activeSockets.clear();
@@ -5735,7 +6280,15 @@
                     speed: state.speed,
                     exportRunId: myRunId,
                     exportSessionId: exportLeaseId,
-                    initialConcurrency: state.exportTranslateConcurrency
+                    initialConcurrency: state.exportTranslateConcurrency,
+                    exportFetchPace: state.exportFetchPace,
+                    exportPaceOverride: options.exportPaceOverride || null,
+                    onRequestCaptchaVerification: (targetUrl, chapNum) => waitForCaptchaVerification(
+                        targetUrl,
+                        chapNum,
+                        myRunId,
+                        exportLeaseId
+                    )
                 })
                 : null;
             if (pipeline && ch1EstSec < targetSeconds * EXPORT_PROBE_BUFFER_RATIO) {
@@ -6007,19 +6560,37 @@
                     updatePlayerUI();
 
                     let nextData = null;
-                    try {
-                        nextData = pipeline
-                            ? await pipeline.getNextChapter(upcomingIdx)
-                            : await fetchAndTranslateChapterForExport(currentChapterNextUrl, preloadMode, myRunId, {
-                                preserveOtherPreloads: true,
-                                exportSessionId: exportLeaseId
-                            });
-                    } catch (fetchErr) {
-                        if (exportState.aborted || exportState.savePartialRequested || fetchErr?.message === 'EXPORT_ABORTED' || fetchErr?.message === 'EXPORT_SAVE_PARTIAL') {
-                            throw fetchErr;
+                    let loopFetchFailed = false;
+                    while (!exportState.aborted && !exportState.savePartialRequested && exportState.runId === myRunId) {
+                        try {
+                            nextData = pipeline
+                                ? await pipeline.getNextChapter(upcomingIdx)
+                                : await fetchAndTranslateChapterForExport(currentChapterNextUrl, preloadMode, myRunId, {
+                                    preserveOtherPreloads: true,
+                                    exportSessionId: exportLeaseId
+                                });
+                            break;
+                        } catch (fetchErr) {
+                            if (exportState.aborted || exportState.savePartialRequested || fetchErr?.message === 'EXPORT_ABORTED' || fetchErr?.message === 'EXPORT_SAVE_PARTIAL') {
+                                throw fetchErr;
+                            }
+                            if (fetchErr?.captchaRequired) {
+                                exportState.captchaEncountered = true;
+                                await waitForCaptchaVerification(
+                                    fetchErr.targetUrl || currentChapterNextUrl,
+                                    exportState.chaptersCompleted + 2,
+                                    myRunId,
+                                    exportLeaseId
+                                );
+                                continue;
+                            }
+                            earlyStopReason = fetchErr?.message || String(fetchErr || 'Lỗi tải/dịch chương kế tiếp');
+                            console.warn(`[STV TTS Export] Dừng nối chương tại chương ${exportState.chaptersCompleted}:`, earlyStopReason);
+                            loopFetchFailed = true;
+                            break;
                         }
-                        earlyStopReason = fetchErr?.message || String(fetchErr || 'Lỗi tải/dịch chương kế tiếp');
-                        console.warn(`[STV TTS Export] Dừng nối chương tại chương ${exportState.chaptersCompleted}:`, earlyStopReason);
+                    }
+                    if (loopFetchFailed || exportState.aborted || exportState.savePartialRequested || exportState.runId !== myRunId) {
                         break;
                     }
 
@@ -6158,8 +6729,10 @@
             }
             return { ok: true, filename, chapters: savedChapters, minutes: Number(exactMinLabel), byteLength: wav.byteLength };
         } catch (err) {
+            setVerificationTitleAlert(false);
             exportState.active = false;
             exportState.waitingTranslation = false;
+            exportState.waitingVerification = false;
             exportState.fetchingNext = false;
             if (err?.message === 'EXPORT_ABORTED' && exportState.aborted) {
                 const cancelMsg = tTts('tts_dl_cancelled', 'Đã hủy tải audio.');
@@ -6171,6 +6744,7 @@
             notifyTtsToast(errMsg, 'error');
             return { ok: false, error: errMsg };
         } finally {
+            setVerificationTitleAlert(false);
             if (driveExportActive && !driveExportFinalized) {
                 driveExportFinalized = true;
                 callColabDriveExport('abort', { session_id: exportLeaseId }, myRunId, {
@@ -6201,9 +6775,20 @@
                 exportState.probingChapters = false;
                 exportState.preExtractingGlossary = false;
                 exportState.waitingTranslation = false;
+                exportState.waitingVerification = false;
+                exportState.verificationUrl = '';
+                exportState.verificationChapter = 0;
+                exportState.verificationTabId = null;
+                exportState.verificationTabClosed = false;
+                exportState.verificationManualOnly = false;
+                exportState.verificationResumeHandler = null;
+                exportState.captchaEncountered = false;
+                exportState.savedDocTitle = null;
                 exportState.fetchingNext = false;
                 exportState.activePreloadPorts.clear();
                 exportState.abortRejects.clear();
+                const verifyBoxEl = state.playerEl?.querySelector?.('[data-role="dl-verify-box"]');
+                if (verifyBoxEl) verifyBoxEl.hidden = true;
             }
         }
     }
@@ -6302,6 +6887,8 @@
         startDownload: startTTSDownload,
         cancelDownload: cancelTTSDownload,
         savePartialDownload: requestSavePartialDownload,
+        openVerificationPage,
+        resumeAfterVerification,
         stop: stopPlayback,
         togglePauseResume,
         toggleAutoNext,
@@ -6325,9 +6912,12 @@
             downloadSource: state.downloadSource,
             colabGpuTier: state.colabGpuTier,
             exportTranslateConcurrency: state.exportTranslateConcurrency,
+            exportFetchPace: state.exportFetchPace,
             iconMode: state.iconMode,
             iconStyle: state.iconStyle,
             exportActive: exportState.active,
+            exportWaitingVerification: exportState.waitingVerification,
+            exportCaptchaEncountered: exportState.captchaEncountered,
             nextOpenUrl: exportState.nextOpenUrl
         })
     };

@@ -157,6 +157,152 @@ function STV_getMeaningfulTextLength(cleanText) {
     return stripped.length;
 }
 
+window.STV_detectCaptchaInDocument = function (doc, options = {}) {
+    if (!doc || typeof doc.querySelector !== 'function') {
+        return { detected: false, kind: '' };
+    }
+    const { isStaticHtml = false } = options || {};
+
+    const hasModalClosedClass = (el) => {
+        const cls = typeof el.className === 'string' ? el.className : '';
+        if (!/\bmodal\b/i.test(cls)) return false;
+        if (/\b(show|in)\b/i.test(cls)) return false;
+        const stDisplay = el.style && el.style.display;
+        if (stDisplay && stDisplay !== 'none') return false;
+        const rawStyle = typeof el.getAttribute === 'function' ? (el.getAttribute('style') || '') : '';
+        if (/display\s*:\s*(block|flex|grid)/i.test(rawStyle)) return false;
+        return true;
+    };
+
+    const isNodeVisible = (el, win) => {
+        let cur = el;
+        for (let depth = 0; depth < 6 && cur; depth += 1) {
+            if (cur.hidden === true) return false;
+            if (typeof cur.hasAttribute === 'function' && cur.hasAttribute('hidden')) return false;
+            if (typeof cur.getAttribute === 'function' && cur.getAttribute('aria-hidden') === 'true') {
+                return false;
+            }
+            const st = cur.style;
+            if (st && (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0')) {
+                return false;
+            }
+            const rawStyle = typeof cur.getAttribute === 'function' ? (cur.getAttribute('style') || '') : '';
+            if (/display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\s*;|\s*$)/i.test(rawStyle)) {
+                return false;
+            }
+            if (isStaticHtml && hasModalClosedClass(cur)) {
+                return false;
+            }
+            if (!isStaticHtml && win && typeof win.getComputedStyle === 'function') {
+                try {
+                    const cs = win.getComputedStyle(cur);
+                    if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0')) {
+                        return false;
+                    }
+                } catch {}
+            }
+            if (!isStaticHtml && depth === 0 && typeof cur.getBoundingClientRect === 'function') {
+                try {
+                    const rect = cur.getBoundingClientRect();
+                    if (rect && rect.width === 0 && rect.height === 0) {
+                        return false;
+                    }
+                } catch {}
+            }
+            cur = cur.parentElement || (cur.parentNode && cur.parentNode.nodeType === 1 ? cur.parentNode : null);
+        }
+        return true;
+    };
+
+    const docView = doc.defaultView || null;
+
+    // 1. Full-page Cloudflare / anti-bot interstitials
+    const titleEl = doc.querySelector('title');
+    const titleText = String(doc.title || (titleEl ? titleEl.textContent : '') || '').trim();
+    if (/just a moment|attention required|verify you are human|security check|one more step|checking your browser|ddos-guard/i.test(titleText)) {
+        return { detected: true, kind: 'cloudflare_interstitial' };
+    }
+    const interstitialSel = '#challenge-form, #challenge-running, #challenge-stage, #cf-challenge-running, #cf-wrapper, .cf-error-details';
+    if (doc.querySelector(interstitialSel)) {
+        return { detected: true, kind: 'cloudflare_interstitial' };
+    }
+    if (typeof doc.querySelectorAll === 'function') {
+        const forms = doc.querySelectorAll('form');
+        for (const form of forms) {
+            const action = String(form.getAttribute?.('action') || form.action || '');
+            if (/__cf_chl/i.test(action)) {
+                return { detected: true, kind: 'cloudflare_interstitial' };
+            }
+        }
+
+        // 2. Active CAPTCHA widget iframes
+        const iframes = doc.querySelectorAll('iframe');
+        for (const frame of iframes) {
+            const src = String(frame.getAttribute?.('src') || frame.src || '').toLowerCase();
+            if (/challenges\.cloudflare\.com|turnstile|hcaptcha\.com|google\.com\/recaptcha|recaptcha\.net/.test(src)) {
+                if (isStaticHtml ? isNodeVisible(frame, null) : isNodeVisible(frame, docView)) {
+                    return { detected: true, kind: 'turnstile_iframe' };
+                }
+            }
+        }
+
+        // 3. Visible CAPTCHA modals / widget containers
+        const candidates = new Set();
+        for (const el of doc.querySelectorAll('.cf-turnstile, .g-recaptcha, .h-captcha, .modal, [role="dialog"]')) {
+            candidates.add(el);
+        }
+        for (const el of doc.querySelectorAll('div, section, aside, form')) {
+            const idStr = String(el.id || '');
+            const clsStr = typeof el.className === 'string' ? el.className : '';
+            if (/captcha/i.test(idStr) || /captcha/i.test(clsStr)) {
+                candidates.add(el);
+            }
+        }
+
+        for (const el of candidates) {
+            if (!isNodeVisible(el, docView)) continue;
+
+            const clsStr = typeof el.className === 'string' ? el.className : '';
+            const isWidgetClass = /\b(cf-turnstile|g-recaptcha|h-captcha)\b/i.test(clsStr);
+            if (isWidgetClass) {
+                const hasSitekey = Boolean(el.getAttribute?.('data-sitekey'));
+                const hasChildren = Boolean(el.childNodes && el.childNodes.length > 0);
+                if (hasSitekey || hasChildren) {
+                    return { detected: true, kind: 'captcha_modal' };
+                }
+            }
+
+            if (typeof el.querySelectorAll === 'function') {
+                const inputs = el.querySelectorAll('input');
+                for (const inp of inputs) {
+                    const name = String(inp.getAttribute?.('name') || inp.name || '');
+                    if (name === 'cf-turnstile-response' || name === 'h-captcha-response' || name === 'g-recaptcha-response') {
+                        return { detected: true, kind: 'captcha_modal' };
+                    }
+                }
+                const nestedFrames = el.querySelectorAll('iframe');
+                for (const nf of nestedFrames) {
+                    const src = String(nf.getAttribute?.('src') || nf.src || '').toLowerCase();
+                    if (/cloudflare|turnstile|captcha|recaptcha|hcaptcha/.test(src)) {
+                        return { detected: true, kind: 'captcha_modal' };
+                    }
+                }
+            }
+
+            const cleanText = (el.textContent || el.innerText || '').replace(/\s+/g, ' ').trim();
+            if (
+                cleanText.length >= 4 &&
+                cleanText.length <= 600 &&
+                /verify you are human|xác minh.*(người|con người)|xác nhận.*robot|cloudflare.*privacy|captcha/i.test(cleanText)
+            ) {
+                return { detected: true, kind: 'captcha_modal' };
+            }
+        }
+    }
+
+    return { detected: false, kind: '' };
+};
+
 window.STV_findContentBoxInDocument = function (doc, savedSelector = '') {
     if (!doc || typeof doc.querySelector !== 'function') return null;
 
@@ -308,29 +454,57 @@ function STV_extractChunksFromElement(box) {
     return window.STV_convertHtmlToTextChunks(clone.innerHTML);
 }
 
-function STV_extractFromDocument(doc, pageUrl, savedSelector = '') {
+function STV_extractFromDocument(doc, pageUrl, savedSelector = '', options = {}) {
     const box = window.STV_findContentBoxInDocument(doc, savedSelector);
     const { nextUrl, pendingNextUrl } = STV_inspectNextChapterLinks(doc, pageUrl);
     if (!box) {
-        return { ok: false, chunks: null, nextUrl, pendingNextUrl, reason: 'not_ready' };
+        const isStaticHtml = options && options.isStaticHtml !== undefined
+            ? Boolean(options.isStaticHtml)
+            : !(doc && doc.defaultView);
+        const captcha = window.STV_detectCaptchaInDocument(doc, { isStaticHtml });
+        return {
+            ok: false,
+            chunks: null,
+            nextUrl,
+            pendingNextUrl,
+            reason: captcha.detected ? 'captcha_required' : 'not_ready',
+            captchaRequired: Boolean(captcha.detected),
+            captchaKind: captcha.kind || ''
+        };
     }
     const chunks = STV_extractChunksFromElement(box);
-    return { ok: Array.isArray(chunks) && chunks.length > 0, chunks, nextUrl, pendingNextUrl };
+    if (Array.isArray(chunks) && chunks.length > 0) {
+        return { ok: true, chunks, nextUrl, pendingNextUrl, captchaRequired: false, captchaKind: '' };
+    }
+    const isStaticHtml = options && options.isStaticHtml !== undefined
+        ? Boolean(options.isStaticHtml)
+        : !(doc && doc.defaultView);
+    const captcha = window.STV_detectCaptchaInDocument(doc, { isStaticHtml });
+    return {
+        ok: false,
+        chunks,
+        nextUrl,
+        pendingNextUrl,
+        reason: captcha.detected ? 'captcha_required' : 'not_ready',
+        captchaRequired: Boolean(captcha.detected),
+        captchaKind: captcha.kind || ''
+    };
 }
+window.STV_extractFromDocument = STV_extractFromDocument;
 
 // Trích xuất nội dung chương từ chuỗi HTML thô (dùng cho preload ngầm chương sau)
 window.STV_extractFromHtml = function (htmlString, pageUrl, savedSelector = '') {
     try {
         const parser = new DOMParser();
         const doc = parser.parseFromString(htmlString || '', 'text/html');
-        return STV_extractFromDocument(doc, pageUrl, savedSelector);
+        return STV_extractFromDocument(doc, pageUrl, savedSelector, { isStaticHtml: true });
     } catch (err) {
         return { ok: false, chunks: null, nextUrl: null, error: err.message };
     }
 };
 
 // Trích xuất nội dung chương cho các site tải bằng AJAX (như STV) qua iframe ẩn cùng origin
-window.STV_extractFromUrlViaIframe = function (targetUrl, savedSelector = '', timeoutMs = 10000) {
+window.STV_extractFromUrlViaIframe = function (targetUrl, savedSelector = '', timeoutMs = 12000) {
     return new Promise((resolve) => {
         let settled = false;
         let pollTimer = null;
@@ -338,6 +512,10 @@ window.STV_extractFromUrlViaIframe = function (targetUrl, savedSelector = '', ti
         let iframe = null;
         let bestResult = null;
         let nextUrlDeadline = 0;
+        let captchaConfirmCount = 0;
+        let lastCaptchaKind = '';
+        let crossOriginErrCount = 0;
+        let hasLoaded = false;
 
         try {
             const targetOrigin = new URL(targetUrl, window.location.href).origin;
@@ -382,8 +560,9 @@ window.STV_extractFromUrlViaIframe = function (targetUrl, savedSelector = '', ti
                         iWin.confirm = () => false;
                     } catch {}
                 }
-                const res = STV_extractFromDocument(iDoc, targetUrl, savedSelector);
+                const res = STV_extractFromDocument(iDoc, targetUrl, savedSelector, { isStaticHtml: false });
                 if (res.ok) {
+                    captchaConfirmCount = 0;
                     if (res.nextUrl) {
                         finish(res);
                         return;
@@ -398,21 +577,82 @@ window.STV_extractFromUrlViaIframe = function (targetUrl, savedSelector = '', ti
                     if (Date.now() >= nextUrlDeadline) {
                         finish(bestResult);
                     }
+                    return;
+                }
+                if (res.captchaRequired) {
+                    captchaConfirmCount += 1;
+                    lastCaptchaKind = res.captchaKind || lastCaptchaKind || 'captcha_modal';
+                    if (captchaConfirmCount >= 2) {
+                        finish({
+                            ok: false,
+                            chunks: null,
+                            nextUrl: null,
+                            reason: 'captcha_required',
+                            captchaRequired: true,
+                            captchaKind: lastCaptchaKind
+                        });
+                    }
+                } else {
+                    captchaConfirmCount = 0;
                 }
             } catch {
-                // Trang có thể chặn same-origin hoặc đang điều hướng
+                // Trang có thể chặn same-origin (Cloudflare challenge) hoặc đang điều hướng
+                if (hasLoaded) {
+                    crossOriginErrCount += 1;
+                    if (crossOriginErrCount >= 2) {
+                        finish({
+                            ok: false,
+                            chunks: null,
+                            nextUrl: null,
+                            reason: 'captcha_cross_origin',
+                            captchaRequired: true,
+                            captchaKind: 'cross_origin_challenge'
+                        });
+                    }
+                }
             }
         };
 
-        iframe.addEventListener('load', tryReadIframe);
+        iframe.addEventListener('load', () => {
+            hasLoaded = true;
+            tryReadIframe();
+        });
         pollTimer = setInterval(tryReadIframe, 150);
+        if (typeof pollTimer.unref === 'function') pollTimer.unref();
         deadlineTimer = setTimeout(() => {
             if (bestResult) {
                 finish(bestResult);
                 return;
             }
-            finish({ ok: false, chunks: null, nextUrl: null, reason: 'iframe_timeout' });
+            let stuckLoading = Boolean(lastCaptchaKind);
+            let finalKind = lastCaptchaKind;
+            if (!stuckLoading && iframe) {
+                try {
+                    const iDoc = iframe.contentDocument;
+                    const bodyText = String(iDoc?.body?.textContent || iDoc?.body?.innerText || '').trim();
+                    const hasSpinner = Boolean(iDoc?.querySelector?.('.spinner-border'));
+                    if (
+                        hasSpinner ||
+                        /(đang tải nội dung chương|nhấp vào để tải chương|vui lòng đợi|loading|please wait)/i.test(bodyText)
+                    ) {
+                        stuckLoading = true;
+                        finalKind = finalKind || 'stuck_loading';
+                    }
+                } catch {
+                    stuckLoading = true;
+                    finalKind = finalKind || 'cross_origin_challenge';
+                }
+            }
+            finish({
+                ok: false,
+                chunks: null,
+                nextUrl: null,
+                reason: 'iframe_timeout',
+                captchaRequired: stuckLoading,
+                captchaKind: finalKind
+            });
         }, Math.max(2000, timeoutMs));
+        if (typeof deadlineTimer.unref === 'function') deadlineTimer.unref();
 
         iframe.src = targetUrl;
         (document.body || document.documentElement).appendChild(iframe);
